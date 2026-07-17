@@ -199,6 +199,23 @@ lives in the monorepo.
 | [`docs/design.md`](docs/design.md) | The approved architecture and design. |
 | [`CLAUDE.md`](CLAUDE.md)           | Repo conventions and architecture rules. |
 
+## License
+
+Licensed under the Apache License, Version 2.0 — see [`LICENSE`](LICENSE) and
+[`NOTICE`](NOTICE).
+
+Because a Neovim plugin is distributed as its own source tree, any third-party code
+the recorder depends on at runtime (notably the vendored pure-Lua ed25519 and
+XChaCha20-Poly1305) will be committed into this repo and therefore redistributed by
+us. When that crypto is vendored, a `THIRD-PARTY-NOTICES.txt` reproducing each
+component's license and attribution is added in the same commit — a hard release
+gate, since the plugin's `extension_hash` is a hash of exactly this source tree.
+
+## Trademarks
+
+Neovim and Vim are separate works used as the host runtime; this project is
+independent and not affiliated with or endorsed by the Neovim or Vim projects.
+
 ## Contributing
 
 Contributor conventions and architecture rules live in [`CLAUDE.md`](CLAUDE.md); the design

@@ -35,6 +35,7 @@ The keystone decision for this port is **pure-Lua, vendored, zero native depende
 - **SHA-256** via `vim.fn.sha256` (Neovim builtin). **ed25519** and **XChaCha20-Poly1305** are vendored pure-Lua implementations. **File I/O** is `vim.uv` (libuv). No FFI, no libsodium, no sidecar binary.
 - **Do not introduce a native dependency** (FFI-to-libsodium, a compiled helper) to "make crypto easier." That reintroduces the per-platform distribution fragility this design deliberately avoids, and undercuts the auditability the recorder is required to keep (PRD §6). If you think the pure-Lua path is genuinely unworkable somewhere, stop and ask — it is a keystone decision, not an implementation detail.
 - **Do not write crypto from scratch.** Vendor a known, readable existing pure-Lua implementation and pin it. Correctness is proven against the conformance suite regardless.
+- **Vendoring is a licensing gate.** A Neovim plugin is distributed as its own source tree, so anything vendored is redistributed by us. In the *same commit* that vendors a component, create/update `THIRD-PARTY-NOTICES.txt` at the repo root with that component's upstream project, vendored path, version/commit, and full license + copyright text. Prefer permissive licenses (MIT/BSD/Apache-2.0/CC0/Unlicense); copyleft needs review first. No `THIRD-PARTY-NOTICES.txt` entry → do not vendor.
 - Signing is infrequent (session start / every-100-entries checkpoint / seal); the per-keystroke path only hashes. Keep it that way — never move a signing operation into the edit firehose.
 
 ## Working agreement

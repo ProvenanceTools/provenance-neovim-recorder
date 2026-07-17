@@ -1,0 +1,13 @@
+Provenance Recorder for Neovim
+Copyright 2026 Aaryan Mehta
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Neovim is a separate work, used as the host runtime and not redistributed by
+this project. Neovim is distributed under the Apache License, Version 2.0 and
+the Vim license; see https://github.com/neovim/neovim.
+
+Note: when third-party code (e.g. the pure-Lua ed25519 / XChaCha20-Poly1305
+implementations) is vendored into this repository, a THIRD-PARTY-NOTICES.txt
+reproducing each component's license and attribution must be added alongside
+this file. See CLAUDE.md and docs/design.md §3.
