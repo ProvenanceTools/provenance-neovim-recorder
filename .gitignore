@@ -1,0 +1,18 @@
+# Lua / LuaRocks
+*.rock
+.luarocks/
+lua_modules/
+
+# Test / harness scratch
+.tests/
+*.log
+# NOTE: tests/conformance/fixtures/ is intentionally committed (golden vectors
+# are the checked-in parity gate; CI must run without the monorepo present).
+
+# Editor / OS
+.DS_Store
+*.swp
+tags
+
+# Superpowers session state
+.superpowers/
