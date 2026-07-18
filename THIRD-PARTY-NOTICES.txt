@@ -1,0 +1,78 @@
+THIRD-PARTY NOTICES
+===================
+
+This file lists third-party code vendored into the provenance-neovim-recorder
+(provnvim) source tree. A Neovim plugin is distributed as its own source tree,
+so anything vendored here is redistributed by us. Each entry records the
+upstream project, the vendored path in this repo, the version/commit it was
+taken from, and the full upstream license + copyright text.
+
+--------------------------------------------------------------------------------
+
+TweetNaCl.js (ed25519 signatures + SHA-512)
+-------------------------------------------
+
+Vendored path : lua/provenance/vendor/ed25519.lua
+Upstream       : TweetNaCl.js — https://github.com/dchest/tweetnacl-js
+Version        : 1.0.3
+Commit         : e6141a20553498697e9e7d92fbc4517994caff52
+Source file    : nacl.js (the non-"fast" reference build)
+License        : The Unlicense (public domain dedication)
+
+What was taken and how it was adapted
+  Ported to LuaJIT (Neovim's bundled runtime): the ed25519 signature scheme
+  (crypto_sign / crypto_sign_open / crypto_sign_keypair, the GF(2^255-19) field
+  arithmetic, and the Edwards-curve group operations) together with the SHA-512
+  implementation TweetNaCl bundles (crypto_hash / crypto_hashblocks), which
+  ed25519 requires internally per RFC 8032. Adaptations from the JavaScript
+  source: Uint8Array/Float64Array became 0-indexed Lua tables of numbers (LuaJIT
+  numbers are IEEE-754 doubles, matching JS); `subarray` views became explicit
+  integer offset parameters; the SHA-512 64-bit words use a {hi,lo} table of
+  unsigned 32-bit halves with the LuaJIT `bit` library for the bitwise ops;
+  JavaScript int32 operators (^ & | ~ << >>>) map to LuaJIT `bit`
+  (bxor/band/bor/bnot/lshift/rshift), while arithmetic `>>` and `Math.floor` on
+  wide field values map to `math.floor` division. The Salsa20/Poly1305/X25519
+  parts of TweetNaCl.js were NOT vendored. Correctness is proven byte-for-byte
+  against the pinned cross-language vector in tests/conformance/fixtures/
+  ed25519.json (produced by @noble/ed25519 in the Provenance monorepo).
+
+Authors of TweetNaCl.js
+  * Dmitry Chestnykh (@dchest)
+  * Devi Mandiri (@devi)
+  * AndSDev (@AndSDev)
+
+Authors of the third-party public-domain code TweetNaCl.js derives from
+  TweetNaCl (http://tweetnacl.cr.yp.to/):
+    * Bernard van Gastel
+    * Daniel J. Bernstein (http://cr.yp.to/djb.html)
+    * Peter Schwabe (http://www.cryptojedi.org/users/peter/)
+    * Sjaak Smetsers (http://www.cs.ru.nl/~sjakie/)
+    * Tanja Lange (http://hyperelliptic.org/tanja)
+    * Wesley Janssen
+
+Full license text (The Unlicense):
+
+    This is free and unencumbered software released into the public domain.
+
+    Anyone is free to copy, modify, publish, use, compile, sell, or
+    distribute this software, either in source code form or as a compiled
+    binary, for any purpose, commercial or non-commercial, and by any
+    means.
+
+    In jurisdictions that recognize copyright laws, the author or authors
+    of this software dedicate any and all copyright interest in the
+    software to the public domain. We make this dedication for the benefit
+    of the public at large and to the detriment of our heirs and
+    successors. We intend this dedication to be an overt act of
+    relinquishment in perpetuity of all present and future rights to this
+    software under copyright law.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+    IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+    OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+    ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+    OTHER DEALINGS IN THE SOFTWARE.
+
+    For more information, please refer to <http://unlicense.org>
