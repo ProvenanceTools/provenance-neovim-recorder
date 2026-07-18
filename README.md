@@ -159,6 +159,45 @@ The plugin does nothing until you open a workspace containing a course-signed
 `.provenance-manifest`, so it is safe to have installed all the time. When you finish, run
 `:ProvenanceSeal` to write the signed submission bundle.
 
+## Status indicator
+
+The recorder shows a `● Provenance: recording` indicator **only if you add it to your
+statusline** — it does not modify your statusline for you, on purpose, so it can never
+clobber your own config (this is why nothing appears out of the box). The plugin exposes one
+function that returns the indicator text while a session is active and an empty string
+otherwise, so you wire it in once and it appears/disappears on its own as you enter and leave
+activated workspaces — no manual command needed:
+
+```lua
+require("provenance.recorder.status").segment()
+--> "● Provenance: recording"  while recording
+--> ""                          otherwise
+```
+
+**Native statusline** — append the segment (append, so you keep whatever you already have):
+
+```lua
+vim.opt.statusline:append("%{%v:lua.require'provenance.recorder.status'.segment()%}")
+```
+
+**[lualine](https://github.com/nvim-lualine/lualine.nvim)** — add it as a component in any section:
+
+```lua
+require("lualine").setup({
+  sections = {
+    lualine_x = {
+      function() return require("provenance.recorder.status").segment() end,
+      "encoding", "fileformat", "filetype", -- your existing components
+    },
+  },
+})
+```
+
+Any statusline framework works the same way: call `segment()` and render its return value.
+It is always safe to call before activation (it just returns `""`), so there is no load-order
+concern. If you ever want to check state without a statusline, `:lua =require('provenance.recorder.status').segment()`
+prints the current indicator text.
+
 > **Why a tag matters.** Neovim plugins are git checkouts, not signed artifacts. The
 > recorder's `extension_hash` is a deterministic hash of its own installed Lua source at
 > runtime, and the analyzer allowlists the hash of each released tag. Installing an arbitrary
