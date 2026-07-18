@@ -350,6 +350,7 @@ lives in the monorepo.
 
 | Document                           | What's in it                          |
 | ---------------------------------- | ------------------------------------- |
+| [`docs/student-guide.md`](docs/student-guide.md) | Student-facing setup/install steps for course staff to hand out. |
 | [`docs/design.md`](docs/design.md) | The approved architecture and design. |
 | [`CLAUDE.md`](CLAUDE.md)           | Repo conventions and architecture rules. |
 
