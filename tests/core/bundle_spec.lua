@@ -139,6 +139,18 @@ describe("bundle.validate_shape", function()
     assert.is_false(res.ok)
     assert.equals("not_object", res.error.kind)
   end)
+
+  it("rejects a 1.1 manifest whose sessions is a JSON object, not an array", function()
+    local decoded = vim.json.decode(
+      '{"format_version":"1.1","assignment_id":"a","semester":"s",'
+        .. '"extension_hash":"' .. ("a"):rep(64) .. '",'
+        .. '"sessions":{"x":1},"submission_files":[]}'
+    )
+    local res = bundle.validate_shape(decoded)
+    assert.is_false(res.ok)
+    assert.equals("invalid_field", res.error.kind)
+    assert.equals("sessions", res.error.field)
+  end)
 end)
 
 describe("conformance: bundle-manifest.json (byte-exact JCS pin + verify_sig)", function()

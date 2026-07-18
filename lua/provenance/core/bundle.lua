@@ -113,6 +113,9 @@ function M.validate_shape(value)
     if is_null(sessions) or type(sessions) ~= "table" then
       return result.err({ kind = "missing_field", field = "sessions" })
     end
+    if not vim.islist(sessions) then
+      return result.err({ kind = "invalid_field", field = "sessions" })
+    end
     for i = 1, #sessions do
       local s = sessions[i]
       if type(s) ~= "table" then
@@ -136,6 +139,9 @@ function M.validate_shape(value)
       local files = value.submission_files
       if is_null(files) or type(files) ~= "table" then
         return result.err({ kind = "missing_field", field = "submission_files" })
+      end
+      if not vim.islist(files) then
+        return result.err({ kind = "invalid_field", field = "submission_files" })
       end
       for i = 1, #files do
         local f = files[i]

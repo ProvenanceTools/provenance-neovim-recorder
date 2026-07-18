@@ -111,4 +111,9 @@ describe("conformance: golden-bundle.json (real sealed 1.0 manifest validates)",
     local res = bundle.validate_shape(fx.manifest)
     assert.is_true(res.ok)
   end)
+
+  it("build() on the 1.0 manifest omits submission_files from the canonical JSON", function()
+    local built = bundle.build(fx.manifest)
+    assert.is_nil(bundle.to_canonical(built):find("submission_files", 1, true))
+  end)
 end)
