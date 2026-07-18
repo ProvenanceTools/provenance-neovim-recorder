@@ -237,3 +237,20 @@ conformance suite (`tests/conformance/`) proves byte-for-byte format parity
 with the Provenance monorepo's `log-core`; a red conformance test means the
 implementation drifted — fix the code, never the vectors. Regenerate vectors
 with `PROVENANCE_REPO=/path/to/provenance make vectors`.
+
+### Conformance
+
+`lua/provenance/core/` is verified byte-for-byte against Provenance's `log-core`
+via golden vectors exported by the monorepo's `tools/export-conformance-vectors.ts`
+into `tests/conformance/fixtures/`. A failing conformance test means the format
+has drifted — fix the implementation, never the vectors. Crypto/bundle vectors
+are asserted starting in Plan 2.
+
+`tests/conformance/conformance_spec.lua` currently asserts the format vectors in
+`fixtures/vectors.json`: the pinned SHA-256 test cases and the pinned hash-chain
+entry, run through this repo's `core.sha256` and `core.hash_chain` +
+`core.envelope`. The remaining fixtures (`ed25519.json`, `session-key.json`,
+`checkpoint.json`, `manifest.json`, `bundle-manifest.json`, `golden-bundle.json`,
+`golden-bundle.zip`) are committed now as the pinned contract snapshot but are
+not yet asserted against — they gate the vendored ed25519/XChaCha20 crypto and
+the seal/bundle path added in Plan 2.
