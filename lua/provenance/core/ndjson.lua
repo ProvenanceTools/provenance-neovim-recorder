@@ -41,7 +41,7 @@ local function validate_shape(obj)
   if type(obj.t) ~= "number" then return "t" end
   if type(obj.wall) ~= "string" then return "wall" end
   if type(obj.kind) ~= "string" then return "kind" end
-  if type(obj.data) ~= "table" or json.is_array(obj.data) then return "data" end
+  if type(obj.data) ~= "table" or json.is_array(obj.data) or obj.data == json.NULL then return "data" end
   if not is_hex64(obj.prev_hash) then return "prev_hash" end
   if not is_hex64(obj.hash) then return "hash" end
   return nil
