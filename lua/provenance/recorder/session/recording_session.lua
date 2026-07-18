@@ -36,6 +36,8 @@ local heartbeat = require("provenance.recorder.events.heartbeat")
 local seal_cmd = require("provenance.recorder.commands.seal")
 local chain_recovery = require("provenance.recorder.startup.chain_recovery")
 local uv_recovery_deps = require("provenance.recorder.startup.uv_recovery_deps")
+local disk_full_handler = require("provenance.recorder.failure.disk_full_handler")
+local degraded_notifier = require("provenance.recorder.failure.degraded_notifier")
 
 local M = {}
 
@@ -90,8 +92,14 @@ end
 ---   prev_session_id: string|nil    -- explicit override; wins over recovery's decision when set
 ---   env: table|nil                 -- recorder_context env overrides (uuid, hostname, ...)
 ---   checkpoint_interval: number|nil -- entries between signed checkpoints (default 100)
----   is_degraded: function|nil      -- () -> boolean; true suppresses checkpoint scheduling
----     (a seam for a later degraded-mode task; defaults to always false)
+---   is_degraded: function|nil      -- () -> boolean; when explicitly supplied, overrides
+---     the real degraded source (the disk-full handler's own is_degraded) — a seam so
+---     tests can force degraded routing without a real write error. True suppresses
+---     checkpoint scheduling AND routes entries through the disk-full handler's ring
+---     instead of the writer (see on_entry below).
+---   notify: function|nil           -- (message) -> nil; injected into the disk-full
+---     handler as its user notification. Defaults to degraded_notifier.notify
+---     (vim.notify at ERROR level). A seam so tests can capture the degraded message.
 ---   recover: function|nil          -- () -> RecoveryDecision; full injection seam for tests.
 ---     Defaults to running chain_recovery.recover_previous_session over the real
 ---     vim.uv deps (uv_recovery_deps.new(provenance_dir)). Runs BEFORE this
@@ -112,7 +120,14 @@ function M.start(opts)
   local manifest = opts.manifest
   local clock = opts.clock
   local checkpoint_interval = opts.checkpoint_interval or 100
-  local is_degraded = opts.is_degraded or function() return false end
+
+  -- Forward-declared: the disk-full handler's on_degraded closure (built
+  -- below, before the writer/host exist) must call host.emit(...), but
+  -- `host` itself is only constructed at step 7. Capturing this local as an
+  -- upvalue now and assigning it later (never re-`local`-ing it) means the
+  -- closure sees the real host once writes are actually flowing — a write
+  -- error can only happen after the host exists.
+  local host
 
   -- 0. Ensure provenance_dir exists before anything below writes into it
   -- (meta_writer.create in step 6 atomic-writes immediately and does not
@@ -169,8 +184,29 @@ function M.start(opts)
   local slog_path = provenance_dir .. "/session-" .. file_uuid .. ".slog"
   local meta_path = slog_path .. ".meta"
 
-  -- 4. Buffered, append-only `.slog` writer.
-  local writer = session_writer.open({ slog_path = slog_path, clock = clock })
+  -- 3b. Disk-full handler (Plan 8, Task 6/7). Wired as the writer's
+  -- on_error below so a write failure flips it into degraded mode: notify
+  -- once, emit recorder.degraded once (via host, once it exists), and from
+  -- then on route entries through its in-memory critical-only ring instead
+  -- of the writer (see on_entry in step 7).
+  local disk_full = disk_full_handler.new({
+    on_degraded = function(data)
+      -- host is assigned by step 7 before writes can occur (session.start
+      -- is the very first write below); a write error can only happen
+      -- after that.
+      if host then host.emit("recorder.degraded", data) end
+    end,
+    notify = opts.notify or degraded_notifier.notify,
+  })
+
+  -- 4. Buffered, append-only `.slog` writer. on_error routes write
+  -- failures (e.g. ENOSPC) to the disk-full handler above.
+  local writer = session_writer.open({ slog_path = slog_path, clock = clock, on_error = disk_full.handle_write_error })
+
+  -- Real degraded source is the disk-full handler; opts.is_degraded (Task 3
+  -- seam) still wins when explicitly supplied, so tests can force degraded
+  -- routing without a real write error.
+  local is_degraded = opts.is_degraded or disk_full.is_degraded
 
   -- 5. Wrap the session private key under the manifest signature so only a
   -- holder of the activation-gate secret can recover it.
@@ -207,17 +243,34 @@ function M.start(opts)
     end,
   })
 
-  -- 7. The single chaining chokepoint; on_entry feeds the writer, then (if
-  -- not degraded) checks the checkpoint cadence and schedules a checkpoint.
-  -- writer.append runs FIRST so the entry is persisted to the .slog before
-  -- any checkpoint bookkeeping happens.
-  local host = session_host.new({
+  -- 7. The single chaining chokepoint; on_entry feeds the writer (or, while
+  -- degraded, the disk-full handler's critical-only ring), then — only on
+  -- the normal path — checks the checkpoint cadence and schedules a
+  -- checkpoint. writer.append runs FIRST so the entry is persisted to the
+  -- .slog before any checkpoint bookkeeping happens.
+  --
+  -- LOOP SAFETY: a write error -> disk_full.handle_write_error (idempotent)
+  -- flips degraded + notifies once + calls on_degraded once ->
+  -- host.emit("recorder.degraded", ...) -> chains a new entry -> this same
+  -- on_entry -> is_degraded() now true -> disk_full.enqueue(the
+  -- recorder.degraded entry) (a CRITICAL kind, retained in the ring) — NOT
+  -- writer.append, so no new write is attempted and on_error cannot fire
+  -- again. The idempotent handler plus the degraded flag routing away from
+  -- the writer together rule out any recursion/infinite loop.
+  host = session_host.new({
     session_id = context.session_id,
     clock = clock,
     on_entry = function(entry)
-      writer.append(entry)
-      if not is_degraded() and cadence.on_entry_appended() then
-        scheduler.schedule(entry.seq, entry.hash)
+      if is_degraded() then
+        -- Disk is failing: bypass the writer entirely; only CRITICAL kinds
+        -- are retained (in-memory ring), everything else is dropped. No
+        -- write is attempted, so on_error cannot re-trigger from here.
+        disk_full.enqueue(entry)
+      else
+        writer.append(entry)
+        if cadence.on_entry_appended() then
+          scheduler.schedule(entry.seq, entry.hash)
+        end
       end
     end,
   })
@@ -261,7 +314,18 @@ function M.start(opts)
     slog_path = slog_path,
     meta_path = meta_path,
     public_key_hex = keypair.public_key_hex,
+    -- Test/inspection seams onto the disk-full handler (Plan 8, Task 7).
+    is_degraded = disk_full.is_degraded,
+    _ring_snapshot = disk_full.ring_snapshot,
   }
+
+  --- TEST-ONLY HOOK: deterministically drive the disk-full handler into
+  --- degraded mode without needing a real ENOSPC on disk. Just calls
+  --- disk_full.handle_write_error, the exact same entrypoint the writer's
+  --- on_error uses. Not part of the session's real API surface.
+  function session._simulate_write_error(err)
+    disk_full.handle_write_error(err or "ENOSPC")
+  end
 
   --- Flush the writer and seal a submission bundle from everything
   --- recorded so far (across all sessions in provenance_dir, per
