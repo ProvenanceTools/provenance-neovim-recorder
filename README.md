@@ -270,12 +270,20 @@ lives in the monorepo.
 Licensed under the Apache License, Version 2.0 — see [`LICENSE`](LICENSE) and
 [`NOTICE`](NOTICE).
 
-Because a Neovim plugin is distributed as its own source tree, any third-party code
-the recorder depends on at runtime (notably the vendored pure-Lua ed25519 and
-XChaCha20-Poly1305) will be committed into this repo and therefore redistributed by
-us. When that crypto is vendored, a `THIRD-PARTY-NOTICES.txt` reproducing each
-component's license and attribution is added in the same commit — a hard release
-gate, since the plugin's `extension_hash` is a hash of exactly this source tree.
+Because a Neovim plugin is distributed as its own source tree, the third-party crypto
+the recorder carries at runtime is committed into this repo and therefore redistributed
+by us. Two pure-Lua components are vendored under
+[`lua/provenance/vendor/`](lua/provenance/vendor):
+
+- **ed25519 + SHA-512** — ported to LuaJIT from
+  [TweetNaCl.js](https://github.com/dchest/tweetnacl-js) (The Unlicense / public domain).
+- **XChaCha20-Poly1305** — ported to LuaJIT from
+  [philanc/plc](https://github.com/philanc/plc) (MIT).
+
+Their full upstream licenses and attribution are reproduced in
+[`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt), added in the same commit that
+vendored each component. This is a hard release gate: the plugin's `extension_hash` is a
+hash of exactly this source tree, so anything redistributed must be documented there.
 
 ## Trademarks
 
