@@ -14,14 +14,28 @@
 --- only when BOTH (a) it is either a CONFIRMED intercept (content-matched,
 --- within the time window) or classifier-flagged "paste_likely", AND
 --- (b) it is PasteDecision-shaped — exactly ONE delta, at ANY range (empty
---- or non-empty). That shape constraint exists because PastePayload can
---- only carry one range + one text; a single delta = one range + one text
---- fits it exactly, regardless of whether that range is an empty insertion
---- point or a non-empty replacement. A MULTI-delta edit cannot be
---- represented that way without lossy reconstruction (it would collapse
---- several distinct ranges into one), so multi-delta edits route to
---- `doc.change` with `source = "paste_likely"` instead — preserving every
---- delta faithfully.
+--- or non-empty), AND the inserted text fits inline. That shape constraint
+--- exists because PastePayload can only carry one range + one text; a
+--- single delta = one range + one text fits it exactly, regardless of
+--- whether that range is an empty insertion point or a non-empty
+--- replacement. A MULTI-delta edit cannot be represented that way without
+--- lossy reconstruction (it would collapse several distinct ranges into
+--- one), so multi-delta edits route to `doc.change` with
+--- `source = "paste_likely"` instead — preserving every delta faithfully.
+---
+--- THE INLINE-SIZE GATE: `paste_payload.build_paste_payload` only inlines
+--- the full text up to `MAX_INLINE_BYTES` (4096); beyond that it TRUNCATES
+--- to a head/tail preview (see paste_payload.lua). A `paste` event built
+--- from truncated content cannot be replayed by the analyzer — its
+--- `applyPasteBuf` returns applied=false and RESETS the reconstruction
+--- buffer, marking the file INDETERMINATE. So a single-delta bulk insert
+--- whose inserted text exceeds MAX_INLINE_BYTES must NOT be routed to
+--- `paste` even though it is otherwise PasteDecision-shaped; it is routed
+--- to `doc.change source = "paste_likely"` instead, which inlines the full
+--- deltas with no size cap and reconstructs faithfully. This also makes
+--- `doc.change source = "paste_likely"` reachable via on_lines for large
+--- single-delta edits (previously unreachable, since a shaped single delta
+--- always won the `paste` branch).
 ---
 --- NOTE ON THE EMPTY-RANGE CHECK THIS REPLACED: an earlier version of this
 --- shape check additionally required the single delta's range to be EMPTY
@@ -148,16 +162,21 @@ function M.new(opts)
       large_insert_count = large_insert_count + 1
     end
 
-    local inserted = table.concat(vim.tbl_map(function(d)
-      return d.text
-    end, deltas))
+    local inserted_parts = {}
+    for i, d in ipairs(deltas) do
+      inserted_parts[i] = d.text
+    end
+    local inserted = table.concat(inserted_parts)
 
     local confirmed = false
     if pending ~= nil and (at - pending.at) <= window_ms and matches(inserted, pending.text) then
       confirmed = true
     end
 
-    local is_paste_shaped = #deltas == 1
+    -- #inserted is the UTF-8 BYTE length of the concatenated inserted text
+    -- (Lua `#` on a string counts bytes), matching how build_paste_payload
+    -- decides inline-vs-truncate on `length <= MAX_INLINE_BYTES`.
+    local is_paste_shaped = (#deltas == 1) and (#inserted <= paste_payload.MAX_INLINE_BYTES)
 
     if (confirmed or classification == "paste_likely") and is_paste_shaped then
       if confirmed then

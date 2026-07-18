@@ -339,6 +339,62 @@ describe("paste_correlator.counts", function()
 end)
 
 -- ---------------------------------------------------------------------------
+-- Large single-delta bulk inserts (>MAX_INLINE_BYTES): must route to
+-- doc.change source=paste_likely, NOT paste, because build_paste_payload
+-- would truncate the content and the analyzer cannot replay a truncated
+-- paste payload (applyPasteBuf resets reconstruction to INDETERMINATE).
+-- ---------------------------------------------------------------------------
+
+describe("paste_correlator: single-delta bulk insert exceeding MAX_INLINE_BYTES", function()
+  it("CONFIRMED single-delta paste whose inserted text is >4096 bytes -> doc.change source=paste_likely (NOT paste)", function()
+    local c = new_correlator()
+    local big = string.rep("a", 5000)
+    assert.is_true(#big > paste_payload.MAX_INLINE_BYTES)
+
+    c.on_paste_intercept(big, 0)
+
+    local range = empty_range()
+    local decision = c.on_doc_change({ delta(big, range) }, range, 1)
+
+    assert.equals("doc.change", decision.kind)
+    assert.equals("paste_likely", decision.source)
+    assert.same({ delta(big, range) }, decision.deltas)
+  end)
+
+  it("paste_likely single-delta bulk insert (no intercept) >4096 bytes -> doc.change source=paste_likely (NOT paste)", function()
+    local c = new_correlator()
+    local big = string.rep("z", 4200)
+    assert.is_true(#big > paste_payload.MAX_INLINE_BYTES)
+
+    local range = empty_range()
+    local decision = c.on_doc_change({ delta(big, range) }, range, 5)
+
+    assert.equals("doc.change", decision.kind)
+    assert.equals("paste_likely", decision.source)
+    assert.equals(1, c.counts().large_insert)
+  end)
+
+  it("boundary: exactly MAX_INLINE_BYTES (4096) inserted -> paste; MAX_INLINE_BYTES + 1 (4097) -> doc.change source=paste_likely", function()
+    local c = new_correlator()
+
+    local exact = string.rep("e", paste_payload.MAX_INLINE_BYTES)
+    assert.equals(paste_payload.MAX_INLINE_BYTES, #exact)
+    c.on_paste_intercept(exact, 0)
+    local range1 = empty_range()
+    local decision1 = c.on_doc_change({ delta(exact, range1) }, range1, 1)
+    assert.equals("paste", decision1.kind)
+    assert.equals(exact, decision1.payload.content)
+
+    local over = string.rep("e", paste_payload.MAX_INLINE_BYTES + 1)
+    c.on_paste_intercept(over, 2)
+    local range2 = empty_range()
+    local decision2 = c.on_doc_change({ delta(over, range2) }, range2, 3)
+    assert.equals("doc.change", decision2.kind)
+    assert.equals("paste_likely", decision2.source)
+  end)
+end)
+
+-- ---------------------------------------------------------------------------
 -- Independent instances
 -- ---------------------------------------------------------------------------
 
