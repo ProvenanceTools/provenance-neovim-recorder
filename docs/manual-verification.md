@@ -164,3 +164,17 @@ real OS-level watcher latency — those need a live TUI:
       `fs.external_change` — i.e. `note_save` + the tolerance window
       correctly suppress the editor's own write from being misclassified as
       an external one.
+
+## Plan 7 — terminal, git, and plugin snapshot
+
+- [ ] **Shell-integrated terminal captures command + exit code:** In a terminal buffer with OSC-133 shell integration enabled (e.g., bash/zsh configured to emit `133;C` / `133;D` markers), run a command. Confirm that a `terminal.command` event is recorded with the command's `exit_code` (captured from the `133;D;<code>` marker), while non-command markers (e.g., `133;C`) are ignored. The recorded `terminal_id` matches the terminal's job id.
+
+- [ ] **Non-integrated terminal records open only:** Open a terminal buffer without shell integration (or a shell not emitting OSC-133 markers). Confirm a `terminal.open` event with `shell_integration=false` is recorded, and NO `terminal.command` events occur even if commands are run. No crash or error.
+
+- [ ] **Terminal close does not error:** Close a terminal buffer. Confirm no event is emitted (the format has no `terminal.close` event), and the closure does not error or produce side effects in the `.slog`.
+
+- [ ] **Plugin snapshot:** Start a session in an activated workspace. Confirm an `ext.snapshot` event is recorded at session start with an `extensions` array listing loaded plugins (by basename from the runtimepath). Confirm the snapshot re-emits approximately every 5 minutes (verify via a second `ext.snapshot` in the `.slog` after ~5 minutes of session activity).
+
+- [ ] **Git commit emits git.event:** In an activated workspace that is a git repository, make a commit (e.g., `git commit -m "test"`). Confirm a `git.event` with `operation="state_change"` is recorded, including the new `commit_sha`. Confirm that a file change shortly after the commit is tagged with `explanation="git"` by the explanation tagger.
+
+- [ ] **No git installed → session still works:** With no `git` binary on PATH, or in a non-git workspace, start a session in an activated directory. Confirm the session activates, records events normally, and seals without error. The git wiring degrades to a no-op (no `git.event`, no tagger marks) — a missing git integration is a degraded signal, not a failure.
