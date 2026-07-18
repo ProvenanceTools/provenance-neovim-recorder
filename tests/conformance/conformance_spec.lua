@@ -3,6 +3,7 @@ local hc = require("provenance.core.hash_chain")
 local envelope = require("provenance.core.envelope")
 local ed25519 = require("provenance.core.ed25519")
 local manifest = require("provenance.core.manifest")
+local bundle = require("provenance.core.bundle")
 
 -- NOTE: `<sfile>` (per the task brief) does not resolve to this file under
 -- plenary's busted runner: specs are loaded via `loadfile()`, not `:source`,
@@ -79,5 +80,35 @@ describe("conformance: manifest vector (manifest.json — activation gate)", fun
     local parsed = manifest.parse(vim.json.encode(decoded))
     assert.is_true(parsed.ok)
     assert.is_false(manifest.verify(parsed.value, fx.course_pubkey_hex))
+  end)
+end)
+
+describe("conformance: bundle-manifest.json (byte-exact JCS pin + verify_sig)", function()
+  local fx = load_fixture("bundle-manifest.json")
+
+  it("bundle.build + to_canonical reproduces the fixture's canonical_json exactly", function()
+    local built = bundle.build(fx.manifest)
+    assert.equals(fx.canonical_json, bundle.to_canonical(built))
+  end)
+
+  it("verify_sig is true for the fixture's canonical_json/signature/pubkey", function()
+    assert.is_true(bundle.verify_sig(fx.canonical_json, fx.signature_hex, fx.session_pubkey_hex))
+  end)
+
+  it("sign -> verify_sig round-trips with a locally generated keypair", function()
+    local priv, pub_hex = ed25519.generate_keypair()
+    local built = bundle.build(fx.manifest)
+    local signed = bundle.sign(built, priv)
+    assert.equals(fx.canonical_json, signed.canonical_json)
+    assert.is_true(bundle.verify_sig(signed.canonical_json, signed.signature_hex, pub_hex))
+  end)
+end)
+
+describe("conformance: golden-bundle.json (real sealed 1.0 manifest validates)", function()
+  local fx = load_fixture("golden-bundle.json")
+
+  it("validate_shape accepts it", function()
+    local res = bundle.validate_shape(fx.manifest)
+    assert.is_true(res.ok)
   end)
 end)
