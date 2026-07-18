@@ -152,13 +152,16 @@ paste reconciler. Do not simplify to one signal without discussion.
   The tree-hash algorithm (sorted relative paths, per-file SHA-256, one rolling
   digest) is part of `core/` and itself covered by a vector so it is reproducible.
 
-- **The course public key is a committed constant.** The course public key is
-  *public*; there is no build-time embed step (Neovim has no build step). A given
-  course ships its key as a committed Lua constant in a tagged release. Because the
-  key is part of the hashed source, each course release's allowlist entry already
-  binds its specific key — a different course key produces a different tree hash
-  and therefore a distinct, intentional allowlist entry. No secret is ever
-  committed; the *public* key is.
+- **The master public key is a committed constant.** Verification uses a single
+  maintainer-held *master* key, not a per-course key: there is one published
+  plugin, mirroring the single published VS Code / JetBrains extension. Its public
+  half is committed as a Lua constant (`lua/provenance/course_public_key.lua`) on
+  `main`; the private half is held offline and never enters the repo. There is no
+  build-time embed step (Neovim has no build step), so the key ships as-is in every
+  tagged release. Because the key is part of the hashed source, a given release's
+  tree hash already covers it: rotating the key is simply a new tagged release with
+  a new allowlist entry. No secret is ever committed; the *public* key is. (The
+  constant is named `COURSE_PUBLIC_KEY_HEX` for parity with the other recorders.)
 
 - **The `vscode` field wrinkle.** `session.start` has a hard-coded
   `vscode: { version, commit, platform }` object that is part of the signed,
@@ -176,11 +179,16 @@ paste reconciler. Do not simplify to one signal without discussion.
 There is no compile/sign step, so the `build:prod` flow the VS Code and JetBrains
 recorders run collapses to almost nothing:
 
-- **Distribution** is a tagged git release, installed by any Neovim plugin
-  manager. A course either uses the canonical release (with the canonical course
-  key committed) or maintains a fork/tag that commits *their* course public key.
+- **Distribution** is a plain tagged git release of this one canonical repo,
+  installed by any Neovim plugin manager (`version = "v0.1.0"` in lazy.nvim, etc.).
+  There are no per-course forks: every course installs the same release and pins
+  the tag its course points to. The master public key (§6) is committed on `main`,
+  so cutting a release is an ordinary `git tag` — nothing is swapped or embedded at
+  release time.
 - **`extension_hash`** is the runtime tree-hash of §6, not an artifact SHA. The
-  monorepo allowlist pins the tree hash of each released tag.
+  monorepo allowlist pins the tree hash of each released tag. Rotating the master
+  key is a new tagged release and a new allowlist entry; older tags keep their old
+  key immutably.
 - The plugin **never modifies** `manifest.json` / `manifest.sig` after seal — same
   rule as the monorepo and `provjet`. The stored bundle must stay signature/chain
   verifiable.

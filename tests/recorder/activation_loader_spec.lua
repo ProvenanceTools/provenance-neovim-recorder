@@ -74,11 +74,16 @@ describe("activation.load_and_verify", function()
   end)
 
   it("defaults pubkey_hex to COURSE_PUBLIC_KEY_HEX when omitted", function()
-    assert.equals(course_public_key.COURSE_PUBLIC_KEY_HEX, fx.course_pubkey_hex)
+    -- The fixture manifest is signed by the fixture's own dev keypair, not by the
+    -- committed master key, so we do not assert "active" here. Instead we prove the
+    -- default parameter *is* COURSE_PUBLIC_KEY_HEX: omitting the key must behave
+    -- identically to passing that constant explicitly.
     local dir = new_tempdir()
     vim.fn.writefile({ vim.json.encode(fx.manifest) }, dir .. "/.provenance-manifest")
-    local res = activation.load_and_verify(dir)
-    assert.equals("active", res.status)
+    local defaulted = activation.load_and_verify(dir)
+    local explicit = activation.load_and_verify(dir, course_public_key.COURSE_PUBLIC_KEY_HEX)
+    assert.equals(explicit.status, defaulted.status)
+    assert.equals(explicit.reason, defaulted.reason)
   end)
 
   it("never throws even for a nonexistent workspace_dir", function()

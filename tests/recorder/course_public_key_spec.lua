@@ -16,7 +16,9 @@ describe("course_public_key", function()
     end
   end)
 
-  it("matches the pinned dev fixture value", function()
-    assert.equals("fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618", course_public_key.COURSE_PUBLIC_KEY_HEX)
+  it("matches the pinned master public key", function()
+    -- Pins the committed production key so an accidental edit is caught. This is
+    -- the public half only; the private key is held offline, never in the repo.
+    assert.equals("b5bca59ffa918c879d01050dab428e60c630f9d2051508af3d29c60cce985e25", course_public_key.COURSE_PUBLIC_KEY_HEX)
   end)
 end)

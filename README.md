@@ -74,7 +74,7 @@ same golden conformance vectors that pin the format.
 
 - **Offline.** The plugin makes no network calls during a session.
 - **Scoped to the assignment workspace.** It activates only against a `.provenance-manifest`
-  that verifies with the course public key committed in the release. Events for files
+  that verifies with the master public key committed in the release. Events for files
   outside the workspace are dropped. It never records a student's Neovim config
   (`init.lua`, `~/.config/nvim`) or out-of-workspace scratch buffers.
 - **Append-only.** There is no update or delete on a log, anywhere. Exactly one chaining
@@ -101,7 +101,7 @@ Install with any Neovim plugin manager, from the release your course points you 
 ```lua
 {
   "ProvenanceTools/provenance-neovim-recorder",
-  -- pin the tag your course specifies; the tag commits the course public key,
+  -- pin the tag your course specifies; the tag ships the master public key,
   -- and its source tree-hash is what the analyzer allowlist recognizes.
   version = "v0.1.0",
 }
@@ -116,21 +116,21 @@ The plugin does nothing until you open a workspace containing a course-signed
 > commit or a fork with modified source will produce a hash the analyzer does not recognize,
 > and every submission from it gets flagged.
 
-## Distribution & course key model
+## Distribution & the master key
 
-A course does not run a canonical release — it publishes its own. Distribution works like this:
+There is one canonical, published plugin — not a fork per course. Distribution works like this:
 
-- The course maintains a **fork or tagged release** of this repo that commits its own public key
-  as a Lua constant in `lua/provenance/course_public_key.lua`. This is the **public key** — not a
-  secret, committed as part of the source code. (Neovim has no build step, so there is no
-  separate build-time embedding.)
-- Students install the plugin from that course-specific release (e.g.,
-  `version = "cs101/v1.0"`), and it records events only for a workspace that contains a
-  `.provenance-manifest` signed with that same course public key.
-- Because the course public key is part of the plugin's source tree, and the `extension_hash`
-  is a hash of that source tree (§ `extension_hash` below), each course's release produces a
-  **distinct `extension_hash`** — a different course key → a different tree hash → a different
-  allowlist entry in the analyzer. This binds each course to its own key with no configuration.
+- This repo commits a single **master public key** as a Lua constant in
+  `lua/provenance/course_public_key.lua`. It is the maintainer-held signing key's public half —
+  **public, not a secret** — committed as part of the source; the private half is kept offline and
+  never enters the repo. Neovim has no build step, so the key ships as-is in every release (there
+  is no build-time embedding step like the VS Code recorder's).
+- Students install a **pinned tag** of this repo (e.g., `version = "v0.1.0"`). The recorder
+  records only for a workspace whose `.provenance-manifest` is signed by that master key.
+- Because the key is part of the plugin's source tree, and the `extension_hash` is a hash of that
+  source tree (§ `extension_hash` below), each released tag has a fixed `extension_hash` that the
+  analyzer allowlists. Rotating the master key is a normal new tagged release with a new allowlist
+  entry; older tags keep their old key immutably.
 
 The sealed bundle's `manifest.json` and `manifest.sig` are **never modified after seal**. The
 stored bundle must remain signature and chain verifiable.
