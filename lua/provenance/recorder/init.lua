@@ -90,6 +90,42 @@ function M.setup(opts)
           )
         end
       end
+
+      -- Register the LIVE :ProvenanceSeal command for this active workspace.
+      -- nvim_create_user_command overwrites any prior definition by default,
+      -- so this replaces the inert stub the INACTIVE branch may have left
+      -- behind. The callback closes over the `controller` upvalue (not a
+      -- snapshot) so a later workspace change — which stops the old
+      -- controller and starts a new one via the guard above — still seals
+      -- whatever session is current when :ProvenanceSeal actually runs.
+      vim.api.nvim_create_user_command(SEAL_COMMAND_NAME, function()
+        if not controller then
+          vim.notify("Provenance: no active recording session to seal.", vim.log.levels.INFO)
+          return
+        end
+        local ok, result = pcall(controller.seal)
+        if not ok then
+          vim.notify("Provenance: seal failed: " .. tostring(result), vim.log.levels.ERROR)
+          return
+        end
+        if result.kind == "ok" then
+          if result.warnings and result.warnings.chain_broken then
+            vim.notify(
+              "Provenance: sealed WITH WARNINGS (hash chain broken) -> " .. result.bundle_path,
+              vim.log.levels.WARN
+            )
+          else
+            vim.notify("Provenance: sealed submission bundle -> " .. result.bundle_path, vim.log.levels.INFO)
+          end
+        elseif result.kind == "no_sessions" then
+          vim.notify("Provenance: nothing to seal (no recorded sessions).", vim.log.levels.WARN)
+        else -- write_error (or any other)
+          vim.notify(
+            "Provenance: seal failed: " .. tostring(result.message or result.kind),
+            vim.log.levels.ERROR
+          )
+        end
+      end, { desc = "Provenance: seal the recorded submission bundle" })
     else
       -- Leaving/entering an unactivated workspace stops any live session.
       stop_controller()
