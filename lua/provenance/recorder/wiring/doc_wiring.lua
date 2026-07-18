@@ -17,6 +17,29 @@ local AUGROUP_NAME = "ProvenanceDocWiring"
 -- both must change together if the manifest filename ever changes).
 local MANIFEST_RELS = { [".provenance-manifest"] = true, ["provenance-manifest"] = true }
 
+--- content_bytes(buf) -> string
+---
+--- The single content model used for doc.open's inlined content/hash and
+--- doc.save's hash: buffer lines joined by "\n", PLUS one trailing "\n".
+---
+--- This matches two things that must agree for the analyzer to accept a
+--- bundle: (a) Neovim's default `'fixeol'` (on) always terminates a written
+--- file with a trailing "\n" regardless of the buffer's own line array, so
+--- this is what actually lands on disk (and what seal.lua's raw-byte hash
+--- for submission_files sees); and (b) VS Code's `TextDocument.getText()` —
+--- what the reference recorder (doc-wiring.ts) and the analyzer's delta-
+--- replay reconstruction both assume — models a file ending in "\n" as N+1
+--- lines with an empty last line, which is exactly `join(lines, "\n") ..
+--- "\n"`.
+---
+--- Deferred (not handled here — default unix+fixeol is the scope this gate
+--- needs): fileformat=dos/mac, `'nobinary'`/`'noeol'` buffers, and the
+--- empty-buffer/0-byte-file edge case.
+local function content_bytes(buf)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  return table.concat(lines, "\n") .. "\n"
+end
+
 --- attach(opts) -> handle
 ---
 --- opts:
@@ -163,9 +186,8 @@ function M.attach(opts)
     end
     seen[rel] = true
 
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    local text = table.concat(lines, "\n")
-    local line_count = #lines
+    local line_count = #vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local text = content_bytes(buf)
     local hash = get_hash(text)
 
     local ev = doc_events.transform_doc_open(rel, hash, text, line_count)
@@ -205,17 +227,21 @@ function M.attach(opts)
         end
 
         -- Single line-granular delta representing lines [first, last)
-        -- replaced by lines [first, new_last). Intentionally NOT
-        -- byte/character-precise — the Plan-4 success gate is chain
-        -- integrity + signatures, not byte-perfect delta reconstruction.
-        -- Character-precise diffing is out of scope for this task.
+        -- replaced by lines [first, new_last). Byte-accurate under the
+        -- trailing-newline content model (content_bytes): each buffer line
+        -- in that model is "\n"-terminated, including the (possibly empty)
+        -- line at the old/new line count, so appending "\n" to the new
+        -- lines' join reproduces exactly the bytes being spliced in at
+        -- offsetAt(first,0)..offsetAt(last,0). A pure deletion (new_last ==
+        -- first) has no replacement text, so text is "".
         local new_lines = vim.api.nvim_buf_get_lines(b, first, new_last, false)
+        local text = (new_last > first) and (table.concat(new_lines, "\n") .. "\n") or ""
         local delta = {
           range = {
             start = { line = first, character = 0 },
             ["end"] = { line = last, character = 0 },
           },
-          text = table.concat(new_lines, "\n"),
+          text = text,
         }
 
         local ev = doc_events.transform_doc_change(r, { delta })
@@ -260,8 +286,7 @@ function M.attach(opts)
         return
       end
 
-      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-      local text = table.concat(lines, "\n")
+      local text = content_bytes(buf)
       local hash = get_hash(text)
 
       local ev = doc_events.transform_doc_save(rel, hash)

@@ -102,9 +102,12 @@ describe("doc_wiring.attach", function()
     local ev = find(events, "doc.open")
     assert.is_not_nil(ev)
     assert.equals("foo.txt", ev.data.path)
-    assert.equals(sha256.hex("line1\nline2"), ev.data.sha256)
+    -- Trailing-newline content model: matches nvim's default fixeol
+    -- on-disk bytes and VS Code's getText() semantics (see doc_wiring.lua's
+    -- content_bytes comment).
+    assert.equals(sha256.hex("line1\nline2\n"), ev.data.sha256)
     assert.equals(2, ev.data.line_count)
-    assert.equals("line1\nline2", ev.data.content)
+    assert.equals("line1\nline2\n", ev.data.content)
   end)
 
   it("emits one doc.change per edit, source=typed, well-formed delta", function()
@@ -134,8 +137,28 @@ describe("doc_wiring.attach", function()
       end
     end
 
-    assert.equals("edited1", events[2].data.deltas[1].text)
-    assert.equals("edited2", events[3].data.deltas[1].text)
+    -- Delta text carries a trailing "\n" per replaced-line, matching the
+    -- content_bytes model (new_last > first, so non-empty replacement).
+    assert.equals("edited1\n", events[2].data.deltas[1].text)
+    assert.equals("edited2\n", events[3].data.deltas[1].text)
+  end)
+
+  it("emits an empty-text delta for a pure line deletion", function()
+    local workspace = scratch.workspace()
+    local path = workspace .. "/foo.txt"
+    scratch.write_file(path, "line1\nline2\nline3\n")
+
+    local events, emit = new_emit()
+    scratch.handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+
+    local buf = scratch.edit(path)
+    -- Delete line 2 (0-indexed line 1) with no replacement lines: first=1,
+    -- last=2, new_last=1 -> new_last == first, so text must be "".
+    vim.api.nvim_buf_set_lines(buf, 1, 2, false, {})
+
+    local ev = find(events, "doc.change")
+    assert.is_not_nil(ev)
+    assert.equals("", ev.data.deltas[1].text)
   end)
 
   it("emits doc.save with the current content hash on :write", function()
@@ -153,7 +176,64 @@ describe("doc_wiring.attach", function()
     local ev = find(events, "doc.save")
     assert.is_not_nil(ev)
     assert.equals("foo.txt", ev.data.path)
-    assert.equals(sha256.hex("changed"), ev.data.sha256)
+    assert.equals(sha256.hex("changed\n"), ev.data.sha256)
+  end)
+
+  it("pins the trailing-newline model: doc.open content + doc.change deltas reconstruct to doc.save's hash (analyzer offsetAt/splice)", function()
+    local workspace = scratch.workspace()
+    local path = workspace .. "/foo.txt"
+    scratch.write_file(path, "line1\nline2\nline3\n")
+
+    local events, emit = new_emit()
+    scratch.handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+
+    local buf = scratch.edit(path)
+    -- Replace 1 line with 2 (first=1, last=2, new_last=3): exercises the
+    -- delta model where the replacement text is longer than what it
+    -- replaces, and where an interior (not final) line boundary is spliced.
+    vim.api.nvim_buf_set_lines(buf, 1, 2, false, { "EDITED-a", "EDITED-b" })
+    vim.cmd("write")
+
+    local open_ev = find(events, "doc.open")
+    local save_ev = find(events, "doc.save")
+    assert.is_not_nil(open_ev)
+    assert.is_not_nil(save_ev)
+
+    -- Minimal Lua reimplementation of the real analyzer's offsetAt/splice
+    -- (packages/analysis-core/src/index/reconstruct-file.ts): a flat
+    -- content string plus a line-start index, {line, character=0} only
+    -- (matches what doc_wiring ever emits — character is always 0).
+    local function line_starts(content)
+      local starts = { 0 }
+      for i = 1, #content do
+        if content:sub(i, i) == "\n" then
+          table.insert(starts, i)
+        end
+      end
+      return starts
+    end
+
+    local function offset_at(content, starts, line)
+      if line + 1 <= #starts then
+        return starts[line + 1]
+      end
+      return #content
+    end
+
+    local content = open_ev.data.content
+    for _, ev in ipairs(events) do
+      if ev.kind == "doc.change" then
+        for _, delta in ipairs(ev.data.deltas) do
+          local starts = line_starts(content)
+          local s = offset_at(content, starts, delta.range.start.line)
+          local e = offset_at(content, starts, delta.range["end"].line)
+          content = content:sub(1, s) .. delta.text .. content:sub(e + 1)
+        end
+      end
+    end
+
+    assert.equals("line1\nEDITED-a\nEDITED-b\nline3\n", content)
+    assert.equals(sha256.hex(content), save_ev.data.sha256)
   end)
 
   it("never records a file under provenance_dir (self-loop prevention)", function()
