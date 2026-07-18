@@ -1,12 +1,14 @@
---- Activation bootstrap (design.md §5, task 6): the plugin entry point that
---- wires activation.load_and_verify + state + status together behind
---- VimEnter/DirChanged autocmds. This is the FINAL wiring task of Plan 3 —
---- it records nothing yet (recording is Plan 4). On an active workspace it
---- populates the module-level RecorderState and attaches the status
---- segment; on an inactive workspace it registers an inert :ProvenanceSeal
---- stub that only shows guidance and never records.
+--- Activation bootstrap (design.md §5): the plugin entry point that wires
+--- activation.load_and_verify + state + status together behind
+--- VimEnter/DirChanged autocmds. On an active workspace it populates the
+--- module-level RecorderState, attaches the status segment, and (Plan 9)
+--- starts the full-signals recording_controller for that workspace — stopping
+--- it on deactivation/dispose. On an inactive workspace it registers an inert
+--- :ProvenanceSeal stub that only shows guidance and never records.
 local state_mod = require("provenance.recorder.state")
 local status = require("provenance.recorder.status")
+local recording_controller = require("provenance.recorder.session.recording_controller")
+local core_clock = require("provenance.core.clock")
 
 local M = {}
 
@@ -28,6 +30,30 @@ function M.setup(opts)
   -- Module-level RecorderState: single-workspace, one Neovim session.
   local state = state_mod.new()
 
+  -- The full-signals recording session started on a real activation (Plan 9).
+  -- Injectable seam: opts.start_recording defaults to the real controller.
+  local start_recording = opts.start_recording or recording_controller.start
+
+  -- Only start a REAL recording session on a REAL activation. init_spec injects
+  -- a fake load_and_verify and asserts state/status/augroup WITHOUT starting a
+  -- live session (its fake manifest has no sig/files_under_review and its
+  -- workspace is a throwaway path). Gate the start: skip when the loader was
+  -- injected, UNLESS a fake start_recording was ALSO injected (the seam a
+  -- controller-wiring test would use to observe the start without a real one).
+  local should_start_recording = (opts.load_and_verify == nil) or (opts.start_recording ~= nil)
+
+  -- Lifecycle: at most one live controller, keyed by the workspace it records.
+  local controller = nil
+  local controller_workspace = nil
+
+  local function stop_controller()
+    if controller then
+      pcall(controller.stop, "deactivate")
+      controller = nil
+      controller_workspace = nil
+    end
+  end
+
   -- Factored so both the immediate setup() call and the later
   -- VimEnter/DirChanged autocmds drive the exact same resolve+load+apply
   -- path (task brief requirement).
@@ -38,7 +64,35 @@ function M.setup(opts)
     if result.status == "active" then
       state.activate({ workspace = workspace, manifest = result.manifest })
       status.attach(state)
+
+      -- Start the live recording controller for this workspace (Plan 9). The
+      -- controller-workspace guard makes this idempotent: a re-fire of
+      -- resolve_and_apply for the SAME already-recording workspace (e.g. the
+      -- immediate call plus a VimEnter) leaves the existing session running
+      -- rather than leaking it and starting a second one. A genuine workspace
+      -- change stops the old session first. pcall-guarded so a start failure
+      -- degrades gracefully rather than breaking Neovim startup.
+      if should_start_recording and controller_workspace ~= workspace then
+        stop_controller()
+        local ok, c = pcall(start_recording, {
+          workspace = workspace,
+          provenance_dir = workspace .. "/.provenance",
+          manifest = result.manifest,
+          clock = core_clock.system(),
+        })
+        if ok then
+          controller = c
+          controller_workspace = workspace
+        elseif vim.g.provenance_debug then
+          vim.notify(
+            "Provenance: failed to start recording: " .. tostring(c),
+            vim.log.levels.ERROR
+          )
+        end
+      end
     else
+      -- Leaving/entering an unactivated workspace stops any live session.
+      stop_controller()
       -- Silent by default: an unactivated cwd (e.g. the student's home
       -- directory, an unrelated project) is the common case, not something
       -- to surface to the user every time they open Neovim or `cd`s.
@@ -86,6 +140,7 @@ function M.setup(opts)
   --- autocmds), the attached status, and the inert seal command if one was
   --- created. Idempotent-ish: safe to call once per handle.
   function handle.dispose()
+    stop_controller()
     pcall(vim.api.nvim_del_augroup_by_name, AUGROUP_NAME)
     status.detach()
     pcall(vim.api.nvim_del_user_command, SEAL_COMMAND_NAME)

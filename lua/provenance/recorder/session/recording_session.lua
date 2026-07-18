@@ -33,6 +33,16 @@ local checkpoint_cadence = require("provenance.recorder.session.checkpoint_caden
 local checkpoint_scheduler = require("provenance.recorder.session.checkpoint_scheduler")
 local doc_wiring = require("provenance.recorder.wiring.doc_wiring")
 local heartbeat = require("provenance.recorder.events.heartbeat")
+-- Plan 9 additional signals (only wired when opts.enable_signals is true; see
+-- M.start). recording_session with enable_signals=false stays byte-identical to
+-- its pre-Plan-9 behavior — none of these are required-at-runtime unless enabled.
+local external_change_coordinator = require("provenance.recorder.watch.external_change_coordinator")
+local paste_assembly = require("provenance.recorder.wiring.paste_assembly")
+local terminal_wiring = require("provenance.recorder.wiring.terminal_wiring")
+local git_wiring = require("provenance.recorder.wiring.git_wiring")
+local snapshot_wiring = require("provenance.recorder.wiring.snapshot_wiring")
+local clock_skew_watcher = require("provenance.recorder.events.clock_skew_watcher")
+local explanation_tags = require("provenance.recorder.events.explanation_tags")
 local seal_cmd = require("provenance.recorder.commands.seal")
 local chain_recovery = require("provenance.recorder.startup.chain_recovery")
 local uv_recovery_deps = require("provenance.recorder.startup.uv_recovery_deps")
@@ -120,6 +130,24 @@ function M.start(opts)
   local manifest = opts.manifest
   local clock = opts.clock
   local checkpoint_interval = opts.checkpoint_interval or 100
+
+  -- Plan 9 CAPSTONE seam: when false/absent (the default), recording_session
+  -- behaves EXACTLY as it did pre-Plan-9 (the lean core used by focused specs
+  -- + the e2e driver). When true, the additional signals (paste, external-
+  -- change, terminal/git/snapshot, clock-skew) are wired below with the
+  -- ordering they require. recording_controller.start sets this true.
+  local enable_signals = opts.enable_signals
+
+  -- Shared explanation tagger (only when signals are enabled): BOTH the
+  -- external-change coordinator and git wiring mark it, so a git op explains a
+  -- nearby external change (tagger.consume() in save_time_checker). Created
+  -- before the coordinator so the same instance is threaded into both.
+  local tagger = enable_signals and explanation_tags.new({ get_now = clock.now }) or nil
+
+  -- Forward-declared signal sub-handles so session.stop()'s closure can
+  -- dispose them (they are only assigned below when enable_signals is true;
+  -- nil-guarded in stop() so the disabled path is a no-op).
+  local coordinator, paste, term, git, snap, skew
 
   -- Forward-declared: the disk-full handler's on_degraded closure (built
   -- below, before the writer/host exist) must call host.emit(...), but
@@ -289,15 +317,60 @@ function M.start(opts)
     host.emit("recorder.recovered_from_corruption", { quarantined_path = recovery.quarantined_path })
   end
 
+  -- 8c. External-change coordinator (Plan 9): MUST be created AFTER host
+  -- exists (it needs host.emit) and AFTER session.start is emitted, but
+  -- BEFORE doc-wiring, because doc-wiring below takes the coordinator's
+  -- methods as its `external_change` dependency. Shares the tagger with git
+  -- wiring so a git op can explain a nearby external change.
+  if enable_signals then
+    coordinator = external_change_coordinator.start({
+      workspace = workspace,
+      files_under_review = manifest.files_under_review,
+      emit = host.emit,
+      tagger = tagger,
+      get_now = clock.now,
+    })
+  end
+
   -- 9. Doc-wiring: attaches buffer/autocmd listeners and (as part of
   -- attach()'s catch-up pass) emits doc.open for already-open recordable
-  -- buffers, chained after session.start.
+  -- buffers, chained after session.start. When signals are enabled, the
+  -- coordinator's methods are threaded in as `external_change` so doc.open
+  -- seeds the expected-content baseline, on_lines keeps it current, and
+  -- BufWritePost reconciles/checks it (Path 1). Omitted (nil) when disabled
+  -- -> doc-wiring is byte-identical to pre-Plan-9.
   local wiring = doc_wiring.attach({
     workspace = workspace,
     provenance_dir = provenance_dir,
     files_under_review = manifest.files_under_review,
     emit = host.emit,
+    external_change = coordinator and {
+      seed_open = coordinator.seed_open,
+      apply_change = coordinator.apply_change,
+      reconcile_save = coordinator.reconcile_save,
+      note_save = coordinator.note_save,
+      check_after_save = coordinator.check_after_save,
+    } or nil,
   })
+
+  -- 9b. Paste assembly (Plan 9): MUST be started AFTER doc-wiring, because it
+  -- installs doc-wiring's change_router (set_change_router) to fuse the three
+  -- paste-detection signals. Disposed BEFORE wiring in stop() so it unhooks
+  -- the router first.
+  if enable_signals then
+    paste = paste_assembly.attach({ emit = host.emit, doc_wiring_handle = wiring })
+  end
+
+  -- 9c. Terminal / git / snapshot / clock-skew signals (Plan 9). snapshot
+  -- emits an ext.snapshot immediately on start; git degrades to an inert
+  -- handle when the workspace is not a git repo; clock-skew + snapshot both
+  -- run unref'd timers that never block headless exit.
+  if enable_signals then
+    term = terminal_wiring.start({ emit = host.emit })
+    git = git_wiring.start({ workspace = workspace, emit = host.emit, tagger = tagger })
+    snap = snapshot_wiring.start({ emit = host.emit })
+    skew = clock_skew_watcher.start({ emit = host.emit })
+  end
 
   -- 10. Heartbeat: production defaults (get_focused/get_active_file) come
   -- from heartbeat's own simple defaults; only the session's clock is
@@ -318,6 +391,24 @@ function M.start(opts)
     is_degraded = disk_full.is_degraded,
     _ring_snapshot = disk_full.ring_snapshot,
   }
+
+  -- TEST SEAM (Plan 9): expose the signal sub-handles so the integration test
+  -- can force deterministic ticks (heartbeat._tick, clock_skew._tick,
+  -- snapshot._tick) and drive coordinator paths directly. Only populated when
+  -- signals are enabled; nil otherwise (so the disabled path exposes no new
+  -- surface — existing specs see the exact same session table).
+  if enable_signals then
+    session._signals = {
+      heartbeat = hb,
+      paste = paste,
+      coordinator = coordinator,
+      terminal = term,
+      git = git,
+      snapshot = snap,
+      clock_skew = skew,
+      tagger = tagger,
+    }
+  end
 
   --- TEST-ONLY HOOK: deterministically drive the disk-full handler into
   --- degraded mode without needing a real ENOSPC on disk. Just calls
@@ -367,6 +458,19 @@ function M.start(opts)
     -- Drain any pending checkpoint (including one scheduled by session.end
     -- itself) so it is signed+persisted to the meta before teardown.
     scheduler.drain()
+
+    -- Dispose the Plan 9 signal handles (each nil when signals were disabled,
+    -- so guarded; each own dispose() is idempotent). Order matters:
+    --   - paste BEFORE wiring: paste unhooks doc-wiring's change_router.
+    --   - coordinator releases its fs_poll watchers + FileChangedShellPost
+    --     augroup (no libuv/autocmd leak -> clean headless exit).
+    -- Then the always-present hb/wiring/writer teardown, unchanged.
+    if paste then paste.dispose() end
+    if coordinator then coordinator.dispose() end
+    if skew then skew.dispose() end
+    if snap then snap.dispose() end
+    if git then git.dispose() end
+    if term then term.dispose() end
 
     hb.dispose()
     wiring.dispose()
