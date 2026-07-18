@@ -61,6 +61,27 @@ describe("paste_correlator: confirmed paste via intercept", function()
     assert.same(paste_payload.build_paste_payload(clip), decision.payload)
   end)
 
+  it("intercept + matching single-delta NON-EMPTY-range change (e.g. paste replacing a selection) within window -> paste, range passed through", function()
+    local c = new_correlator()
+    local clip = "HELLO WORLD, THIS IS A PASTED CLIPBOARD STRING"
+    assert.is_true(#clip >= 30)
+
+    c.on_paste_intercept(clip, 0)
+
+    -- Non-empty range: start ~= end, as Neovim's line-granular on_lines
+    -- delta always reports for a real vim.paste (it "replaces" the line(s)
+    -- the cursor sits on, e.g. a paste over a selection).
+    local range = non_empty_range(3, 4, 9)
+    local deltas = { delta(clip, range) }
+    local decision = c.on_doc_change(deltas, range, 1)
+
+    assert.equals("paste", decision.kind)
+    assert.same(range, decision.range)
+    assert.equals(clip, decision.payload.content)
+    assert.equals(#clip, decision.payload.length)
+    assert.equals(core_sha256.hex(clip), decision.payload.sha256)
+  end)
+
   it("consumes the pending intercept: a later change (no new intercept) is NOT confirmed by it", function()
     local c = new_correlator()
     local clip = "HELLO WORLD, THIS IS A PASTED CLIPBOARD STRING"
@@ -238,14 +259,14 @@ describe("paste_correlator: paste_likely without any intercept", function()
     assert.equals(1, c.counts().large_insert)
   end)
 
-  it("single-delta, NON-EMPTY range, >=30 chars, no intercept -> doc.change source=paste_likely (not shape-fit), large_insert_count incremented", function()
+  it("single-delta, NON-EMPTY range, >=30 chars, no intercept -> paste (single delta is shape-fit regardless of range emptiness), large_insert_count incremented", function()
     local c = new_correlator()
     local text = string.rep("z", 40)
     local range = non_empty_range(0, 0, 5)
     local decision = c.on_doc_change({ delta(text, range) }, range, 5)
 
-    assert.equals("doc.change", decision.kind)
-    assert.equals("paste_likely", decision.source)
+    assert.equals("paste", decision.kind)
+    assert.equals(text, decision.payload.content)
     assert.equals(1, c.counts().large_insert)
   end)
 end)

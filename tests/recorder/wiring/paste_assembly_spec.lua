@@ -4,36 +4,29 @@
 --- repo's convention for wiring-layer specs (see doc_wiring_spec.lua,
 --- paste_intercept_spec.lua).
 ---
---- IMPORTANT PORT NOTE (documented per task-6-brief's fallback clause):
---- Neovim's default `vim.paste` always applies pasted text via a CHARWISE
---- `nvim_put`, which — empirically verified against real Neovim 0.12 (see
---- probes run during implementation) — ALWAYS reports an on_lines callback
---- that "replaces" exactly the one line the cursor sits on (first ==
---- last - 1), even when pasting into an empty line or appending at the very
---- end of the buffer. It NEVER produces a first == last ("empty range",
---- zero-existing-lines-touched) delta. That shape only arises from a pure
+--- PORT NOTE: Neovim's default `vim.paste` always applies pasted text via a
+--- CHARWISE `nvim_put`, which — empirically verified against real Neovim
+--- 0.12 — ALWAYS reports an on_lines callback that "replaces" exactly the
+--- one line the cursor sits on (first == last - 1), even when pasting into
+--- an empty line. It NEVER produces a first == last ("empty range",
+--- zero-existing-lines-touched) delta; that shape only arises from a pure
 --- new-line INSERT (no deletion), e.g. `nvim_buf_set_lines(buf, N, N, ...)`.
---- Consequently, a real single-shot `vim.paste()` call, by itself, always
---- routes through paste_correlator as `doc.change source="paste_likely"`
---- (confirmed-but-not-shape-fit) rather than a `paste` event — the `paste`
---- kind requires the empty-range shape that only a genuine insert-only
---- buffer mutation produces.
 ---
---- To exercise the real `paste` kind end-to-end without touching
---- correlator/doc_wiring behavior (out of scope for this task), the "real
---- paste" test below:
----   1. Uses the REAL global `vim.paste` (via a decoy scratch buffer not
----      tracked by doc_wiring) to drive the REAL paste_intercept wrapping —
----      this is the genuine signal 2/3 intercept path.
----   2. Applies the resulting insertion to the RECORDABLE buffer via a real,
----      legitimate Neovim buffer mutation that happens to produce the
----      empty-range shape (`nvim_buf_set_lines(buf, N, N, ...)`, i.e. what a
----      pure new-line insert looks like) — a real on_lines callback, through
----      the real doc_wiring attach + real router + real correlator.
+--- paste_correlator.is_paste_shaped no longer requires an empty range (see
+--- that module's header for why the empty-range check was a VS Code
+--- artifact that never fit Neovim's line-granular on_lines deltas) — it
+--- only requires a SINGLE delta, which a real, single-shot `vim.paste()`
+--- always produces. So the "real paste" test below drives the paste
+--- straight through the genuine path: a real global `vim.paste` (wrapped by
+--- the real paste_intercept, feeding signals 2/3) applied directly to the
+--- RECORDABLE buffer (a real on_lines callback, through the real
+--- doc_wiring attach + real router + real correlator) — no decoy buffer or
+--- manual buffer-mutation workaround needed.
+---
 --- Per doc_wiring's own fileformat-aware content model (see
 --- doc_wiring_spec.lua: "Delta text carries a trailing \n per replaced-line"),
---- an inserted line's delta text always carries a trailing eol, so the
---- pasted content the correlator sees (and thus the emitted `paste` event's
+--- a replaced line's delta text always carries a trailing eol, so the pasted
+--- content the correlator sees (and thus the emitted `paste` event's
 --- `content`) is `<clip> .. "\n"`, not the bare clipboard string. This is
 --- doc_wiring's existing, pre-Plan-6 content model — not something this
 --- assembly changes.
@@ -180,10 +173,10 @@ describe("paste_assembly.attach", function()
     scratch.teardown()
   end)
 
-  it("real paste (>=30 chars, via real vim.paste intercept) -> exactly one `paste` event with content/length/sha256/range", function()
+  it("real paste (>=30 chars, via real vim.paste applied directly to the recordable buffer) -> exactly one `paste` event with content/length/sha256/range", function()
     local workspace = scratch.workspace()
     local path = workspace .. "/foo.txt"
-    scratch.write_file(path, "line1\nline2\n")
+    scratch.write_file(path, "")
 
     local events, emit = new_emit()
     scratch.doc_handle = doc_wiring.attach({ workspace = workspace, emit = emit })
@@ -197,17 +190,13 @@ describe("paste_assembly.attach", function()
     local clip = string.rep("p", 32) -- >=30 chars, no newline
     assert.is_true(#clip >= 30)
 
-    -- Signal 2/3: REAL vim.paste, on a decoy buffer doc_wiring never
-    -- attaches to, so its own charwise mutation emits nothing.
-    local decoy = scratch.scratch_buf()
-    vim.api.nvim_set_current_buf(decoy)
+    -- Real vim.paste, applied directly to the RECORDABLE buffer's single
+    -- (initially empty) line. This drives BOTH the real paste_intercept
+    -- wrapping (signals 2/3, since vim.paste is a single global seam, not
+    -- per-buffer) AND a real on_lines callback through doc_wiring's actual
+    -- buffer attach (signal 1 + the router) -- no decoy buffer needed.
     vim.fn.setreg("+", clip)
     vim.paste({ clip }, -1)
-
-    -- Apply the paste to the RECORDABLE buffer as a genuine insert-only
-    -- edit (empty-range on_lines shape; see module header comment).
-    vim.api.nvim_set_current_buf(buf)
-    vim.api.nvim_buf_set_lines(buf, 0, 0, false, { clip })
 
     assert.equals(1, count(events, "paste"))
     local ev = find(events, "paste")
@@ -220,11 +209,16 @@ describe("paste_assembly.attach", function()
     assert.is_nil(ev.data.content_head)
     assert.is_nil(ev.data.content_tail)
 
+    -- Real vim.paste's charwise nvim_put replaces exactly the one line the
+    -- cursor sits on (first == last - 1, per the module header note) -- a
+    -- non-empty range, which is exactly the case the correlator fix makes
+    -- reachable. `character` is always 0 on both ends (doc_wiring hardcodes
+    -- it; see doc_wiring.lua's on_lines delta construction).
     assert.is_not_nil(ev.data.range)
     assert.equals(0, ev.data.range.start.line)
-    assert.equals(0, ev.data.range["end"].line)
-    assert.equals(ev.data.range.start.line, ev.data.range["end"].line)
-    assert.equals(ev.data.range.start.character, ev.data.range["end"].character)
+    assert.equals(1, ev.data.range["end"].line)
+    assert.equals(0, ev.data.range.start.character)
+    assert.equals(0, ev.data.range["end"].character)
 
     -- No doc.change fired for this same edit (routed to `paste` instead).
     assert.equals(0, count(events, "doc.change"))
@@ -252,7 +246,7 @@ describe("paste_assembly.attach", function()
     assert.equals(0, count(events, "paste"))
   end)
 
-  it("bulk multi-line insert (>=30 chars, newline, non-empty range, no intercept) -> doc.change source=paste_likely", function()
+  it("bulk multi-line insert (>=30 chars, newline, non-empty range, no intercept) -> paste (single delta is shape-fit regardless of range)", function()
     local workspace = scratch.workspace()
     local path = workspace .. "/foo.txt"
     scratch.write_file(path, "line1\nline2\n")
@@ -268,18 +262,24 @@ describe("paste_assembly.attach", function()
     -- Replace existing line 0 (non-empty range: first=0, last=1) with
     -- several lines totalling >=30 chars -- a single delta whose text
     -- contains embedded newlines, classified paste_likely by rule 1 (single
-    -- delta >= 30 chars) regardless of the embedded newline.
+    -- delta >= 30 chars) regardless of the embedded newline. doc_wiring's
+    -- on_lines always produces exactly ONE delta per callback, so this is
+    -- still shape-fit (is_paste_shaped only checks #deltas == 1, not range
+    -- emptiness -- see paste_correlator.lua) and routes to `paste`, not
+    -- `doc.change source=paste_likely` -- that source is only reachable via
+    -- a genuine multi-delta input, which doc_wiring never produces (see
+    -- paste_conformance_spec.lua's DocChangePayload test for how that shape
+    -- is still proven).
     vim.api.nvim_buf_set_lines(buf, 0, 1, false, {
       string.rep("a", 15),
       string.rep("b", 15),
       string.rep("c", 15),
     })
 
-    assert.equals(1, count(events, "doc.change"))
-    local ev = find(events, "doc.change")
+    assert.equals(1, count(events, "paste"))
+    local ev = find(events, "paste")
     assert.equals("foo.txt", ev.data.path)
-    assert.equals("paste_likely", ev.data.source)
-    assert.equals(0, count(events, "paste"))
+    assert.equals(0, count(events, "doc.change"))
   end)
 
   it("diverging intercept/large-insert counts -> paste.anomaly with per-interval deltas", function()
@@ -338,13 +338,18 @@ describe("paste_assembly.attach", function()
     assert.is_not.equals(orig_paste, vim.paste)
 
     local buf = scratch.edit(path)
-    -- A bulk edit BEFORE dispose, to prove the assembly is live.
+    -- A bulk edit BEFORE dispose, to prove the assembly is live. Single
+    -- delta, paste_likely-classified, no intercept -> routes to a `paste`
+    -- event (is_paste_shaped only requires a single delta now, not an empty
+    -- range -- see paste_correlator.lua and the "bulk multi-line insert"
+    -- test above).
     vim.api.nvim_buf_set_lines(buf, 0, 1, false, {
       string.rep("a", 15),
       string.rep("b", 15),
       string.rep("c", 15),
     })
-    assert.equals("paste_likely", find(events, "doc.change").data.source)
+    assert.equals(1, count(events, "paste"))
+    assert.equals(0, count(events, "doc.change"))
 
     assembly.dispose()
 

@@ -16,13 +16,16 @@
 ---
 --- Events are generated via the REAL assembly (doc_wiring + paste_assembly),
 --- exercising the actual production code path, then their captured `data`
---- tables are checked against the allowed field sets above. See
---- paste_assembly_spec.lua's module header for why the `paste` kind test
---- drives the empty-range shape via a real insert-only buffer mutation
---- rather than relying on vim.paste's own (always non-empty-range) charwise
---- put.
+--- tables are checked against the allowed field sets above. The
+--- `doc.change`/source=paste_likely case is the one exception: it is no
+--- longer reachable via a real doc_wiring buffer edit at all (see that
+--- test's own comment for why), so it instead drives paste_correlator +
+--- doc_events directly, replicating paste_assembly.lua's router construction
+--- exactly.
 local doc_wiring = require("provenance.recorder.wiring.doc_wiring")
 local paste_assembly = require("provenance.recorder.wiring.paste_assembly")
+local paste_correlator = require("provenance.recorder.events.paste_correlator")
+local doc_events = require("provenance.recorder.events.doc_events")
 
 --- See paste_assembly_spec.lua's `install_local_clipboard` for why: Plenary's
 --- directory runner spawns one real `nvim --headless` subprocess per spec
@@ -224,14 +227,9 @@ describe("paste assembly: payload-shape conformance (log-core events.ts)", funct
 
     local buf = scratch.edit(path)
 
-    -- typed
+    -- typed: the only source doc_wiring's real on_lines path can still
+    -- produce as a doc.change (< 30 chars, not confirmed, not paste_likely).
     vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "hi" })
-    -- paste_likely
-    vim.api.nvim_buf_set_lines(buf, 1, 2, false, {
-      string.rep("a", 15),
-      string.rep("b", 15),
-      string.rep("c", 15),
-    })
 
     local allowed = { path = true, deltas = true, source = true }
     local source_enum = { typed = true, paste_likely = true, paste_confirmed = true }
@@ -254,7 +252,43 @@ describe("paste assembly: payload-shape conformance (log-core events.ts)", funct
     end
 
     assert.is_true(seen_sources["typed"])
-    assert.is_true(seen_sources["paste_likely"])
+
+    -- paste_likely: NOT reachable via a real doc_wiring buffer edit anymore.
+    -- doc_wiring's on_lines always calls the change-router with exactly ONE
+    -- delta per callback (see doc_wiring.lua's on_lines), and
+    -- paste_correlator.is_paste_shaped now accepts ANY single delta (see
+    -- paste_correlator.lua's header) -- so every classifier-flagged or
+    -- confirmed single-delta change from real doc_wiring now emits `paste`,
+    -- never `doc.change source=paste_likely`. That source value remains
+    -- part of the type union for a MULTI-delta correlator decision (pinned
+    -- by paste_correlator_spec.lua), which only a caller other than
+    -- doc_wiring could produce. Prove the DocChangePayload shape for it here
+    -- by driving the correlator with a genuine multi-delta input and
+    -- building the event exactly as paste_assembly.lua's router does (its
+    -- own logic is a source-agnostic doc_events.transform_doc_change call
+    -- plus a plain `source` field override), rather than asserting
+    -- something a real single buffer edit can no longer produce.
+    local correlator = paste_correlator.new({ get_now = function()
+      return 0
+    end })
+    local d1 = { range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 0 } }, text = string.rep("m", 15) }
+    local d2 = { range = { start = { line = 1, character = 0 }, ["end"] = { line = 1, character = 0 } }, text = string.rep("n", 16) .. "\n" }
+    local range = { start = { line = 0, character = 0 }, ["end"] = { line = 1, character = 0 } }
+    local decision = correlator.on_doc_change({ d1, d2 }, range, 0)
+    assert.equals("doc.change", decision.kind)
+    assert.equals("paste_likely", decision.source)
+
+    local built = doc_events.transform_doc_change("foo.txt", decision.deltas)
+    built.data.source = decision.source
+
+    assert_key_set(built.data, allowed, "DocChangePayload")
+    assert.is_string(built.data.path)
+    assert.is_table(built.data.deltas)
+    assert.equals("paste_likely", built.data.source)
+    for _, delta in ipairs(built.data.deltas) do
+      assert.is_table(delta.range)
+      assert.is_string(delta.text)
+    end
   end)
 
   it("`paste.anomaly` event data matches PasteAnomalyPayload EXACTLY: {intercepted_count:number, large_insert_count:number}, no other fields", function()

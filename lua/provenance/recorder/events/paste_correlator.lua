@@ -13,12 +13,32 @@
 --- DECISION TREE (see on_doc_change): a change is routed to a `paste` event
 --- only when BOTH (a) it is either a CONFIRMED intercept (content-matched,
 --- within the time window) or classifier-flagged "paste_likely", AND
---- (b) it is PasteDecision-shaped — a single delta at an EMPTY range (pure
---- insertion). That shape constraint exists because PastePayload can only
---- carry one range + one text; a multi-delta edit or a delta that REPLACES
---- an existing range (non-empty range) cannot be represented that way
---- without lossy reconstruction, so those route to `doc.change` with
---- `source = "paste_likely"` instead — preserving every delta faithfully.
+--- (b) it is PasteDecision-shaped — exactly ONE delta, at ANY range (empty
+--- or non-empty). That shape constraint exists because PastePayload can
+--- only carry one range + one text; a single delta = one range + one text
+--- fits it exactly, regardless of whether that range is an empty insertion
+--- point or a non-empty replacement. A MULTI-delta edit cannot be
+--- represented that way without lossy reconstruction (it would collapse
+--- several distinct ranges into one), so multi-delta edits route to
+--- `doc.change` with `source = "paste_likely"` instead — preserving every
+--- delta faithfully.
+---
+--- NOTE ON THE EMPTY-RANGE CHECK THIS REPLACED: an earlier version of this
+--- shape check additionally required the single delta's range to be EMPTY
+--- (start == end), ported directly from VS Code's `isSinglePasteShaped`.
+--- That was a VS Code artifact, not a real PastePayload constraint: VS
+--- Code's contentChange range IS the pure insertion point for a paste, so
+--- checking for emptiness was just re-deriving "this is a paste, not a
+--- replacement" from a signal that happens to be reliable in VS Code.
+--- Neovim's `on_lines` delta is line-granular — a real `vim.paste` (even a
+--- pure insert) is reported as replacing the line(s) the cursor sits on, so
+--- its range is essentially always non-empty (first ~= last). Requiring
+--- emptiness made every real paste fail the shape check and fall back to
+--- `doc.change source="paste_likely"`, so the `paste` event kind (with
+--- content/sha256/length) was unreachable in practice. The analyzer's
+--- `applyPaste` and `applyDelta` both bottom out in the same range-agnostic
+--- splice, so a paste event with a non-empty range reconstructs correctly —
+--- there was never a correctness reason to require emptiness here.
 --- Anything neither confirmed nor paste_likely is plain typing:
 --- `doc.change` `source = "typed"`.
 ---
@@ -81,10 +101,6 @@ local function matches(inserted, clipboard)
   return false
 end
 
-local function same_position(a, b)
-  return a.line == b.line and a.character == b.character
-end
-
 --- @param opts table  { window_ms?, get_now, similarity? }
 --- @return table c  { on_paste_intercept, on_doc_change, counts }
 function M.new(opts)
@@ -141,7 +157,7 @@ function M.new(opts)
       confirmed = true
     end
 
-    local is_paste_shaped = #deltas == 1 and same_position(deltas[1].range.start, deltas[1].range["end"])
+    local is_paste_shaped = #deltas == 1
 
     if (confirmed or classification == "paste_likely") and is_paste_shaped then
       if confirmed then
