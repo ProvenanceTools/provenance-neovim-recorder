@@ -177,6 +177,28 @@ describe("doc_wiring.attach", function()
     assert.equals(0, #events)
   end)
 
+  it("never records a file under provenance_dir created AFTER attach (realpath symmetry)", function()
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    -- Do NOT create provenance_dir yet — attach() must exclude it from the
+    -- moment it exists, not just if it already existed at attach() time.
+
+    local events, emit = new_emit()
+    scratch.handle = doc_wiring.attach({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      emit = emit,
+    })
+
+    vim.fn.mkdir(provenance_dir, "p")
+    local path = provenance_dir .. "/session-x.slog"
+    scratch.write_file(path, "some log content\n")
+
+    scratch.edit(path)
+
+    assert.equals(0, #events)
+  end)
+
   it("never records the .provenance-manifest file", function()
     local workspace = scratch.workspace()
     local path = workspace .. "/.provenance-manifest"
@@ -251,6 +273,22 @@ describe("doc_wiring.attach", function()
     vim.cmd("edit!")
 
     assert.equals(1, count(events, "doc.open"))
+  end)
+
+  it("emits doc.close exactly once per close (BufDelete + BufUnload both fire)", function()
+    local workspace = scratch.workspace()
+    local path = workspace .. "/foo.txt"
+    scratch.write_file(path, "content\n")
+
+    local events, emit = new_emit()
+    scratch.handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+
+    local buf = scratch.edit(path)
+    vim.cmd("bwipeout! " .. buf)
+
+    assert.equals(1, count(events, "doc.close"))
+    local ev = find(events, "doc.close")
+    assert.equals("foo.txt", ev.data.path)
   end)
 
   it("dispose() removes the augroup and no further events emit", function()

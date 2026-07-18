@@ -31,6 +31,15 @@ local MANIFEST_RELS = { [".provenance-manifest"] = true, ["provenance-manifest"]
 ---                                    for tests.
 ---
 --- Returns a handle with handle.dispose().
+--- Best-effort realpath: returns the normalized realpath if it resolves,
+--- nil otherwise (e.g. the path doesn't exist yet). Kept separate from
+--- resolve_dir so callers that need to know resolution failed (to retry
+--- later) can tell the difference from "resolved to itself".
+local function try_realpath(normalized_path)
+  local real = vim.uv.fs_realpath(normalized_path)
+  return real and vim.fs.normalize(real) or nil
+end
+
 --- Resolve a directory to the same absolute form Neovim uses internally for
 --- buffer names (nvim_buf_get_name performs realpath-style resolution of
 --- existing path components — e.g. macOS's /tmp and /var are symlinks into
@@ -43,15 +52,29 @@ local function resolve_dir(path)
     return nil
   end
   local normalized = vim.fs.normalize(path)
-  local real = vim.uv.fs_realpath(normalized)
-  return real and vim.fs.normalize(real) or normalized
+  return try_realpath(normalized) or normalized
 end
 
 function M.attach(opts)
   opts = opts or {}
 
+  -- The workspace is the activated assignment root, so it always exists at
+  -- attach() time — its realpath resolution is immediate and stable.
   local workspace = resolve_dir(opts.workspace)
-  local provenance_dir = resolve_dir(opts.provenance_dir)
+
+  -- provenance_dir may NOT exist yet at attach() time (e.g. before the
+  -- first checkpoint/seal creates it). Resolving it once with a
+  -- non-realpath'd fallback would leave `provenance_dir` permanently in a
+  -- form (e.g. /var/...) that Neovim's realpath'd buffer names (e.g.
+  -- /private/var/... on macOS) never match, letting files created under it
+  -- after attach slip through the exclusion (the self-feeding-loop bug).
+  -- Instead: cache the realpath once it resolves, but keep retrying inside
+  -- is_recordable (autocmd-driven only — never the on_lines hot path)
+  -- until it does, so the exclusion becomes effective the moment the
+  -- directory exists — never falling back to an un-realpath'd guess.
+  local provenance_dir_input = opts.provenance_dir and vim.fs.normalize(opts.provenance_dir) or nil
+  local provenance_dir = provenance_dir_input and try_realpath(provenance_dir_input)
+
   local emit = opts.emit
   local get_hash = opts.get_hash or default_sha256.hex
 
@@ -62,6 +85,13 @@ function M.attach(opts)
   -- doc.open, matching the reference implementation (CLAUDE.md: no registry
   -- deletion on close).
   local seen = {}
+
+  -- De-dup for doc.close: BufDelete and BufUnload both fire for a single
+  -- real close, and this module registers one callback on both. Keyed by
+  -- buffer id; cleared when the buffer is (re)recognized as open via
+  -- BufReadPost/BufNewFile so a genuine close->reopen->close still emits a
+  -- second doc.close.
+  local closed = {}
 
   -- Buffers we've called nvim_buf_attach on, and the workspace-relative path
   -- cached at attach time so the on_lines hot path never recomputes
@@ -93,7 +123,10 @@ function M.attach(opts)
       return nil
     end
 
-    local abs = vim.fs.normalize(name)
+    -- Resolve the buffer path the same way (realpath, with normalize
+    -- fallback) as workspace/provenance_dir, so the prefix comparison below
+    -- is symmetric regardless of which side a symlink sits on.
+    local abs = resolve_dir(name)
     if abs ~= workspace and not vim.startswith(abs, workspace .. "/") then
       return nil
     end
@@ -101,6 +134,11 @@ function M.attach(opts)
 
     if MANIFEST_RELS[rel] then
       return nil
+    end
+    if provenance_dir_input and not provenance_dir then
+      -- Directory didn't exist as of the last attempt; retry now (cheap —
+      -- this only runs on autocmd events, never per-keystroke).
+      provenance_dir = try_realpath(provenance_dir_input)
     end
     if provenance_dir and (abs == provenance_dir or vim.startswith(abs, provenance_dir .. "/")) then
       return nil
@@ -204,6 +242,9 @@ function M.attach(opts)
       if not is_recordable(buf) then
         return
       end
+      -- A genuine reopen: allow a later close of this buffer to emit
+      -- doc.close again.
+      closed[buf] = nil
       emit_doc_open(buf)
       attach_buffer(buf)
     end,
@@ -233,6 +274,13 @@ function M.attach(opts)
     desc = "Provenance: doc.close on delete/unload",
     callback = function(args)
       local buf = args.buf
+      -- BufDelete and BufUnload both fire for one real close (e.g. a
+      -- single :bwipeout!/:bdelete!); this callback is registered on both,
+      -- so de-dup per buffer to emit doc.close exactly once.
+      if closed[buf] then
+        return
+      end
+
       -- The buffer may already be mid-unload by the time this fires (order
       -- relative to nvim_buf_attach's internal on_detach isn't guaranteed),
       -- so fall back to the rel cached at attach time.
@@ -240,6 +288,7 @@ function M.attach(opts)
       if not rel then
         return
       end
+      closed[buf] = true
 
       -- CLAUDE.md/doc-wiring.ts parity: do NOT delete the `seen` de-dup
       -- entry on close — close+reopen is common and should not re-emit
@@ -286,6 +335,7 @@ function M.attach(opts)
     end
     attached_bufs = {}
     buf_rel = {}
+    closed = {}
   end
 
   return handle
