@@ -272,6 +272,28 @@ describe("recording_session.start", function()
     assert.is_true(not ok or #autocmds == 0)
   end)
 
+  it("creates provenance_dir itself when it does not already exist on disk", function()
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    -- Deliberately NOT pre-created (unlike every other test in this file):
+    -- this is the regression case for first activation of a fresh workspace.
+    assert.is_nil(vim.uv.fs_stat(provenance_dir))
+
+    assert.has_no.errors(function()
+      scratch.session = recording_session.start({
+        workspace = workspace,
+        provenance_dir = provenance_dir,
+        manifest = dev_manifest(),
+        clock = core_clock.fixed(0, 0),
+      })
+    end)
+
+    assert.is_true(vim.uv.fs_stat(provenance_dir) ~= nil)
+    assert.is_true(vim.uv.fs_stat(scratch.session.meta_path) ~= nil)
+
+    scratch.session.stop()
+  end)
+
   it("seal() flushes and produces a bundle whose manifest verifies against the session pubkey", function()
     local workspace = scratch.workspace()
     local provenance_dir = workspace .. "/.provenance"

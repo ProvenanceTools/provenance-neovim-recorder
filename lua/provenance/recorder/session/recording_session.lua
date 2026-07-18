@@ -13,10 +13,12 @@
 --- logical id, while the filename id always comes from a fresh random draw
 --- local to this module.
 ---
---- `provenance_dir` must already exist on disk before calling start() —
---- meta_writer.create() atomic-writes into it immediately and does not
---- create parent directories (mirrors every other Plan-4 caller of
---- atomic_write_file: activation/seal callers are responsible for mkdir).
+--- `start()` ensures `provenance_dir` exists (mkdir -p) before anything
+--- writes into it — meta_writer.create() atomic-writes immediately and does
+--- not create parent directories itself, so as the composition entry point
+--- and owner of the session directory lifecycle, start() creates it up
+--- front rather than relying on a later step (e.g. session_writer's first
+--- flush) to do so.
 local bit = require("bit")
 local band, bor = bit.band, bit.bor
 
@@ -93,6 +95,17 @@ function M.start(opts)
   local provenance_dir = opts.provenance_dir
   local manifest = opts.manifest
   local clock = opts.clock
+
+  -- 0. Ensure provenance_dir exists before anything below writes into it
+  -- (meta_writer.create in step 6 atomic-writes immediately and does not
+  -- mkdir). "p" is idempotent — a no-op if the dir already exists — so the
+  -- common case never errors; pcall only guards against vim.fn.mkdir itself
+  -- raising (e.g. E739 when a path component is a regular file), and a
+  -- genuine failure like that still propagates as an error, same as before.
+  local mkdir_ok, mkdir_err = pcall(vim.fn.mkdir, provenance_dir, "p")
+  if not mkdir_ok then
+    error(mkdir_err)
+  end
 
   -- 1. Fresh per-session ed25519 keypair (recorder PRD §4.6).
   local keypair = core_session_keys.generate()
