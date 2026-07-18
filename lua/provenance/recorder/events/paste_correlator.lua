@@ -54,14 +54,19 @@ local function normalize_eol(s)
 end
 
 --- Signal 3 content match (v1 rule): after EOL normalization, a match is
---- equality OR containment in either direction, provided the clipboard side
---- is non-empty. `similarity` is accepted on the constructor for a possible
---- future fuzzy-ratio fallback but is NOT consulted here — containment /
---- equality is the entire implemented matching path.
+--- equality OR containment in either direction, provided BOTH sides are
+--- non-empty. The clipboard-side guard prevents an empty intercept from
+--- matching anything; the inserted-side guard prevents Lua's
+--- `string.find(b, "", 1, true)` (which finds an empty needle in any
+--- non-empty haystack) from turning an empty doc.change delta (e.g. a
+--- backspace) into a false paste match. `similarity` is accepted on the
+--- constructor for a possible future fuzzy-ratio fallback but is NOT
+--- consulted here — containment / equality is the entire implemented
+--- matching path.
 local function matches(inserted, clipboard)
   local a = normalize_eol(inserted)
   local b = normalize_eol(clipboard)
-  if b == "" then
+  if a == "" or b == "" then
     return false
   end
   if a == b then

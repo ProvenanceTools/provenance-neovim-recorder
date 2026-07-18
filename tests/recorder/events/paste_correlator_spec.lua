@@ -143,6 +143,49 @@ describe("paste_correlator: window gate", function()
 end)
 
 -- ---------------------------------------------------------------------------
+-- Regression: empty-insert delta must not false-confirm / false-consume
+-- (Lua's string.find(b, "", 1, true) finds an empty needle in ANY non-empty
+-- haystack, so `matches("", pending.text)` was wrongly returning true.)
+-- ---------------------------------------------------------------------------
+
+describe("paste_correlator: empty-insert delta does not false-confirm", function()
+  it("empty-delta (deletion, non-empty range) after intercept -> typed, and does NOT consume pending; a later real paste is still confirmed", function()
+    local c = new_correlator()
+    local clip = "hi there paste text padded to be long enough to matter"
+
+    c.on_paste_intercept(clip, 0)
+
+    -- A deletion: text == "", non-empty range so is_paste_shaped is false
+    -- regardless. Must NOT confirm, and must NOT consume `pending`.
+    local del_range = non_empty_range(0, 5, 10)
+    local decision1 = c.on_doc_change({ delta("", del_range) }, del_range, 10)
+
+    assert.equals("doc.change", decision1.kind)
+    assert.equals("typed", decision1.source)
+
+    -- The real paste follows, still inside the window, single empty-range
+    -- delta whose text matches the clipboard. If the empty delete above had
+    -- wrongly consumed `pending`, this would resolve as typed instead.
+    local range2 = empty_range()
+    local decision2 = c.on_doc_change({ delta(clip, range2) }, range2, 20)
+
+    assert.equals("paste", decision2.kind)
+    assert.equals(clip, decision2.payload.content)
+  end)
+
+  it("empty-delta with empty range after intercept does not fabricate a paste event", function()
+    local c = new_correlator()
+    c.on_paste_intercept("some clipboard text", 0)
+
+    local range = empty_range()
+    local decision = c.on_doc_change({ delta("", range) }, range, 5)
+
+    assert.equals("doc.change", decision.kind)
+    assert.equals("typed", decision.source)
+  end)
+end)
+
+-- ---------------------------------------------------------------------------
 -- Non-matching clipboard content
 -- ---------------------------------------------------------------------------
 
@@ -192,6 +235,17 @@ describe("paste_correlator: paste_likely without any intercept", function()
 
     assert.equals("paste", decision.kind)
     assert.equals(text, decision.payload.content)
+    assert.equals(1, c.counts().large_insert)
+  end)
+
+  it("single-delta, NON-EMPTY range, >=30 chars, no intercept -> doc.change source=paste_likely (not shape-fit), large_insert_count incremented", function()
+    local c = new_correlator()
+    local text = string.rep("z", 40)
+    local range = non_empty_range(0, 0, 5)
+    local decision = c.on_doc_change({ delta(text, range) }, range, 5)
+
+    assert.equals("doc.change", decision.kind)
+    assert.equals("paste_likely", decision.source)
     assert.equals(1, c.counts().large_insert)
   end)
 end)
