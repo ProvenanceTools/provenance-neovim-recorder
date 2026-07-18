@@ -127,3 +127,40 @@ doc.save hash) as `table.concat(lines, "\n") .. "\n"` — buffer lines plus
 one trailing newline — matching both Neovim's on-disk bytes and VS Code's
 `getText()` semantics. Deferred as a known follow-up: fileformat=dos/mac,
 `'nobinary'`/`'noeol'` buffers, and the empty-buffer/0-byte-file edge case.
+
+## Plan 5 — external-change detection
+
+`lua/provenance/recorder/watch/external_change_coordinator.lua` composes the
+three emission paths (save-time check, `vim.uv` fs-poll watcher,
+`FileChangedShellPost` reload-from-disk) behind one shared registry and
+`recent_saves` tolerance map. The headless suite drives Path 1 and Path 3
+deterministically and Path 2 via both its direct decision-handler seam and
+one real `vim.uv.new_fs_poll()` integration test, and proves the no-
+double-emit guarantee with a controllable clock. What it genuinely cannot
+cover is the LAZY, focus-driven timing of `FileChangedShellPost` itself and
+real OS-level watcher latency — those need a live TUI:
+
+- [ ] **Focus-gain reload, exactly one event:** Open a watched file in a real
+      `nvim` session (with `autoread` on, the plugin's default). Switch away
+      from Neovim (e.g. `Ctrl-Z` to the shell, or switch terminal tabs/apps)
+      and, with the editor UNFOCUSED, externally edit the file (e.g. run a
+      formatter against it, or `echo "extra line" >> file`). Refocus Neovim
+      (or run `:checktime` explicitly). Confirm exactly one
+      `fs.external_change` event lands in the session's `.slog` — not a
+      `doc.change`, and not doubled (i.e. Path 2's watcher, if it also fired
+      while unfocused, did not produce a second event for the same write).
+
+- [ ] **`vim.uv` native-watcher latency while focused:** With the same
+      workspace open and Neovim FOCUSED, externally edit a watched file (a
+      separate terminal, another editor, or a script). Confirm the resulting
+      `fs.external_change` is recorded within roughly 1-2 seconds (bounded by
+      Path 2's fs-poll `poll_interval_ms`, default 1000ms) — i.e. Path 2 (not
+      the lazy Path 3) is the one that actually catches an external change
+      while the editor has focus.
+
+- [ ] **A normal save produces no external-change:** With a watched file
+      open, edit it normally inside Neovim and `:w`. Confirm this produces a
+      `doc.save` (and the preceding `doc.change`s) but does NOT produce an
+      `fs.external_change` — i.e. `note_save` + the tolerance window
+      correctly suppress the editor's own write from being misclassified as
+      an external one.
