@@ -40,13 +40,16 @@ local function format_number(n)
     return string.format("%d", n)
   end
   -- Non-integer path (defensive; real envelopes have no floats).
+  -- Note: %g format depends on LC_NUMERIC (Neovim forces LC_NUMERIC=C at startup).
+  -- Guard against locale-dependent comma decimal separator.
   local s = string.format("%.17g", n)
   -- Trim to shortest round-trip.
   for p = 1, 16 do
     local cand = string.format("%." .. p .. "g", n)
     if tonumber(cand) == n then s = cand; break end
   end
-  return s
+  -- Belt-and-suspenders: replace any locale-generated comma with period.
+  return s:gsub(",", ".")
 end
 
 local canon -- forward decl
