@@ -38,6 +38,10 @@ function M.validate_chain(entries)
       end
 
       if entry.wall < prev.wall then
+        -- Equivalent to log-core's inclusive [prev.seq, entry.seq] window check
+        -- ONLY because rule 2 above (seq == index, checked first, first-failure-
+        -- wins) guarantees entries are contiguous, so that window contains
+        -- exactly {prev, entry} — checking just this adjacent pair covers it.
         local skew_in_window = prev.kind == "clock.skew" or entry.kind == "clock.skew"
         if not skew_in_window then
           return break_("wall_regression", entry.seq)

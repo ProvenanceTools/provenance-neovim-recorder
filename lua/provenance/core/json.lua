@@ -59,7 +59,14 @@ local function canon_object(t)
     if type(k) ~= "string" then error("object keys must be strings") end
     keys[#keys + 1] = k
   end
-  table.sort(keys) -- bytewise == code-unit order for ASCII keys
+  -- bytewise sort == JS UTF-16 code-unit order ONLY because every object key
+  -- in this format is an ASCII structural field name (seq, t, wall, kind, ...).
+  -- If the format ever used a user-derived string as an object KEY (not a
+  -- value), this would need a UTF-16 code-unit comparison instead — bytewise
+  -- UTF-8 sort and UTF-16 code-unit sort diverge for non-BMP characters
+  -- (e.g. emoji), which encode as a single 4-byte UTF-8 sequence but as a
+  -- surrogate PAIR of two UTF-16 code units.
+  table.sort(keys)
   local parts = {}
   for _, k in ipairs(keys) do
     parts[#parts + 1] = escape_string(k) .. ":" .. canon(t[k])

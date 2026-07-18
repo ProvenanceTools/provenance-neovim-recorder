@@ -38,6 +38,13 @@ describe("json.canonicalize", function()
     assert.equals('"\\n\\t"', json.canonicalize("\n\t")) -- short escapes
   end)
 
+  it("passes non-ASCII string VALUES through raw as UTF-8 (not \\u-escaped)", function()
+    assert.equals('"café"', json.canonicalize("café"))
+    assert.equals('"😀"', json.canonicalize("😀")) -- non-BMP, raw 4-byte UTF-8
+    assert.equals([["a/b"]], json.canonicalize("a/b")) -- '/' passes through raw
+    assert.equals("\"\127\"", json.canonicalize("\127")) -- DEL (0x7f) passes through raw
+  end)
+
   it("canonicalizes the envelope shape identically regardless of insertion order", function()
     local a = json.canonicalize({ seq = 0, t = 0, wall = "w", kind = "k", data = { r = 1 } })
     local b = json.canonicalize({ data = { r = 1 }, kind = "k", wall = "w", t = 0, seq = 0 })

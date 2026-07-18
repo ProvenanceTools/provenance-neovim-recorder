@@ -96,6 +96,15 @@ describe("chain_validator", function()
     assert.is_true(res.ok)
   end)
 
+  it("accepts wall going backwards when the CURRENT entry is clock.skew (symmetric branch)", function()
+    local e0 = hc.chain_entry(hc.GENESIS_PREV_HASH,
+      envelope.new(0, 0, "2026-01-01T00:00:05.000Z", "session.start", { extension_id = "provnvim" }))
+    local e1 = hc.chain_entry(e0.hash,
+      envelope.new(1, 1000, "2026-01-01T00:00:01.000Z", "clock.skew", { delta_ms = -4000 }))
+    local res = cv.validate_chain({ e0, e1 })
+    assert.is_true(res.ok)
+  end)
+
   it("rejects wall going backwards without a clock.skew entry", function()
     local e0 = hc.chain_entry(hc.GENESIS_PREV_HASH,
       envelope.new(0, 0, "2026-01-01T00:00:00.000Z", "session.start", { extension_id = "provnvim" }))

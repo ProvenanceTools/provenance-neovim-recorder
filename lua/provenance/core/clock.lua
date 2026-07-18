@@ -20,7 +20,7 @@ end
 function M.system()
   return {
     now = function()
-      return vim.uv.hrtime() / 1e6
+      return math.floor(vim.uv.hrtime() / 1e6)
     end,
     wall = function()
       local sec, usec = vim.uv.gettimeofday()

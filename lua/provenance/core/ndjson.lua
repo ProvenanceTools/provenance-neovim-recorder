@@ -8,7 +8,6 @@ local result = require("provenance.core.result")
 
 local M = {}
 
-local HEX64 = "^[0-9a-f][0-9a-f]" -- length checked separately
 local function is_hex64(s)
   return type(s) == "string" and #s == 64 and s:match("^[0-9a-f]+$") ~= nil
 end
