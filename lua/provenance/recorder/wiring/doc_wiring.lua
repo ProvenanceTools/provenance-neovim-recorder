@@ -167,6 +167,14 @@ function M.attach(opts)
 
   local disposed = false
 
+  -- Optional change-router seam (Plan 6): when set, on_lines routes each
+  -- delta through it instead of doc_events.transform_doc_change directly, so
+  -- paste_assembly.lua can fuse the three paste-detection signals and decide
+  -- per-change whether to emit `paste` or `doc.change` with a non-"typed"
+  -- source. Unset (nil, the default) -> the on_lines hot path is
+  -- byte-identical to pre-Plan-6 behavior; see handle.set_change_router.
+  local change_router = nil
+
   -- Defensive de-dup for doc.open (mirrors doc-wiring.ts's seenDocs). Keyed
   -- by rel path, never cleared — a closed-then-reopened doc does not refire
   -- doc.open, matching the reference implementation (CLAUDE.md: no registry
@@ -310,8 +318,13 @@ function M.attach(opts)
           text = text,
         }
 
-        local ev = doc_events.transform_doc_change(r, { delta })
-        emit(ev.kind, ev.data)
+        if change_router then
+          local routed = change_router(r, { delta }, delta.range)
+          emit(routed.kind, routed.data)
+        else
+          local ev = doc_events.transform_doc_change(r, { delta })
+          emit(ev.kind, ev.data)
+        end
       end,
       on_detach = function(_, b)
         attached_bufs[b] = nil
@@ -407,10 +420,20 @@ function M.attach(opts)
 
   local handle = {}
 
+  --- Install (or clear, with fn = nil) the on_lines change-router (Plan 6).
+  --- `fn` is called as `fn(rel, deltas, range) -> {kind, data}` for every
+  --- on_lines delta in place of doc_events.transform_doc_change; see the
+  --- `change_router` local above for why the unset default is unchanged
+  --- behavior.
+  function handle.set_change_router(fn)
+    change_router = fn
+  end
+
   --- Idempotent: safe to call more than once. After this returns, no
   --- autocmds remain in this augroup, tracked buffers are (best-effort)
-  --- detached, and any in-flight on_lines callback detaches itself on its
-  --- next invocation via the `disposed` flag.
+  --- detached, any in-flight on_lines callback detaches itself on its next
+  --- invocation via the `disposed` flag, and the change-router (if any) is
+  --- cleared so a disposed assembly can't keep routing.
   function handle.dispose()
     if disposed then
       return
@@ -427,6 +450,7 @@ function M.attach(opts)
     attached_bufs = {}
     buf_rel = {}
     closed = {}
+    change_router = nil
   end
 
   return handle

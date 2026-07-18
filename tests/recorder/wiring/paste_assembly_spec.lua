@@ -1,0 +1,383 @@
+--- paste_assembly: the Plan 6 assembly wiring the three paste-detection
+--- signals into doc_wiring's on_lines path. Headless, REAL buffers, REAL
+--- `vim.paste`, REAL doc_wiring — no editor-API mocking, matching this
+--- repo's convention for wiring-layer specs (see doc_wiring_spec.lua,
+--- paste_intercept_spec.lua).
+---
+--- IMPORTANT PORT NOTE (documented per task-6-brief's fallback clause):
+--- Neovim's default `vim.paste` always applies pasted text via a CHARWISE
+--- `nvim_put`, which — empirically verified against real Neovim 0.12 (see
+--- probes run during implementation) — ALWAYS reports an on_lines callback
+--- that "replaces" exactly the one line the cursor sits on (first ==
+--- last - 1), even when pasting into an empty line or appending at the very
+--- end of the buffer. It NEVER produces a first == last ("empty range",
+--- zero-existing-lines-touched) delta. That shape only arises from a pure
+--- new-line INSERT (no deletion), e.g. `nvim_buf_set_lines(buf, N, N, ...)`.
+--- Consequently, a real single-shot `vim.paste()` call, by itself, always
+--- routes through paste_correlator as `doc.change source="paste_likely"`
+--- (confirmed-but-not-shape-fit) rather than a `paste` event — the `paste`
+--- kind requires the empty-range shape that only a genuine insert-only
+--- buffer mutation produces.
+---
+--- To exercise the real `paste` kind end-to-end without touching
+--- correlator/doc_wiring behavior (out of scope for this task), the "real
+--- paste" test below:
+---   1. Uses the REAL global `vim.paste` (via a decoy scratch buffer not
+---      tracked by doc_wiring) to drive the REAL paste_intercept wrapping —
+---      this is the genuine signal 2/3 intercept path.
+---   2. Applies the resulting insertion to the RECORDABLE buffer via a real,
+---      legitimate Neovim buffer mutation that happens to produce the
+---      empty-range shape (`nvim_buf_set_lines(buf, N, N, ...)`, i.e. what a
+---      pure new-line insert looks like) — a real on_lines callback, through
+---      the real doc_wiring attach + real router + real correlator.
+--- Per doc_wiring's own fileformat-aware content model (see
+--- doc_wiring_spec.lua: "Delta text carries a trailing \n per replaced-line"),
+--- an inserted line's delta text always carries a trailing eol, so the
+--- pasted content the correlator sees (and thus the emitted `paste` event's
+--- `content`) is `<clip> .. "\n"`, not the bare clipboard string. This is
+--- doc_wiring's existing, pre-Plan-6 content model — not something this
+--- assembly changes.
+local doc_wiring = require("provenance.recorder.wiring.doc_wiring")
+local paste_assembly = require("provenance.recorder.wiring.paste_assembly")
+local sha256 = require("provenance.core.sha256")
+
+--- Plenary's directory test runner spawns one REAL `nvim --headless`
+--- SUBPROCESS per spec file, run concurrently (plenary/test_harness.lua:
+--- Job:start() per file, not sequential by default). On macOS (and anywhere
+--- else with a real `pbcopy`/`pbpaste`-style clipboard tool on PATH), the
+--- `"+`/`"*` registers are backed by the ACTUAL OS pasteboard — a resource
+--- shared across ALL those concurrent processes, not per-process. Any spec
+--- file that both writes and reads `"+`/`"*` therefore races every other
+--- concurrently-running spec file doing the same (this repo's pre-existing
+--- paste_intercept_spec.lua already does), which is exactly what caused an
+--- observed cross-file flake against this content: `make test` intermittently
+--- had paste_intercept_spec.lua's "empty registers" test read back a
+--- 32-char "p" string this file had just written to `"+`.
+---
+--- Fix (test-file-local, no production code touched): install a `g:clipboard`
+--- provider backed by a private in-process Lua table instead of the real
+--- pasteboard. `vim.fn.setreg("+"/"*", ...)` and `vim.fn.getreg(...)` still
+--- run for real (paste_intercept.lua's capture_text still calls the real
+--- Neovim register API) — only the STORAGE backing "+`/`"*` is redirected
+--- off the shared OS resource, onto memory scoped to this process.
+local function install_local_clipboard()
+  local store = { ["+"] = { {}, "v" }, ["*"] = { {}, "v" } }
+  vim.g.clipboard = {
+    name = "ProvenanceTestLocalClipboard",
+    copy = {
+      ["+"] = function(lines, regtype)
+        store["+"] = { lines, regtype }
+      end,
+      ["*"] = function(lines, regtype)
+        store["*"] = { lines, regtype }
+      end,
+    },
+    paste = {
+      ["+"] = function()
+        return store["+"]
+      end,
+      ["*"] = function()
+        return store["*"]
+      end,
+    },
+  }
+end
+
+local function new_scratch()
+  local scratch = { bufs = {}, dirs = {}, doc_handle = nil, assembly_handle = nil }
+
+  function scratch.workspace()
+    local dir = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(dir, "p")
+    table.insert(scratch.dirs, dir)
+    return dir
+  end
+
+  function scratch.write_file(path, content)
+    vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+    local f = assert(io.open(path, "w"))
+    f:write(content)
+    f:close()
+  end
+
+  function scratch.edit(path)
+    vim.cmd("edit " .. vim.fn.fnameescape(path))
+    local buf = vim.api.nvim_get_current_buf()
+    table.insert(scratch.bufs, buf)
+    return buf
+  end
+
+  function scratch.scratch_buf()
+    local buf = vim.api.nvim_create_buf(false, true)
+    table.insert(scratch.bufs, buf)
+    return buf
+  end
+
+  function scratch.teardown()
+    if scratch.assembly_handle then
+      scratch.assembly_handle.dispose()
+    end
+    if scratch.doc_handle then
+      scratch.doc_handle.dispose()
+    end
+    for _, buf in ipairs(scratch.bufs) do
+      if vim.api.nvim_buf_is_valid(buf) then
+        pcall(vim.cmd, "bwipeout! " .. buf)
+      end
+    end
+    for _, dir in ipairs(scratch.dirs) do
+      pcall(vim.fn.delete, dir, "rf")
+    end
+    -- Belt-and-braces: a leaked global vim.paste override would corrupt
+    -- every subsequent paste-related spec in this headless process.
+    pcall(vim.fn.setreg, "+", "")
+    pcall(vim.fn.setreg, "*", "")
+  end
+
+  return scratch
+end
+
+local function new_emit()
+  local events = {}
+  local function emit(kind, data)
+    table.insert(events, { kind = kind, data = data })
+  end
+  return events, emit
+end
+
+local function find(events, kind)
+  for _, ev in ipairs(events) do
+    if ev.kind == kind then
+      return ev
+    end
+  end
+  return nil
+end
+
+local function count(events, kind)
+  local n = 0
+  for _, ev in ipairs(events) do
+    if ev.kind == kind then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+describe("paste_assembly.attach", function()
+  local scratch
+
+  before_each(function()
+    install_local_clipboard()
+    scratch = new_scratch()
+    -- Clear clipboard registers so no stale content from a prior test
+    -- accidentally content-matches a later test's typed text.
+    vim.fn.setreg("+", "")
+    vim.fn.setreg("*", "")
+  end)
+
+  after_each(function()
+    scratch.teardown()
+  end)
+
+  it("real paste (>=30 chars, via real vim.paste intercept) -> exactly one `paste` event with content/length/sha256/range", function()
+    local workspace = scratch.workspace()
+    local path = workspace .. "/foo.txt"
+    scratch.write_file(path, "line1\nline2\n")
+
+    local events, emit = new_emit()
+    scratch.doc_handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+    scratch.assembly_handle = paste_assembly.attach({
+      emit = emit,
+      doc_wiring_handle = scratch.doc_handle,
+    })
+
+    local buf = scratch.edit(path)
+
+    local clip = string.rep("p", 32) -- >=30 chars, no newline
+    assert.is_true(#clip >= 30)
+
+    -- Signal 2/3: REAL vim.paste, on a decoy buffer doc_wiring never
+    -- attaches to, so its own charwise mutation emits nothing.
+    local decoy = scratch.scratch_buf()
+    vim.api.nvim_set_current_buf(decoy)
+    vim.fn.setreg("+", clip)
+    vim.paste({ clip }, -1)
+
+    -- Apply the paste to the RECORDABLE buffer as a genuine insert-only
+    -- edit (empty-range on_lines shape; see module header comment).
+    vim.api.nvim_set_current_buf(buf)
+    vim.api.nvim_buf_set_lines(buf, 0, 0, false, { clip })
+
+    assert.equals(1, count(events, "paste"))
+    local ev = find(events, "paste")
+    assert.equals("foo.txt", ev.data.path)
+
+    local expected_content = clip .. "\n" -- doc_wiring's trailing-eol content model
+    assert.equals(expected_content, ev.data.content)
+    assert.equals(#expected_content, ev.data.length)
+    assert.equals(sha256.hex(expected_content), ev.data.sha256)
+    assert.is_nil(ev.data.content_head)
+    assert.is_nil(ev.data.content_tail)
+
+    assert.is_not_nil(ev.data.range)
+    assert.equals(0, ev.data.range.start.line)
+    assert.equals(0, ev.data.range["end"].line)
+    assert.equals(ev.data.range.start.line, ev.data.range["end"].line)
+    assert.equals(ev.data.range.start.character, ev.data.range["end"].character)
+
+    -- No doc.change fired for this same edit (routed to `paste` instead).
+    assert.equals(0, count(events, "doc.change"))
+  end)
+
+  it("typing (<30 chars, no newline) -> doc.change source=typed (router preserves typed for non-pastes)", function()
+    local workspace = scratch.workspace()
+    local path = workspace .. "/foo.txt"
+    scratch.write_file(path, "line1\nline2\n")
+
+    local events, emit = new_emit()
+    scratch.doc_handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+    scratch.assembly_handle = paste_assembly.attach({
+      emit = emit,
+      doc_wiring_handle = scratch.doc_handle,
+    })
+
+    local buf = scratch.edit(path)
+    vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "hi" })
+
+    assert.equals(1, count(events, "doc.change"))
+    local ev = find(events, "doc.change")
+    assert.equals("foo.txt", ev.data.path)
+    assert.equals("typed", ev.data.source)
+    assert.equals(0, count(events, "paste"))
+  end)
+
+  it("bulk multi-line insert (>=30 chars, newline, non-empty range, no intercept) -> doc.change source=paste_likely", function()
+    local workspace = scratch.workspace()
+    local path = workspace .. "/foo.txt"
+    scratch.write_file(path, "line1\nline2\n")
+
+    local events, emit = new_emit()
+    scratch.doc_handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+    scratch.assembly_handle = paste_assembly.attach({
+      emit = emit,
+      doc_wiring_handle = scratch.doc_handle,
+    })
+
+    local buf = scratch.edit(path)
+    -- Replace existing line 0 (non-empty range: first=0, last=1) with
+    -- several lines totalling >=30 chars -- a single delta whose text
+    -- contains embedded newlines, classified paste_likely by rule 1 (single
+    -- delta >= 30 chars) regardless of the embedded newline.
+    vim.api.nvim_buf_set_lines(buf, 0, 1, false, {
+      string.rep("a", 15),
+      string.rep("b", 15),
+      string.rep("c", 15),
+    })
+
+    assert.equals(1, count(events, "doc.change"))
+    local ev = find(events, "doc.change")
+    assert.equals("foo.txt", ev.data.path)
+    assert.equals("paste_likely", ev.data.source)
+    assert.equals(0, count(events, "paste"))
+  end)
+
+  it("diverging intercept/large-insert counts -> paste.anomaly with per-interval deltas", function()
+    local workspace = scratch.workspace()
+    local path = workspace .. "/foo.txt"
+    scratch.write_file(path, "line1\nline2\n")
+
+    local events, emit = new_emit()
+    scratch.doc_handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+    -- Short real interval + tolerance=0 so a single-unit divergence (one
+    -- large_insert, zero intercepts) trips the anomaly on the next real
+    -- timer tick, without needing to reach into assembly internals.
+    scratch.assembly_handle = paste_assembly.attach({
+      emit = emit,
+      doc_wiring_handle = scratch.doc_handle,
+      interval_ms = 20,
+      tolerance = 0,
+    })
+
+    local buf = scratch.edit(path)
+    -- A bulk paste_likely edit with NO intercept: large_insert_count
+    -- increments, intercepted_count does not -> divergence.
+    vim.api.nvim_buf_set_lines(buf, 0, 1, false, {
+      string.rep("a", 15),
+      string.rep("b", 15),
+      string.rep("c", 15),
+    })
+
+    local ok = vim.wait(500, function()
+      return find(events, "paste.anomaly") ~= nil
+    end, 10)
+    assert.is_true(ok)
+
+    local ev = find(events, "paste.anomaly")
+    assert.equals(0, ev.data.intercepted_count)
+    assert.equals(1, ev.data.large_insert_count)
+  end)
+
+  it("dispose() unhooks the router (edit reverts to source=typed default), restores vim.paste, and stops the reconciler timer", function()
+    local orig_paste = vim.paste
+
+    local workspace = scratch.workspace()
+    local path = workspace .. "/foo.txt"
+    scratch.write_file(path, "line1\nline2\n")
+
+    local events, emit = new_emit()
+    scratch.doc_handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+    local assembly = paste_assembly.attach({
+      emit = emit,
+      doc_wiring_handle = scratch.doc_handle,
+      interval_ms = 20,
+      tolerance = 0,
+    })
+    scratch.assembly_handle = nil -- disposed manually below; don't double-dispose in teardown
+
+    assert.is_not.equals(orig_paste, vim.paste)
+
+    local buf = scratch.edit(path)
+    -- A bulk edit BEFORE dispose, to prove the assembly is live.
+    vim.api.nvim_buf_set_lines(buf, 0, 1, false, {
+      string.rep("a", 15),
+      string.rep("b", 15),
+      string.rep("c", 15),
+    })
+    assert.equals("paste_likely", find(events, "doc.change").data.source)
+
+    assembly.dispose()
+
+    assert.equals(orig_paste, vim.paste)
+
+    local before = #events
+    -- Post-dispose edit: default doc_wiring routing (source=typed), even
+    -- though this edit would otherwise classify paste_likely.
+    vim.api.nvim_buf_set_lines(buf, 1, 2, false, {
+      string.rep("z", 40),
+    })
+    local ev = find(events, "doc.change")
+    -- Most recent doc.change (index-based: last one appended).
+    local last_change
+    for _, e in ipairs(events) do
+      if e.kind == "doc.change" then
+        last_change = e
+      end
+    end
+    assert.equals("typed", last_change.data.source)
+    assert.is_true(#events > before)
+
+    -- Reconciler timer stopped: no further paste.anomaly even after
+    -- waiting past several would-be intervals.
+    local anomaly_count_before = count(events, "paste.anomaly")
+    vim.wait(100, function()
+      return false
+    end, 10)
+    assert.equals(anomaly_count_before, count(events, "paste.anomaly"))
+
+    -- Idempotent.
+    assert.has_no.errors(function()
+      assembly.dispose()
+    end)
+  end)
+end)
