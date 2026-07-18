@@ -116,6 +116,18 @@ end
 ---   emit: function(kind, data)    -- SessionHost.emit
 ---   get_hash: function(text) -> hex string; defaults to sha256.hex, injectable
 ---                                    for tests.
+---   external_change: table|nil    -- OPTIONAL (Plan 9). The external-change
+---                                    coordinator's handle methods: {
+---                                    seed_open, apply_change, reconcile_save,
+---                                    note_save, check_after_save }. In
+---                                    production the recording_controller
+---                                    passes the real coordinator handle
+---                                    (external_change_coordinator.lua); tests
+---                                    may pass a fake. nil (the default)
+---                                    -> doc_wiring behaves EXACTLY as before
+---                                    this integration (byte-identical),
+---                                    since every call site below is guarded
+---                                    by `if ec_deps then`.
 ---
 --- Returns a handle with handle.dispose().
 --- Best-effort realpath: returns the normalized realpath if it resolves,
@@ -164,6 +176,13 @@ function M.attach(opts)
 
   local emit = opts.emit
   local get_hash = opts.get_hash or default_sha256.hex
+
+  -- Optional external-change coordinator seam (Plan 9): when set, doc.open
+  -- seeds the coordinator's ExpectedContent baseline, on_lines keeps it
+  -- current with tracked edits, and BufWritePost reconciles/checks it before
+  -- the doc.save emit. Unset (nil, the default) -> every call site below is
+  -- a no-op and this module's behavior is byte-identical to pre-Plan-9.
+  local ec_deps = opts.external_change
 
   local disposed = false
 
@@ -264,6 +283,10 @@ function M.attach(opts)
 
     local ev = doc_events.transform_doc_open(rel, hash, text, line_count)
     emit(ev.kind, ev.data)
+
+    if ec_deps then
+      ec_deps.seed_open(rel, text)
+    end
   end
 
   -------------------------------------------------------------------------
@@ -325,6 +348,15 @@ function M.attach(opts)
           local ev = doc_events.transform_doc_change(r, { delta })
           emit(ev.kind, ev.data)
         end
+
+        -- Keep the external-change model current with this tracked edit.
+        -- Matches the VS Code reference (applyDeltas per change); adds one
+        -- offset-splice per edit to the hot path, acceptable for
+        -- assignment-sized files (CLAUDE.md/Plan 9 task brief). No signing
+        -- or canonicalization here — apply_change only mutates a string.
+        if ec_deps then
+          ec_deps.apply_change(r, { delta })
+        end
       end,
       on_detach = function(_, b)
         attached_bufs[b] = nil
@@ -365,9 +397,29 @@ function M.attach(opts)
         return
       end
 
-      local text = content_bytes(buf, { as_written = true })
-      local hash = get_hash(text)
+      local written = content_bytes(buf, { as_written = true })
 
+      -- External-change check runs BEFORE the doc.save emit (Plan 5/9
+      -- ordering: any fs.external_change this save uncovers must precede,
+      -- and thus explain, the doc.save that follows it):
+      --   1. reconcile_save: the noeol fix. Reconcile the coordinator's
+      --      ExpectedContent to `written` (what Neovim ACTUALLY just wrote,
+      --      including any fixeol-added trailing EOL) BEFORE the check, so
+      --      the editor's own fixeol newline is never misread as an
+      --      external clobber (see content_bytes's docstring above).
+      --   2. note_save: mark this as an editor save so Path 2 (fs_watcher)
+      --      tolerates the resulting on-disk change.
+      --   3. check_after_save: Path 1 — emits fs.external_change if disk
+      --      bytes differ from `written` (a genuine external clobber
+      --      between Neovim's flush and this check).
+      if ec_deps then
+        local abs = resolve_dir(vim.api.nvim_buf_get_name(buf))
+        ec_deps.reconcile_save(rel, written)
+        ec_deps.note_save(rel)
+        ec_deps.check_after_save(rel, abs)
+      end
+
+      local hash = get_hash(written)
       local ev = doc_events.transform_doc_save(rel, hash)
       emit(ev.kind, ev.data)
     end,

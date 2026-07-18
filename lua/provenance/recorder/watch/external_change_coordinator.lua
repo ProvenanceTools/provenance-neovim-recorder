@@ -77,7 +77,8 @@ end
 ---   tolerance_ms: number|nil, default 250
 --- }
 --- @return table handle {
----   seed_open(rel, content), apply_change(rel, deltas), note_save(rel),
+---   seed_open(rel, content), apply_change(rel, deltas),
+---   reconcile_save(rel, written_content), note_save(rel),
 ---   check_after_save(rel, abs_path), on_file_changed_shell(buf),
 ---   registry, dispose()
 --- }
@@ -159,6 +160,24 @@ function M.start(opts)
     local ec = registry.get(rel)
     if ec ~= nil then
       ec.apply_deltas(deltas)
+    end
+  end
+
+  --- reconcile_save(rel, written_content) — the noeol fix (Plan 5 carry-
+  --- forward): reconcile the shared ExpectedContent to the bytes the editor
+  --- ACTUALLY just wrote to disk, BEFORE check_after_save runs. Neovim's
+  --- default `fixeol` silently adds a trailing EOL when writing a noeol
+  --- buffer, but the ExpectedContent model seeded at doc.open (and kept
+  --- current by apply_change) never reflects that write-time-only EOL — so
+  --- without this reconciliation, check_after_save would compare disk bytes
+  --- (with the fixeol newline) against a model that never had one, and
+  --- misdetect the editor's own clean save as `fs.external_change`. No-op if
+  --- `rel` isn't tracked. doc-wiring calls this from BufWritePost, ahead of
+  --- note_save and check_after_save.
+  function handle.reconcile_save(rel, written_content)
+    local ec = registry.get(rel)
+    if ec ~= nil then
+      ec.reset(written_content)
     end
   end
 
