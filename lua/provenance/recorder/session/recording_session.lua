@@ -38,6 +38,7 @@ local heartbeat = require("provenance.recorder.events.heartbeat")
 -- its pre-Plan-9 behavior — none of these are required-at-runtime unless enabled.
 local external_change_coordinator = require("provenance.recorder.watch.external_change_coordinator")
 local paste_assembly = require("provenance.recorder.wiring.paste_assembly")
+local selection_wiring = require("provenance.recorder.wiring.selection_wiring")
 local terminal_wiring = require("provenance.recorder.wiring.terminal_wiring")
 local git_wiring = require("provenance.recorder.wiring.git_wiring")
 local snapshot_wiring = require("provenance.recorder.wiring.snapshot_wiring")
@@ -147,7 +148,7 @@ function M.start(opts)
   -- Forward-declared signal sub-handles so session.stop()'s closure can
   -- dispose them (they are only assigned below when enable_signals is true;
   -- nil-guarded in stop() so the disabled path is a no-op).
-  local coordinator, paste, term, git, snap, skew
+  local coordinator, paste, term, git, snap, skew, sel
 
   -- Forward-declared: the disk-full handler's on_degraded closure (built
   -- below, before the writer/host exist) must call host.emit(...), but
@@ -359,6 +360,10 @@ function M.start(opts)
   -- the router first.
   if enable_signals then
     paste = paste_assembly.attach({ emit = host.emit, doc_wiring_handle = wiring })
+    -- Selection/cursor signal (selection.change). Reuses doc-wiring's
+    -- recordable-buffer filter via its handle, mirroring VS Code's
+    -- onDidChangeTextEditorSelection (colocated with doc-wiring there too).
+    sel = selection_wiring.start({ emit = host.emit, doc_wiring_handle = wiring })
   end
 
   -- 9c. Terminal / git / snapshot / clock-skew signals (Plan 9). snapshot
@@ -401,6 +406,7 @@ function M.start(opts)
     session._signals = {
       heartbeat = hb,
       paste = paste,
+      selection = sel,
       coordinator = coordinator,
       terminal = term,
       git = git,
@@ -466,6 +472,7 @@ function M.start(opts)
     --     augroup (no libuv/autocmd leak -> clean headless exit).
     -- Then the always-present hb/wiring/writer teardown, unchanged.
     if paste then paste.dispose() end
+    if sel then sel.dispose() end
     if coordinator then coordinator.dispose() end
     if skew then skew.dispose() end
     if snap then snap.dispose() end

@@ -541,6 +541,15 @@ function M.attach(opts)
 
   local handle = {}
 
+  --- The workspace-relative path for `buf` if it is an attached, recordable
+  --- buffer, else nil. Reuses the cache filled at attach time (never recomputes
+  --- recordability), so other signals keyed off the active buffer (e.g.
+  --- selection.change) can apply the SAME recordable-buffer filter as doc.change
+  --- without re-deriving the workspace/provenance-dir/manifest exclusions.
+  function handle.recordable_rel(buf)
+    return buf_rel[buf]
+  end
+
   --- Install (or clear, with fn = nil) the on_lines change-router (Plan 6).
   --- `fn` is called as `fn(rel, deltas, range) -> {kind, data}` for every
   --- on_lines delta in place of doc_events.transform_doc_change; see the
