@@ -16,3 +16,6 @@ tags
 
 # Superpowers session state
 .superpowers/
+
+# test harness scratch config home
+.test-xdg/
