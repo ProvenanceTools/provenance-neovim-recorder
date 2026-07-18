@@ -1,11 +1,23 @@
 --- git_wiring: the Neovim seam between a workspace's git repo and
 --- `git.event` (Plan 7, Task 6). Detects a git repo in the workspace on
---- start and, when present, watches for HEAD/state changes (commit,
---- checkout, branch switch, merge, rebase — all of which rewrite
---- `.git/HEAD`) and emits a coarse `state_change` `git.event`, while also
---- marking the Plan 5 explanation tagger so a file change that follows a
---- git operation within the tagger's window gets `explanation="git"`
---- instead of surfacing as an unexplained external change.
+--- start and, when present, watches for HEAD movement (commit, checkout,
+--- branch switch, merge, rebase, reset, amend) and emits a coarse
+--- `state_change` `git.event`, while also marking the Plan 5 explanation
+--- tagger so a file change that follows a git operation within the
+--- tagger's window gets `explanation="git"` instead of surfacing as an
+--- unexplained external change.
+---
+--- WHY THE REFLOG, NOT `.git/HEAD`: a plain `git commit` on the CURRENT
+--- branch does NOT rewrite `.git/HEAD` — that file stays
+--- `ref: refs/heads/<branch>` across the commit; only the branch ref
+--- (`.git/refs/heads/<branch>`) and the reflog (`.git/logs/HEAD`) change.
+--- `.git/HEAD` itself only changes on a branch switch / checkout / detached
+--- HEAD move. Since same-branch commit is the single most common git
+--- operation, watching `.git/HEAD` would silently miss it. `.git/logs/HEAD`
+--- (the reflog) instead APPENDS one line on every HEAD movement, including
+--- same-branch commits, resets, merges, rebases, and amends — so its
+--- size/mtime changes exactly when we need to know HEAD moved. This module
+--- watches the reflog file.
 ---
 --- GRACEFUL DEGRADATION IS THE PRIMARY GATE (CLAUDE.md, task brief): no git
 --- repo in the workspace, or no `git` binary on PATH at all, must NEVER
@@ -17,16 +29,19 @@
 --- is a deterministic decision handler — read the current commit sha via the
 --- injectable `run_git` seam, build+emit the payload, mark the tagger — with
 --- no waiting involved. Tests drive it directly. A thin `vim.uv` watcher
---- seam wires HEAD-file change notifications to it.
+--- seam wires reflog change notifications to it.
 ---
---- WATCHER CHOICE: `vim.uv.new_fs_poll()` on the resolved `.git/HEAD` path,
---- same rationale as fs_watcher.lua (stat-based polling survives
---- rename-into-place writes and git's own atomic HEAD updates, and is easy
---- to reason about/test relative to native fs_event notification quirks).
---- If the HEAD path can't be resolved (a git dir layout this port doesn't
---- special-case), this degrades further to a `run_git`-driven poll timer
+--- WATCHER CHOICE: `vim.uv.new_fs_poll()` on the resolved `.git/logs/HEAD`
+--- reflog path, same rationale as fs_watcher.lua (stat-based polling
+--- survives rename-into-place writes and git's own atomic ref updates, and
+--- is easy to reason about/test relative to native fs_event notification
+--- quirks). `.git/logs/HEAD` only exists once there has been at least one
+--- ref update, so a brand-new repo with zero commits may not have it yet
+--- (or the git dir can't be resolved at all — a layout this port doesn't
+--- special-case). Either case degrades to a `run_git`-driven poll timer
 --- that only fires `_on_head_change()` when the observed HEAD sha actually
---- changes since the last tick — never a crash, just a coarser signal.
+--- changes since the last tick — never a crash, just a coarser signal, and
+--- it still catches that first commit.
 ---
 --- COMMIT_SHA HANDLING (documented choice — task brief flagged this as an
 --- either-or): when `rev-parse HEAD` fails (unborn branch, detached-HEAD
@@ -138,29 +153,31 @@ local function read_gitdir_pointer(git_file_path)
   return gitdir
 end
 
---- resolve_head_path(workspace, run_git) -> string|nil
+--- resolve_git_dir(workspace, run_git) -> string|nil
 ---
---- Resolve the actual `HEAD` file to watch. Normal repo: `.git/HEAD`
---- directly under the workspace. Worktree/submodule (`.git` is a file):
---- best-effort read its `gitdir: <path>` pointer; falls back to
---- `git rev-parse --git-dir` if the pointer can't be read. Returns nil
---- (defensive degrade — no crash) if none of these resolve.
+--- Resolve the actual git DIRECTORY (not a specific file inside it) for
+--- this workspace. Normal repo: `.git` directly under the workspace.
+--- Worktree/submodule (`.git` is a file): best-effort read its
+--- `gitdir: <path>` pointer; falls back to `git rev-parse --git-dir` if
+--- the pointer can't be read. Returns nil (defensive degrade — no crash)
+--- if none of these resolve. Callers append the specific file they want
+--- to watch (e.g. `/logs/HEAD` for the reflog).
 --- @param workspace string
 --- @param run_git function
 --- @return string|nil
-local function resolve_head_path(workspace, run_git)
+local function resolve_git_dir(workspace, run_git)
   local git_path = workspace .. "/.git"
   local ok, stat = pcall(uv.fs_stat, git_path)
   if ok and stat ~= nil then
     if stat.type == "directory" then
-      return git_path .. "/HEAD"
+      return git_path
     elseif stat.type == "file" then
       local gitdir = read_gitdir_pointer(git_path)
       if gitdir ~= nil then
         if not gitdir:match("^/") then
           gitdir = workspace .. "/" .. gitdir
         end
-        return gitdir .. "/HEAD"
+        return gitdir
       end
     end
   end
@@ -171,7 +188,7 @@ local function resolve_head_path(workspace, run_git)
     if not git_dir:match("^/") then
       git_dir = workspace .. "/" .. git_dir
     end
-    return git_dir .. "/HEAD"
+    return git_dir
   end
 
   return nil
@@ -189,6 +206,9 @@ end
 ---   dispose(): idempotent teardown,
 ---   _on_head_change(): deterministic decision handler, exposed for tests,
 ---   active: boolean -- whether a repo was detected
+---   _watch_path: string|nil -- resolved reflog path being fs_polled, when
+---     the primary watch path could be set up; nil when the fallback
+---     run_git poll timer is in use instead. Test-oriented introspection.
 --- }
 function M.start(opts)
   opts = opts or {}
@@ -246,19 +266,34 @@ function M.start(opts)
   end
 
   -------------------------------------------------------------------------
-  -- Watch: prefer an fs_poll directly on the resolved HEAD file (fires only
-  -- on an actual change, mirrors fs_watcher.lua). If the path can't be
-  -- resolved, degrade to a run_git-driven poll timer that only fires
-  -- _on_head_change() when the observed sha differs from the prior tick.
+  -- Watch: prefer an fs_poll directly on the resolved REFLOG file
+  -- (`.git/logs/HEAD`), which appends on every HEAD movement including a
+  -- same-branch commit (fires only on an actual change, mirrors
+  -- fs_watcher.lua). If the git dir can't be resolved, or the reflog
+  -- doesn't exist yet (a fresh repo with zero commits), degrade to a
+  -- run_git-driven poll timer that only fires _on_head_change() when the
+  -- observed sha differs from the prior tick -- this also catches that
+  -- first commit, before any reflog exists.
   -------------------------------------------------------------------------
 
-  local resolve_ok, head_path = pcall(resolve_head_path, workspace, run_git)
-  head_path = (resolve_ok and type(head_path) == "string") and head_path or nil
+  local resolve_ok, git_dir = pcall(resolve_git_dir, workspace, run_git)
+  git_dir = (resolve_ok and type(git_dir) == "string") and git_dir or nil
 
-  if head_path then
+  local reflog_path = nil
+  if git_dir then
+    local candidate = git_dir .. "/logs/HEAD"
+    local stat_ok, stat = pcall(uv.fs_stat, candidate)
+    if stat_ok and stat ~= nil then
+      reflog_path = candidate
+    end
+  end
+
+  handle._watch_path = nil
+
+  if reflog_path then
     local poll = uv.new_fs_poll()
     if poll then
-      local started = poll:start(head_path, poll_interval_ms, function(_err, _prev, _curr)
+      local started = poll:start(reflog_path, poll_interval_ms, function(_err, _prev, _curr)
         if disposed then
           return
         end
@@ -271,6 +306,7 @@ function M.start(opts)
       end)
       if started then
         watcher = poll
+        handle._watch_path = reflog_path
       else
         pcall(function() poll:close() end)
       end
@@ -278,10 +314,11 @@ function M.start(opts)
   end
 
   if watcher == nil then
-    -- Defensive fallback: no HEAD path could be resolved (an unusual git
-    -- dir layout), so poll `run_git` on a timer instead of a file watcher.
-    -- Only calls _on_head_change() when the observed sha actually changes,
-    -- so this doesn't spam an event every tick.
+    -- Defensive fallback: no reflog could be resolved (a fresh repo with
+    -- no commits yet, or an unusual git dir layout), so poll `run_git` on
+    -- a timer instead of a file watcher. Only calls _on_head_change() when
+    -- the observed sha actually changes, so this doesn't spam an event
+    -- every tick.
     local last_sha = nil
     local timer = uv.new_timer()
     if timer then

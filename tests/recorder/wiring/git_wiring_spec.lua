@@ -215,6 +215,75 @@ describe("git_wiring", function()
   end)
 
   -------------------------------------------------------------------------
+  -- Watch target — proves the fix: the reflog (`.git/logs/HEAD`), not
+  -- `.git/HEAD`, is what gets watched, since a same-branch commit rewrites
+  -- the reflog but leaves `.git/HEAD` untouched.
+  -------------------------------------------------------------------------
+
+  describe("watch target", function()
+    it("with .git/logs/HEAD present, resolves+watches the REFLOG path, not .git/HEAD", function()
+      vim.fn.mkdir(dir .. "/.git/logs", "p")
+      local reflog_path = dir .. "/.git/logs/HEAD"
+      vim.fn.writefile(
+        { "0000000000000000000000000000000000000000 abc123def Author <a@example.com> 1700000000 +0000\tcommit (initial): init" },
+        reflog_path
+      )
+
+      local events, emit = new_emit()
+
+      local handle = track(git_wiring.start({
+        workspace = dir,
+        emit = emit,
+        run_git = function(args)
+          if args[1] == "rev-parse" and args[2] == "HEAD" then
+            return { ok = true, out = "abc123def" }
+          end
+          return { ok = true, out = ".git" }
+        end,
+      }))
+
+      assert.is_true(handle.active)
+      assert.equals(vim.fs.normalize(reflog_path), vim.fs.normalize(handle._watch_path))
+    end)
+
+    it("with .git/logs/HEAD ABSENT (fresh repo, no commits), falls back to the run_git poll: still active, still detects a sha change", function()
+      vim.fn.mkdir(dir .. "/.git", "p")
+      -- No .git/logs directory at all — mirrors a just-`git init`ed repo
+      -- before any commit has ever moved HEAD.
+
+      local events, emit = new_emit()
+      local mark_called = false
+      local fake_tagger = { mark_git = function() mark_called = true end }
+
+      local handle = track(git_wiring.start({
+        workspace = dir,
+        emit = emit,
+        tagger = fake_tagger,
+        run_git = function(args)
+          if args[1] == "rev-parse" and args[2] == "HEAD" then
+            return { ok = true, out = "freshsha1" }
+          end
+          return { ok = true, out = ".git" }
+        end,
+      }))
+
+      assert.is_true(handle.active)
+      assert.is_nil(handle._watch_path) -- no reflog to watch -> fallback in use
+
+      -- The fallback poll timer degrades gracefully, but _on_head_change
+      -- (the deterministic handler it drives) still works: the first
+      -- commit is still detectable via the run_git-driven path.
+      handle._on_head_change()
+
+      assert.equals(1, #events)
+      assert.equals("git.event", events[1].kind)
+      assert.equals("state_change", events[1].data.operation)
+      assert.equals("freshsha1", events[1].data.commit_sha)
+      assert.is_true(mark_called)
+    end)
+  end)
+
+  -------------------------------------------------------------------------
   -- dispose — idempotent, stops the watcher, no leaked handle.
   -------------------------------------------------------------------------
 
