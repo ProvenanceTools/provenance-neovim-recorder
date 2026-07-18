@@ -39,13 +39,19 @@ function M.setup(opts)
       state.activate({ workspace = workspace, manifest = result.manifest })
       status.attach(state)
     else
-      -- Debug-level only: an unactivated cwd (e.g. the student's home
+      -- Silent by default: an unactivated cwd (e.g. the student's home
       -- directory, an unrelated project) is the common case, not something
-      -- to surface to the user every time they open Neovim.
-      vim.notify(
-        string.format("Provenance: workspace not activated (%s)", tostring(result.reason)),
-        vim.log.levels.DEBUG
-      )
+      -- to surface to the user every time they open Neovim or `cd`s.
+      -- vim.notify does NOT filter by level on its own (even DEBUG is
+      -- echoed unconditionally by the default handler), so gate this
+      -- explicitly behind an opt-in debug flag rather than relying on the
+      -- level argument to suppress it.
+      if vim.g.provenance_debug then
+        vim.notify(
+          string.format("Provenance: workspace not activated (%s)", tostring(result.reason)),
+          vim.log.levels.DEBUG
+        )
+      end
       state.deactivate()
 
       if vim.fn.exists(":" .. SEAL_COMMAND_NAME) == 0 then

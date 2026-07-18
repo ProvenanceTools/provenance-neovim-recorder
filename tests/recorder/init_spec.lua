@@ -112,6 +112,53 @@ describe("recorder.setup", function()
     end
   end)
 
+  it("inactive loader: debug gate off (default) emits no visible notification", function()
+    local calls = {}
+    local orig_notify = vim.notify
+    vim.notify = function(...)
+      table.insert(calls, { ... })
+    end
+
+    local ok = pcall(function()
+      handle = recorder.setup({
+        workspace = "/tmp/ws",
+        load_and_verify = function()
+          return { status = "inactive", reason = "no_manifest_file" }
+        end,
+      })
+    end)
+
+    vim.notify = orig_notify
+
+    assert.is_true(ok)
+    assert.equals(0, #calls)
+  end)
+
+  it("inactive loader: debug gate on (vim.g.provenance_debug) emits a notification", function()
+    vim.g.provenance_debug = true
+
+    local calls = {}
+    local orig_notify = vim.notify
+    vim.notify = function(...)
+      table.insert(calls, { ... })
+    end
+
+    local ok = pcall(function()
+      handle = recorder.setup({
+        workspace = "/tmp/ws",
+        load_and_verify = function()
+          return { status = "inactive", reason = "no_manifest_file" }
+        end,
+      })
+    end)
+
+    vim.notify = orig_notify
+    vim.g.provenance_debug = nil
+
+    assert.is_true(ok)
+    assert.is_true(#calls >= 1)
+  end)
+
   it("dispose(): detaches status so segment() goes back to empty", function()
     handle = recorder.setup({
       workspace = "/tmp/ws",
