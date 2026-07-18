@@ -293,6 +293,57 @@ Verbatim `ValidationReport` (`bash scripts/e2e/run_full_e2e.sh`,
 }
 ```
 
+## Precise on_bytes deltas + selection/focus/ext.activate signals
+
+These items cover the switch to precise `on_bytes` deltas and the three added
+signals (`selection.change`, `focus.change`, `ext.activate`). The headless
+suite covers the transforms, the wiring seams, and reconstruction against a
+faithful reimplementation of the analyzer's `offsetAt`/splice; the live-TUI
+items below cover what headless cannot.
+
+- [x] **Real analyzer accepts precise-delta bundles (re-run of the Plan 9
+      Task 4 gate):** After switching `doc_wiring.lua` from `on_lines`
+      (full-line delta text) to `on_bytes` (precise character-range deltas
+      carrying exactly the inserted text), the full-signals e2e gate
+      (`scripts/e2e/run_full_e2e.sh` against
+      `PROVENANCE_MONOREPO=/Users/aaryanmehta/projects/provenance`) still
+      produces `overall: "pass"` with `doc_save_hashes` and
+      `submitted_code_match` both `"pass"` — i.e. the real analyzer
+      reconstructs the file byte-for-byte from the new delta shape. (Run
+      locally with the committed fixture's dev course key restored, since the
+      committed fixture manifest predates the production-key swap in
+      `8506a30`; the analyzer itself does not consult the course key.)
+
+- [ ] **Typing on a long line is NOT flagged as paste:** In a real `nvim`
+      session in an activated workspace, type a full line of code longer than
+      30 characters, character by character, in insert mode. Confirm the
+      `.slog` records `doc.change` events with `source="typed"` (NOT `paste`
+      or `paste.anomaly`), and that each keystroke's delta `text` is the
+      single typed character — not the whole line.
+
+- [ ] **selection.change on cursor + visual:** Move the cursor around a
+      recordable buffer (h/j/k/l, `w`, `}`) and confirm `selection.change`
+      events with `was_selection=false` and the cursor position. Then make a
+      visual selection (`v` + motion, `V`, Ctrl-V) and confirm
+      `selection.change` with `was_selection=true` and a non-empty range.
+      Confirm no `selection.change` is emitted while the cursor is in a
+      non-recordable buffer (e.g. a terminal or a file outside the workspace).
+
+- [ ] **focus.change on terminal focus:** With focus reporting supported by
+      the hosting terminal, switch away from the Neovim window and back.
+      Confirm a `focus.change` with `gained=false` on blur and `gained=true`
+      on refocus (one per transition, not doubled), and that the next
+      `session.heartbeat` reflects the current `focused` state rather than a
+      constant `true`.
+
+- [ ] **ext.activate on lazy-loaded plugin:** In a session using a plugin
+      manager with lazy-loading, trigger a plugin to load mid-session (e.g.
+      open a filetype that lazy-loads an LSP/plugin). Confirm an `ext.activate`
+      `{ id, version }` is recorded for the newly-loaded plugin within one
+      poll interval (~5 min), and that plugins already loaded at session start
+      do NOT emit `ext.activate` (they are the baseline, covered by the
+      startup `ext.snapshot`).
+
 ## Plan 9 — full integration
 
 - [ ] **End-to-end installation and manual seal:** Install the plugin in a real `nvim` session via a plugin manager (lazy.nvim or packer.nvim) from a course-specific release tag. Open a workspace containing a valid, course-signed `.provenance-manifest` (one that verifies against the committed course public key). Confirm the status indicator shows "Provenance: recording". Do some work: type in a file, paste some text, save. Run `:ProvenanceSeal` via the command-line. Confirm that a `.provenance.zip` bundle file is produced in the workspace and the seal command outputs its path. Verify that the `.zip` contains a `manifest.json`, `manifest.sig`, and `.provenance/` directory with `.slog` and `.slog.meta` files.
