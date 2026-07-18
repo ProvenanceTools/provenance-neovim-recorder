@@ -178,3 +178,117 @@ real OS-level watcher latency — those need a live TUI:
 - [ ] **Git commit emits git.event:** In an activated workspace that is a git repository, make a commit (e.g., `git commit -m "test"`). Confirm a `git.event` with `operation="state_change"` is recorded, including the new `commit_sha`. Confirm that a file change shortly after the commit is tagged with `explanation="git"` by the explanation tagger.
 
 - [ ] **No git installed → session still works:** With no `git` binary on PATH, or in a non-git workspace, start a session in an activated directory. Confirm the session activates, records events normally, and seals without error. The git wiring degrades to a no-op (no `git.event`, no tagger marks) — a missing git integration is a degraded signal, not a failure.
+
+## Plan 9 Task 4 — full-signals end-to-end analyzer acceptance
+
+This is the FULL-SIGNALS counterpart of Plan 4 Task 10: instead of a minimal
+`recording_session` (doc.open/doc.change/doc.save only), this gate drives a
+`recording_controller` session (`enable_signals = true`) through every
+signal kind — paste, an externally-clobbered file, a synthetic terminal
+open, a real git commit, the always-on `ext.snapshot`, a forced
+`session.heartbeat`, and a signed checkpoint (small `checkpoint_interval`)
+— then seals, and hands the bundle to the REAL Provenance monorepo's
+`analysis-core`. The point is that paste + external-change reconstruction
+must not break `doc_save_hashes` (check 7) or `submitted_code_match`
+(check 8), which the minimal session never exercises.
+
+### How to run
+
+```sh
+# Requires a sibling checkout of github.com/ProvenanceTools/provenance with
+# analysis-core built (packages/analysis-core/dist/index.js must exist).
+PROVENANCE_MONOREPO=/path/to/provenance scripts/e2e/run_full_e2e.sh
+```
+
+This:
+1. Runs `scripts/e2e/produce_full_signals_bundle.lua` headless (`nvim
+   --headless -u tests/minimal_init.lua -l
+   scripts/e2e/produce_full_signals_bundle.lua`), which builds a temp
+   workspace from the same dev manifest fixture as the minimal driver, git
+   `init`s it, starts a real `recording_controller` session
+   (`checkpoint_interval = 3`), drives every signal kind, seals, and copies
+   the resulting `.zip` to `$PROVNVIM_E2E_OUT/full-signals-bundle.zip`.
+2. Runs `node scripts/verify-bundle-with-analyzer.mjs
+   $OUT/full-signals-bundle.zip` against the real analyzer.
+
+The externally-clobbered file (`fs.external_change`) is the reviewed file
+itself, driven deterministically via
+`session._signals.coordinator.check_after_save(rel, abs_path)` right after
+overwriting it on disk with different bytes — and it is never touched again
+afterward, so the final on-disk bytes equal the `fs.external_change` event's
+`new_hash`, which is what `submitted_code_match` (check 8) compares against
+(it only ever looks at the LAST recorded hash per file — `doc.save` /
+`doc.open` / `fs.external_change`, whichever is most recent by seq — never
+full reconstruction). Terminal is driven via a synthetic `TermOpen`
+autocmd fire (mirrors `tests/recorder/wiring/terminal_wiring_spec.lua`); git
+via a real `git commit` plus a deterministic
+`session._signals.git._on_head_change()` call, rather than waiting on the
+real `vim.uv.new_fs_poll()` reflog watcher's default 2s interval.
+
+### Current status: PASSING — real analyzer accepts a full-signals Neovim-produced bundle
+
+As of 2026-07-18, running the gate produced `overall: "pass"`, with every
+check — including `doc_save_hashes` and `submitted_code_match` — `"pass"`.
+Recorded event kinds: `session.start`, `ext.snapshot`, `doc.open`,
+`doc.change`, `paste`, `doc.save`, `fs.external_change`, `terminal.open`,
+`git.event`, `session.heartbeat` (plus `session.end`, appended at
+`session.stop()`), and a signed checkpoint in the `.slog.meta` (from
+`checkpoint_interval = 3`). No fix was required — check 7/8's design already
+accounts for `fs.external_change` (it marks reconstruction indeterminate at
+that point rather than failing, and check 8 compares only the last
+recorded hash, not a full replay), which the minimal session never
+exercises.
+
+Verbatim `ValidationReport` (`bash scripts/e2e/run_full_e2e.sh`,
+`PROVENANCE_MONOREPO=/Users/aaryanmehta/projects/provenance`):
+
+```json
+{
+  "checks": [
+    {
+      "id": "manifest_sig",
+      "label": "Bundle manifest signature",
+      "status": "pass",
+      "detail": "Verified against session 73e44a26-f069-4314-b7d5-8d7fb3024278."
+    },
+    {
+      "id": "session_binding",
+      "label": "Session binding to assignment manifest",
+      "status": "pass",
+      "detail": "Single session; binding trivially consistent."
+    },
+    {
+      "id": "chain_integrity",
+      "label": "Hash chain integrity",
+      "status": "pass"
+    },
+    {
+      "id": "seq_gaps",
+      "label": "No seq gaps",
+      "status": "pass"
+    },
+    {
+      "id": "monotonic_t",
+      "label": "Monotonically non-decreasing t",
+      "status": "pass"
+    },
+    {
+      "id": "monotonic_wall",
+      "label": "Monotonically non-decreasing wall clock",
+      "status": "pass"
+    },
+    {
+      "id": "doc_save_hashes",
+      "label": "Doc save hash consistency",
+      "status": "pass"
+    },
+    {
+      "id": "submitted_code_match",
+      "label": "Submitted code matches recorded final state",
+      "status": "pass",
+      "detail": "1 submitted file(s) match the recorded final state."
+    }
+  ],
+  "overall": "pass"
+}
+```
