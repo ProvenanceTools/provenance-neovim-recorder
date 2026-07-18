@@ -1,0 +1,294 @@
+--- Doc wiring: the Neovim seam between buffer/autocmd signals and the pure
+--- doc_events transforms, emitted through the SessionHost's `emit`. Ports the
+--- CORE of the monorepo's doc-wiring.ts (recordability filter, open/change/
+--- save/close, catch-up for already-open buffers). Paste detection (Plan 6)
+--- and external-change detection (Plan 5) are DEFERRED — doc.change always
+--- carries source="typed" (hardcoded in doc_events.transform_doc_change), and
+--- there is no expected-content model here yet.
+local doc_events = require("provenance.recorder.events.doc_events")
+local default_sha256 = require("provenance.core.sha256")
+
+local M = {}
+
+local AUGROUP_NAME = "ProvenanceDocWiring"
+
+-- The activation manifest at the workspace root — never recorded, mirrors
+-- activation.lua's MANIFEST_NAMES (not exported there, so duplicated here;
+-- both must change together if the manifest filename ever changes).
+local MANIFEST_RELS = { [".provenance-manifest"] = true, ["provenance-manifest"] = true }
+
+--- attach(opts) -> handle
+---
+--- opts:
+---   workspace: string             -- absolute path to the activated workspace root
+---   provenance_dir: string|nil    -- absolute path to <workspace>/.provenance/;
+---                                    files under it are NEVER recorded (self-loop
+---                                    prevention). May be nil in tests.
+---   files_under_review: table|nil -- workspace-relative paths; kept for signature
+---                                    parity with later plans, unused here.
+---   emit: function(kind, data)    -- SessionHost.emit
+---   get_hash: function(text) -> hex string; defaults to sha256.hex, injectable
+---                                    for tests.
+---
+--- Returns a handle with handle.dispose().
+--- Resolve a directory to the same absolute form Neovim uses internally for
+--- buffer names (nvim_buf_get_name performs realpath-style resolution of
+--- existing path components — e.g. macOS's /tmp and /var are symlinks into
+--- /private, so a workspace path built from vim.fn.tempname()/getcwd() can
+--- disagree with a buffer's reported name unless both are resolved the same
+--- way). Falls back to plain vim.fs.normalize if the path doesn't exist yet
+--- or realpath fails, so this stays safe to call before the directory exists.
+local function resolve_dir(path)
+  if not path then
+    return nil
+  end
+  local normalized = vim.fs.normalize(path)
+  local real = vim.uv.fs_realpath(normalized)
+  return real and vim.fs.normalize(real) or normalized
+end
+
+function M.attach(opts)
+  opts = opts or {}
+
+  local workspace = resolve_dir(opts.workspace)
+  local provenance_dir = resolve_dir(opts.provenance_dir)
+  local emit = opts.emit
+  local get_hash = opts.get_hash or default_sha256.hex
+
+  local disposed = false
+
+  -- Defensive de-dup for doc.open (mirrors doc-wiring.ts's seenDocs). Keyed
+  -- by rel path, never cleared — a closed-then-reopened doc does not refire
+  -- doc.open, matching the reference implementation (CLAUDE.md: no registry
+  -- deletion on close).
+  local seen = {}
+
+  -- Buffers we've called nvim_buf_attach on, and the workspace-relative path
+  -- cached at attach time so the on_lines hot path never recomputes
+  -- recordability per keystroke.
+  local attached_bufs = {}
+  local buf_rel = {}
+
+  -------------------------------------------------------------------------
+  -- Recordability filter (single source of truth).
+  --
+  -- Recordable iff: buftype == "" (a normal file buffer — excludes
+  -- terminal/help/nofile/quickfix/prompt), the buffer has a name whose
+  -- absolute path is inside `workspace`, and it isn't a provenance artifact
+  -- (the activation manifest, or anything under `provenance_dir`).
+  --
+  -- Returns the workspace-relative path on success, nil otherwise, so
+  -- callers can reuse it without recomputing.
+  -------------------------------------------------------------------------
+  local function is_recordable(buf)
+    if not vim.api.nvim_buf_is_valid(buf) then
+      return nil
+    end
+    if vim.api.nvim_get_option_value("buftype", { buf = buf }) ~= "" then
+      return nil
+    end
+
+    local name = vim.api.nvim_buf_get_name(buf)
+    if name == "" then
+      return nil
+    end
+
+    local abs = vim.fs.normalize(name)
+    if abs ~= workspace and not vim.startswith(abs, workspace .. "/") then
+      return nil
+    end
+    local rel = (abs == workspace) and "" or abs:sub(#workspace + 2)
+
+    if MANIFEST_RELS[rel] then
+      return nil
+    end
+    if provenance_dir and (abs == provenance_dir or vim.startswith(abs, provenance_dir .. "/")) then
+      return nil
+    end
+
+    return rel
+  end
+
+  -------------------------------------------------------------------------
+  -- doc.open
+  -------------------------------------------------------------------------
+
+  --- Emit doc.open for `buf`, reading its text exactly once. No-op if not
+  --- recordable or already emitted for this rel path.
+  local function emit_doc_open(buf)
+    local rel = is_recordable(buf)
+    if not rel then
+      return
+    end
+    if seen[rel] then
+      return
+    end
+    seen[rel] = true
+
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local text = table.concat(lines, "\n")
+    local line_count = #lines
+    local hash = get_hash(text)
+
+    local ev = doc_events.transform_doc_open(rel, hash, text, line_count)
+    emit(ev.kind, ev.data)
+  end
+
+  -------------------------------------------------------------------------
+  -- on_lines (hot path) + attach
+  -------------------------------------------------------------------------
+
+  --- Attach nvim_buf_attach to `buf` (idempotent) and cache its rel path.
+  local function attach_buffer(buf)
+    if attached_bufs[buf] then
+      return
+    end
+    local rel = is_recordable(buf)
+    if not rel then
+      return
+    end
+
+    attached_bufs[buf] = true
+    buf_rel[buf] = rel
+
+    vim.api.nvim_buf_attach(buf, false, {
+      -- MINIMAL hot-path work: no signing, no canonicalization, no
+      -- recordability recompute (rel is looked up from the cache filled at
+      -- attach time). emit() only builds the event shape; SessionHost does
+      -- the actual chaining/hashing/writing elsewhere.
+      on_lines = function(_, b, _changedtick, first, last, new_last, ...)
+        if disposed then
+          return true -- detach
+        end
+
+        local r = buf_rel[b]
+        if not r then
+          return
+        end
+
+        -- Single line-granular delta representing lines [first, last)
+        -- replaced by lines [first, new_last). Intentionally NOT
+        -- byte/character-precise — the Plan-4 success gate is chain
+        -- integrity + signatures, not byte-perfect delta reconstruction.
+        -- Character-precise diffing is out of scope for this task.
+        local new_lines = vim.api.nvim_buf_get_lines(b, first, new_last, false)
+        local delta = {
+          range = {
+            start = { line = first, character = 0 },
+            ["end"] = { line = last, character = 0 },
+          },
+          text = table.concat(new_lines, "\n"),
+        }
+
+        local ev = doc_events.transform_doc_change(r, { delta })
+        emit(ev.kind, ev.data)
+      end,
+      on_detach = function(_, b)
+        attached_bufs[b] = nil
+        buf_rel[b] = nil
+      end,
+    })
+  end
+
+  -------------------------------------------------------------------------
+  -- Autocmds
+  -------------------------------------------------------------------------
+
+  local augroup = vim.api.nvim_create_augroup(AUGROUP_NAME, { clear = true })
+
+  vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile" }, {
+    group = augroup,
+    desc = "Provenance: doc.open + attach on buffer read/create",
+    callback = function(args)
+      local buf = args.buf
+      if not is_recordable(buf) then
+        return
+      end
+      emit_doc_open(buf)
+      attach_buffer(buf)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("BufWritePost", {
+    group = augroup,
+    desc = "Provenance: doc.save on write",
+    callback = function(args)
+      local buf = args.buf
+      local rel = is_recordable(buf)
+      if not rel then
+        return
+      end
+
+      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      local text = table.concat(lines, "\n")
+      local hash = get_hash(text)
+
+      local ev = doc_events.transform_doc_save(rel, hash)
+      emit(ev.kind, ev.data)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufDelete", "BufUnload" }, {
+    group = augroup,
+    desc = "Provenance: doc.close on delete/unload",
+    callback = function(args)
+      local buf = args.buf
+      -- The buffer may already be mid-unload by the time this fires (order
+      -- relative to nvim_buf_attach's internal on_detach isn't guaranteed),
+      -- so fall back to the rel cached at attach time.
+      local rel = is_recordable(buf) or buf_rel[buf]
+      if not rel then
+        return
+      end
+
+      -- CLAUDE.md/doc-wiring.ts parity: do NOT delete the `seen` de-dup
+      -- entry on close — close+reopen is common and should not re-emit
+      -- doc.open. Only the buffer attachment is torn down.
+      local ev = doc_events.transform_doc_close(rel)
+      emit(ev.kind, ev.data)
+    end,
+  })
+
+  -------------------------------------------------------------------------
+  -- Catch-up (PRD §4.2.1): synthetic doc.open for buffers already open when
+  -- attach() runs. The `seen` de-dup guards against a race with a live
+  -- BufReadPost firing for the same buffer around this same moment.
+  -------------------------------------------------------------------------
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf) and is_recordable(buf) then
+      emit_doc_open(buf)
+      attach_buffer(buf)
+    end
+  end
+
+  -------------------------------------------------------------------------
+  -- Teardown
+  -------------------------------------------------------------------------
+
+  local handle = {}
+
+  --- Idempotent: safe to call more than once. After this returns, no
+  --- autocmds remain in this augroup, tracked buffers are (best-effort)
+  --- detached, and any in-flight on_lines callback detaches itself on its
+  --- next invocation via the `disposed` flag.
+  function handle.dispose()
+    if disposed then
+      return
+    end
+    disposed = true
+
+    pcall(vim.api.nvim_del_augroup_by_name, AUGROUP_NAME)
+
+    for buf in pairs(attached_bufs) do
+      if vim.api.nvim_buf_is_valid(buf) then
+        pcall(vim.api.nvim_buf_detach, buf)
+      end
+    end
+    attached_bufs = {}
+    buf_rel = {}
+  end
+
+  return handle
+end
+
+return M
