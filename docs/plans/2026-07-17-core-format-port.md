@@ -286,8 +286,8 @@ describe("json.canonicalize", function()
   it("escapes strings like JSON.stringify", function()
     assert.equals([["a/b"]], json.canonicalize("a/b")) -- slash NOT escaped
     assert.equals([["\"\\"]], json.canonicalize('"\\'))
-    assert.equals([[" "]], json.canonicalize("\0\31"))
-    assert.equals([["\n\t"]], json.canonicalize("\n\t"))
+    assert.equals('"\\u0000\\u001f"', json.canonicalize("\0\31")) -- control chars
+    assert.equals('"\\n\\t"', json.canonicalize("\n\t")) -- short escapes
   end)
 
   it("canonicalizes the envelope shape identically regardless of insertion order", function()
