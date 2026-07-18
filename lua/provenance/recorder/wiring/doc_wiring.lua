@@ -17,27 +17,91 @@ local AUGROUP_NAME = "ProvenanceDocWiring"
 -- both must change together if the manifest filename ever changes).
 local MANIFEST_RELS = { [".provenance-manifest"] = true, ["provenance-manifest"] = true }
 
---- content_bytes(buf) -> string
+--- file_eol(buf) -> string
 ---
---- The single content model used for doc.open's inlined content/hash and
---- doc.save's hash: buffer lines joined by "\n", PLUS one trailing "\n".
+--- The line-ending Neovim writes for this buffer, per `'fileformat'`:
+--- dos -> "\r\n", mac -> "\r", unix (or anything else) -> "\n".
+local function file_eol(buf)
+  local ff = vim.bo[buf].fileformat
+  if ff == "dos" then
+    return "\r\n"
+  end
+  if ff == "mac" then
+    return "\r"
+  end
+  return "\n"
+end
+
+--- content_bytes(buf, opts?) -> string
 ---
---- This matches two things that must agree for the analyzer to accept a
---- bundle: (a) Neovim's default `'fixeol'` (on) always terminates a written
---- file with a trailing "\n" regardless of the buffer's own line array, so
---- this is what actually lands on disk (and what seal.lua's raw-byte hash
---- for submission_files sees); and (b) VS Code's `TextDocument.getText()` —
---- what the reference recorder (doc-wiring.ts) and the analyzer's delta-
---- replay reconstruction both assume — models a file ending in "\n" as N+1
---- lines with an empty last line, which is exactly `join(lines, "\n") ..
---- "\n"`.
+--- The content model used for doc.open's inlined content/hash and doc.save's
+--- hash: buffer lines joined by the buffer's own `'fileformat'` line-ending,
+--- plus one trailing line-ending when the buffer's last line actually has
+--- one on disk. This is exactly how Neovim writes the buffer (`:help
+--- fileformat`, `:help eol`, `:help fixeol`), so it matches the raw on-disk
+--- bytes the analyzer's check 8 (`submitted_code_match`) exact-hashes
+--- against, for unix/dos/mac fileformats and for noeol files.
 ---
---- Deferred (not handled here — default unix+fixeol is the scope this gate
---- needs): fileformat=dos/mac, `'nobinary'`/`'noeol'` buffers, and the
---- empty-buffer/0-byte-file edge case.
-local function content_bytes(buf)
+--- Two content models are actually needed, selected by `opts.as_written`,
+--- because `'endofline'` (empirically verified against real Neovim 0.12,
+--- not just documentation) does NOT get updated by a write: it reflects the
+--- state as of the last *read*, and Neovim's write-time policy for whether
+--- the last line gets a trailing EOL is governed by `'endofline'` OR (NOT
+--- `'binary'` AND `'fixeol'`) (`:help 'endofline'`). Under this plugin's
+--- expected default settings (`binary` off, `fixeol` on — its default), that
+--- means a `:write` of a `noeol` buffer SILENTLY ADDS a trailing EOL on
+--- disk while `'endofline'` itself stays reported as false afterward.
+---   - opts.as_written = falsy (doc.open / catch-up): the buffer mirrors
+---     exactly what was just *read*, before any write has touched it, so
+---     `'endofline'` alone is accurate — needed so an untouched/never-saved
+---     noeol file's doc.open hash still matches its still-untouched,
+---     eol-less bytes on disk.
+---   - opts.as_written = true (doc.save, fired on BufWritePost — a write
+---     JUST happened): reproduces Neovim's write-time policy above, so the
+---     hash matches what Neovim actually just wrote (including a fixeol-
+---     added EOL the buffer's own `'endofline'` doesn't reflect).
+---
+--- Special-cased: a buffer of exactly one empty line ({""}) is Neovim's
+--- (ambiguous, per `nvim_buf_get_lines`) representation of a genuinely
+--- empty/0-byte file, and empirically always writes 0 bytes regardless of
+--- `'endofline'`/`'fixeol'` — so this returns "" for it rather than
+--- appending a spurious EOL. (This is indistinguishable, via the buffer
+--- API, from a real single-blank-line file whose content is just an EOL —
+--- an existing, pre-existing Neovim/Vim ambiguity, not introduced here;
+--- out of scope per the "0-byte file if feasible" ask.)
+---
+--- Residual known-minor (not solved here, and — verified above — only
+--- possible under NON-default settings): editing the LAST line of a `noeol`
+--- file with `'nofixeol'` or `'binary'` set, then saving, can make check 7
+--- (internal delta-replay reconstruction) diverge, because the on_lines
+--- delta below always appends a trailing eol to its replacement text even
+--- when that line is the buffer's final, eol-less line, while
+--- content_bytes(as_written=true) would there correctly report no trailing
+--- EOL. Under this plugin's expected defaults (fixeol on, binary off) the
+--- write-time formula above always adds the EOL anyway, so no divergence
+--- occurs. Check 8 (submission integrity) is unaffected either way, since
+--- doc.save always re-hashes content_bytes(buf, {as_written = true}), which
+--- correctly reflects the actual on-disk write.
+local function content_bytes(buf, opts)
+  opts = opts or {}
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  return table.concat(lines, "\n") .. "\n"
+  if #lines == 1 and lines[1] == "" then
+    return ""
+  end
+
+  local eol = file_eol(buf)
+  local body = table.concat(lines, eol)
+
+  local has_trailing_eol
+  if opts.as_written then
+    has_trailing_eol = vim.bo[buf].endofline or (not vim.bo[buf].binary and vim.bo[buf].fixendofline)
+  else
+    has_trailing_eol = vim.bo[buf].endofline
+  end
+  if has_trailing_eol then
+    body = body .. eol
+  end
+  return body
 end
 
 --- attach(opts) -> handle
@@ -228,14 +292,16 @@ function M.attach(opts)
 
         -- Single line-granular delta representing lines [first, last)
         -- replaced by lines [first, new_last). Byte-accurate under the
-        -- trailing-newline content model (content_bytes): each buffer line
-        -- in that model is "\n"-terminated, including the (possibly empty)
-        -- line at the old/new line count, so appending "\n" to the new
+        -- fileformat-aware content model (content_bytes): each buffer line
+        -- in that model is eol-terminated (using this buffer's own
+        -- 'fileformat' line-ending), including the (possibly empty) line at
+        -- the old/new line count, so appending the same eol to the new
         -- lines' join reproduces exactly the bytes being spliced in at
         -- offsetAt(first,0)..offsetAt(last,0). A pure deletion (new_last ==
         -- first) has no replacement text, so text is "".
+        local eol = file_eol(b)
         local new_lines = vim.api.nvim_buf_get_lines(b, first, new_last, false)
-        local text = (new_last > first) and (table.concat(new_lines, "\n") .. "\n") or ""
+        local text = (new_last > first) and (table.concat(new_lines, eol) .. eol) or ""
         local delta = {
           range = {
             start = { line = first, character = 0 },
@@ -286,7 +352,7 @@ function M.attach(opts)
         return
       end
 
-      local text = content_bytes(buf)
+      local text = content_bytes(buf, { as_written = true })
       local hash = get_hash(text)
 
       local ev = doc_events.transform_doc_save(rel, hash)

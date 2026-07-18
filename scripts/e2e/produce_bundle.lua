@@ -82,8 +82,23 @@ local ok, err = pcall(function()
   end
   local reviewed_abs = workspace .. "/" .. reviewed_rel
   vim.fn.mkdir(vim.fn.fnamemodify(reviewed_abs, ":h"), "p")
+
+  -- Optional CRLF/dos-fileformat variant (finding-1 regression proof): the
+  -- ON-DISK bytes already have \r\n line endings BEFORE nvim ever opens the
+  -- file, matching the realistic scenario ("Windows default" / any
+  -- CRLF-authored file) -- Neovim's `'fileformats'` autodetects fileformat
+  -- =dos from this on open, exactly like the doc_wiring_spec.lua CRLF
+  -- coverage. (Forcing 'fileformat' mid-session on an already-open unix
+  -- buffer is a DIFFERENT, harder scenario -- a global EOL-character
+  -- conversion of every line, not a line-granular edit -- and is out of
+  -- scope for this fix.)
+  local forced_fileformat = os.getenv("PROVNVIM_E2E_FILEFORMAT")
+  local reviewed_content = "print('hello world')\n"
+  if forced_fileformat == "dos" then
+    reviewed_content = "print('hello world')\r\n"
+  end
   local rf = assert(io.open(reviewed_abs, "w"))
-  rf:write("print('hello world')\n")
+  rf:write(reviewed_content)
   rf:close()
 
   -- ---------------------------------------------------------------------

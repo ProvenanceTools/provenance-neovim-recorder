@@ -78,6 +78,19 @@ local function count(events, kind)
   return n
 end
 
+--- Read the raw on-disk bytes of `path` via vim.uv (fs_open/fs_read) — NOT
+--- vim.fn.readfile, which splits on "\n" and mangles CRLF/CR line endings,
+--- making it useless for the exact-byte comparisons the fileformat-aware
+--- content model tests below need.
+local function read_raw(path)
+  local uv = vim.uv or vim.loop
+  local fd = assert(uv.fs_open(path, "r", 420))
+  local stat = assert(uv.fs_fstat(fd))
+  local data = uv.fs_read(fd, stat.size, 0)
+  uv.fs_close(fd)
+  return data
+end
+
 describe("doc_wiring.attach", function()
   local scratch
 
@@ -92,7 +105,7 @@ describe("doc_wiring.attach", function()
   it("emits doc.open for a recordable file with correct rel/hash/lines/content", function()
     local workspace = scratch.workspace()
     local path = workspace .. "/foo.txt"
-    scratch.write_file(path, "line1\nline2")
+    scratch.write_file(path, "line1\nline2\n")
 
     local events, emit = new_emit()
     scratch.handle = doc_wiring.attach({ workspace = workspace, emit = emit })
@@ -102,9 +115,10 @@ describe("doc_wiring.attach", function()
     local ev = find(events, "doc.open")
     assert.is_not_nil(ev)
     assert.equals("foo.txt", ev.data.path)
-    -- Trailing-newline content model: matches nvim's default fixeol
-    -- on-disk bytes and VS Code's getText() semantics (see doc_wiring.lua's
-    -- content_bytes comment).
+    -- fileformat=unix + endofline=true content model: matches this file's
+    -- actual on-disk bytes (see doc_wiring.lua's content_bytes comment; the
+    -- noeol/dos/empty variants are covered by the "fileformat-aware content
+    -- model" describe block below).
     assert.equals(sha256.hex("line1\nline2\n"), ev.data.sha256)
     assert.equals(2, ev.data.line_count)
     assert.equals("line1\nline2\n", ev.data.content)
@@ -177,6 +191,115 @@ describe("doc_wiring.attach", function()
     assert.is_not_nil(ev)
     assert.equals("foo.txt", ev.data.path)
     assert.equals(sha256.hex("changed\n"), ev.data.sha256)
+  end)
+
+  describe("fileformat-aware content model (matches raw on-disk bytes for the analyzer's exact-hash check 8)", function()
+    it("unix file with trailing newline: doc.save hash matches raw on-disk bytes (regression guard)", function()
+      local workspace = scratch.workspace()
+      local path = workspace .. "/unix.txt"
+      scratch.write_file(path, "line1\nline2\n")
+
+      local events, emit = new_emit()
+      scratch.handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+
+      local buf = scratch.edit(path)
+      vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "changed" })
+      vim.cmd("write")
+
+      local save_ev = find(events, "doc.save")
+      assert.is_not_nil(save_ev)
+      local raw = read_raw(path)
+      assert.equals("changed\nline2\n", raw)
+      -- Unchanged from the pre-fileformat-aware behavior: fileformat=unix +
+      -- endofline=true is byte-identical to the old hardcoded join(...,"\n").."\n".
+      assert.equals(sha256.hex(raw), save_ev.data.sha256)
+    end)
+
+    it("fileformat=dos (CRLF) file: doc.save hash matches raw CRLF on-disk bytes, delta text uses CRLF", function()
+      local workspace = scratch.workspace()
+      local path = workspace .. "/dos.txt"
+      scratch.write_file(path, "a\r\nb\r\n")
+
+      local events, emit = new_emit()
+      scratch.handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+
+      local buf = scratch.edit(path)
+      assert.equals("dos", vim.bo[buf].fileformat) -- Neovim auto-detects CRLF -> dos
+
+      vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "aX" })
+      vim.cmd("write")
+
+      local raw = read_raw(path)
+      assert.equals("aX\r\nb\r\n", raw)
+
+      local save_ev = find(events, "doc.save")
+      assert.is_not_nil(save_ev)
+      assert.equals(sha256.hex(raw), save_ev.data.sha256)
+
+      local change_ev = find(events, "doc.change")
+      assert.is_not_nil(change_ev)
+      local delta_text = change_ev.data.deltas[1].text
+      assert.equals("\r\n", delta_text:sub(-2))
+    end)
+
+    it("noeol file (no trailing newline): doc.open hash matches the untouched eol-less bytes; doc.save hash matches the actually-written bytes", function()
+      local workspace = scratch.workspace()
+      local path = workspace .. "/noeol.txt"
+      scratch.write_file(path, "abc") -- no trailing newline
+
+      local events, emit = new_emit()
+      scratch.handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+
+      local buf = scratch.edit(path)
+      assert.is_false(vim.bo[buf].endofline)
+
+      -- Before any write: doc.open must match the file's actual (still
+      -- untouched, eol-less) on-disk bytes -- this is the case that matters
+      -- if the file is submitted without ever being modified/saved.
+      local open_ev = find(events, "doc.open")
+      assert.is_not_nil(open_ev)
+      assert.equals(sha256.hex("abc"), open_ev.data.sha256)
+      assert.equals("abc", open_ev.data.content)
+
+      -- Modify the last (only) line and save: Neovim's default 'fixeol'
+      -- silently adds a trailing EOL on write even though 'endofline'
+      -- itself stays reported as false -- doc.save must match what was
+      -- ACTUALLY written, not the stale 'endofline' reading.
+      vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "abcXYZ" })
+      vim.cmd("write")
+
+      local raw = read_raw(path)
+      assert.equals("abcXYZ\n", raw) -- fixeol adds the trailing EOL back
+
+      local save_ev = find(events, "doc.save")
+      assert.is_not_nil(save_ev)
+      assert.equals(sha256.hex(raw), save_ev.data.sha256)
+    end)
+
+    it("empty 0-byte file: doc.open and doc.save hashes both match empty on-disk content", function()
+      local workspace = scratch.workspace()
+      local path = workspace .. "/empty.txt"
+      scratch.write_file(path, "")
+
+      local events, emit = new_emit()
+      scratch.handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+
+      scratch.edit(path)
+      assert.equals("", read_raw(path))
+
+      local open_ev = find(events, "doc.open")
+      assert.is_not_nil(open_ev)
+      assert.equals(sha256.hex(""), open_ev.data.sha256)
+      assert.equals("", open_ev.data.content)
+
+      vim.cmd("write")
+      local raw = read_raw(path)
+      assert.equals("", raw)
+
+      local save_ev = find(events, "doc.save")
+      assert.is_not_nil(save_ev)
+      assert.equals(sha256.hex(raw), save_ev.data.sha256)
+    end)
   end)
 
   it("pins the trailing-newline model: doc.open content + doc.change deltas reconstruct to doc.save's hash (analyzer offsetAt/splice)", function()

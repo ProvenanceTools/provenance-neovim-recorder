@@ -125,6 +125,9 @@ function M.open(opts)
       pcall(writer.flush)
     end
   end))
+  -- A pending periodic flush must never keep Neovim from exiting (same
+  -- rationale as heartbeat.lua's timer:unref()).
+  timer:unref()
 
   --- Idempotent teardown: stop the timer, flush anything still buffered,
   --- then mark disposed so further appends error.
