@@ -24,10 +24,13 @@ local band, bor = bit.band, bit.bor
 
 local core_session_keys = require("provenance.core.session_keys")
 local core_clock = require("provenance.core.clock")
+local core_checkpoint = require("provenance.core.checkpoint")
 local recorder_context = require("provenance.recorder.session.recorder_context")
 local session_host = require("provenance.recorder.session.session_host")
 local session_writer = require("provenance.recorder.io.session_writer")
 local meta_writer = require("provenance.recorder.io.meta_writer")
+local checkpoint_cadence = require("provenance.recorder.session.checkpoint_cadence")
+local checkpoint_scheduler = require("provenance.recorder.session.checkpoint_scheduler")
 local doc_wiring = require("provenance.recorder.wiring.doc_wiring")
 local heartbeat = require("provenance.recorder.events.heartbeat")
 local seal_cmd = require("provenance.recorder.commands.seal")
@@ -84,6 +87,9 @@ end
 ---   clock: table                   -- injectable {now(), wall()} (core.clock)
 ---   prev_session_id: string|nil    -- previous session id for chained sessions
 ---   env: table|nil                 -- recorder_context env overrides (uuid, hostname, ...)
+---   checkpoint_interval: number|nil -- entries between signed checkpoints (default 100)
+---   is_degraded: function|nil      -- () -> boolean; true suppresses checkpoint scheduling
+---     (a seam for a later degraded-mode task; defaults to always false)
 --- }
 --- @return table session {
 ---   session_id, slog_path, meta_path, public_key_hex,
@@ -95,6 +101,8 @@ function M.start(opts)
   local provenance_dir = opts.provenance_dir
   local manifest = opts.manifest
   local clock = opts.clock
+  local checkpoint_interval = opts.checkpoint_interval or 100
+  local is_degraded = opts.is_degraded or function() return false end
 
   -- 0. Ensure provenance_dir exists before anything below writes into it
   -- (meta_writer.create in step 6 atomic-writes immediately and does not
@@ -133,19 +141,50 @@ function M.start(opts)
   -- holder of the activation-gate secret can recover it.
   local encrypted_privkey = core_session_keys.encrypt_privkey(keypair.private_key, manifest.sig)
 
-  -- 6. Persist `.slog.meta` immediately (pubkey + encrypted privkey).
-  meta_writer.create({
+  -- 6. Persist `.slog.meta` immediately (pubkey + encrypted privkey). The
+  -- handle is captured (not discarded) so checkpoint persistence below can
+  -- append signed checkpoints to the same meta file.
+  local mw = meta_writer.create({
     meta_path = meta_path,
     session_id = context.session_id,
     session_pubkey_hex = keypair.public_key_hex,
     encrypted_privkey = encrypted_privkey,
   })
 
-  -- 7. The single chaining chokepoint; on_entry feeds the writer.
+  -- 6b. Checkpoint cadence + async scheduler (Plan 8). Every
+  -- `checkpoint_interval`-th appended entry, a signed seq->hash checkpoint
+  -- is scheduled: signing/persisting is deferred off the on_lines hot path
+  -- (checkpoint_scheduler defers via vim.schedule) and drained synchronously
+  -- at stop()/seal() so nothing pending is lost.
+  local cadence = checkpoint_cadence.new(checkpoint_interval)
+  local scheduler = checkpoint_scheduler.new({
+    sign = function(seq, hash)
+      return core_checkpoint.sign(seq, hash, keypair.private_key)
+    end,
+    persist = function(cp)
+      mw.append_checkpoint(cp)
+    end,
+    on_error = function(err)
+      -- Checkpoint failures must never crash recording; debug-log only.
+      if vim.g.provenance_debug then
+        vim.notify("Provenance: checkpoint error: " .. tostring(err), vim.log.levels.DEBUG)
+      end
+    end,
+  })
+
+  -- 7. The single chaining chokepoint; on_entry feeds the writer, then (if
+  -- not degraded) checks the checkpoint cadence and schedules a checkpoint.
+  -- writer.append runs FIRST so the entry is persisted to the .slog before
+  -- any checkpoint bookkeeping happens.
   local host = session_host.new({
     session_id = context.session_id,
     clock = clock,
-    on_entry = writer.append,
+    on_entry = function(entry)
+      writer.append(entry)
+      if not is_degraded() and cadence.on_entry_appended() then
+        scheduler.schedule(entry.seq, entry.hash)
+      end
+    end,
   })
 
   -- 8. session.start MUST be the first line of the .slog (seq 0), so this
@@ -186,6 +225,9 @@ function M.start(opts)
   --- @return table  seal_bundle's result ({kind="ok",...} | {kind="no_sessions"} | {kind="write_error",...})
   function session.seal(seal_opts)
     seal_opts = seal_opts or {}
+    -- Drain any pending checkpoint first so the sealed meta includes it,
+    -- even if seal() is called without a preceding stop().
+    scheduler.drain()
     writer.flush()
     return seal_cmd.seal_bundle({
       workspace = workspace,
@@ -212,6 +254,10 @@ function M.start(opts)
     stopped = true
 
     host.emit("session.end", { reason = reason or "deactivate" })
+
+    -- Drain any pending checkpoint (including one scheduled by session.end
+    -- itself) so it is signed+persisted to the meta before teardown.
+    scheduler.drain()
 
     hb.dispose()
     wiring.dispose()
