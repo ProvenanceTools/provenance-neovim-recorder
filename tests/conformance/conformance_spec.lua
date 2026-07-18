@@ -2,6 +2,7 @@ local sha256 = require("provenance.core.sha256")
 local hc = require("provenance.core.hash_chain")
 local envelope = require("provenance.core.envelope")
 local ed25519 = require("provenance.core.ed25519")
+local manifest = require("provenance.core.manifest")
 
 -- NOTE: `<sfile>` (per the task brief) does not resolve to this file under
 -- plenary's busted runner: specs are loaded via `loadfile()`, not `:source`,
@@ -51,5 +52,32 @@ describe("conformance: ed25519 vector (ed25519.json == @noble/ed25519)", functio
 
   it("signature verifies", function()
     assert.is_true(ed25519.verify(ed25519.from_hex(fx.sig_hex), fx.msg_utf8, ed25519.from_hex(fx.pub_hex)))
+  end)
+end)
+
+describe("conformance: manifest vector (manifest.json — activation gate)", function()
+  local fx = load_fixture("manifest.json")
+
+  it("parses and verifies the untouched fixture", function()
+    local parsed = manifest.parse(vim.json.encode(fx.manifest))
+    assert.is_true(parsed.ok)
+    assert.is_true(manifest.verify(parsed.value, fx.course_pubkey_hex))
+  end)
+
+  it("verifies false if any field is mutated", function()
+    for _, field in ipairs({ "assignment_id", "semester", "issued_at", "sig" }) do
+      local decoded = vim.json.decode(vim.json.encode(fx.manifest))
+      decoded[field] = decoded[field]:sub(1, -2) .. (decoded[field]:sub(-1) == "a" and "b" or "a")
+      local parsed = manifest.parse(vim.json.encode(decoded))
+      if parsed.ok then
+        assert.is_false(manifest.verify(parsed.value, fx.course_pubkey_hex), field .. " mutation should break verification")
+      end
+    end
+
+    local decoded = vim.json.decode(vim.json.encode(fx.manifest))
+    decoded.files_under_review = { "src/tampered.py" }
+    local parsed = manifest.parse(vim.json.encode(decoded))
+    assert.is_true(parsed.ok)
+    assert.is_false(manifest.verify(parsed.value, fx.course_pubkey_hex))
   end)
 end)
