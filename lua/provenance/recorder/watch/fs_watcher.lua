@@ -10,7 +10,7 @@
 ---
 --- Faithful port of the monorepo's wiring/fs-watcher.ts. See its top-of-file
 --- design-notes comment for the modify/create/delete rules; this module
---- mirrors them (with one deliberate divergence — see DELETE below):
+--- mirrors them:
 ---   - MODIFY: skip if within `tolerance_ms` of the file's last editor save
 ---     (`recent_saves[rel]`, populated by Path 1 / the coordinator) — that
 ---     change is already captured via `doc.save`. Otherwise
@@ -20,12 +20,13 @@
 ---     `files_under_review`) and with no existing registry entry — emit
 ---     `old_hash=""` + seed the registry so subsequent edits chain from
 ---     reality.
----   - DELETE: emit `new_hash=""` (no content fields) using the registry's
----     prior hash, then drop the registry entry so a subsequent re-create
----     starts clean. DIVERGES from fs-watcher.ts here: the TS version still
----     emits (with `old_hash=""`) when the registry has no entry for the
----     deleted path; this port SKIPS instead (nothing meaningful to report
----     — the path brief for this port calls this out explicitly).
+---   - DELETE: emit `new_hash=""` (no content fields) for ANY watched file
+---     that disappeared, whether or not it was ever known to us — `old_hash`
+---     is the registry's prior hash if we have one, `""` otherwise (matches
+---     fs-watcher.ts's `onDidDelete`, which still reports a never-opened
+---     file's deletion so the analyzer's timeline doesn't silently drop the
+---     event). Then drop the registry entry (a harmless no-op if there
+---     wasn't one) so a subsequent re-create starts clean.
 ---
 --- TESTABILITY-FIRST SPLIT (real fs watchers are timing-flaky):
 ---   (A) `handle.handle_path_event(rel, abs_path)` — a deterministic
@@ -68,6 +69,10 @@ local sha256 = require("provenance.core.sha256")
 
 local M = {}
 
+-- Single module-level libuv handle, reused everywhere the module needs
+-- vim.uv (or the legacy vim.loop alias on older Neovim builds).
+local uv = vim.uv or vim.loop
+
 local DEFAULT_TOLERANCE_MS = 250
 local DEFAULT_POLL_INTERVAL_MS = 1000
 
@@ -77,7 +82,6 @@ local DEFAULT_POLL_INTERVAL_MS = 1000
 --- @param path string
 --- @return string|nil  file bytes, or nil if the file can't be read
 local function read_file_bytes(path)
-  local uv = vim.uv or vim.loop
   local fd = uv.fs_open(path, "r", 438) -- 438 = 0o666
   if not fd then
     return nil
@@ -101,7 +105,7 @@ local function read_file_bytes(path)
 end
 
 local function default_get_now()
-  return (vim.uv or vim.loop).hrtime() / 1e6
+  return uv.hrtime() / 1e6
 end
 
 --- utf16-style diff_size for a "whole file appeared/disappeared" operation
@@ -195,20 +199,17 @@ function M.start(opts)
       return
     end
 
-    local uv = vim.uv or vim.loop
     local stat = uv.fs_stat(abs_path)
     local exists = stat ~= nil and stat.type == "file"
     local ec = registry.get(rel)
 
     if not exists then
-      -- DELETE. If never known to us, nothing to compare against — skip
-      -- (deliberate divergence from fs-watcher.ts; see module docstring).
-      if ec == nil then
-        return
-      end
-
-      local old_hash = ec.hash()
-      local diff_size = whole_file_diff_size(ec.get_content())
+      -- DELETE. Emit for ANY watched file that disappeared, whether or not
+      -- we ever knew its content: old_hash is the prior hash if `ec` is
+      -- known, "" otherwise (matches fs-watcher.ts's onDidDelete, which
+      -- reports even a never-opened file's deletion).
+      local old_hash = ec and ec.hash() or ""
+      local diff_size = ec and whole_file_diff_size(ec.get_content()) or 0
 
       local data = {
         path = rel,
@@ -225,7 +226,8 @@ function M.start(opts)
       emit("fs.external_change", data)
 
       -- Drop AFTER emitting: a subsequent re-create starts from a clean
-      -- baseline.
+      -- baseline. No-op (registry.delete is idempotent) if there was no
+      -- entry to begin with.
       registry.delete(rel)
       return
     end
@@ -298,8 +300,6 @@ function M.start(opts)
   -------------------------------------------------------------------------
   -- (B) Thin vim.uv watcher seam — one fs_poll per watched file.
   -------------------------------------------------------------------------
-
-  local uv = vim.uv or vim.loop
 
   for _, rel in ipairs(files_under_review) do
     local abs_path = workspace .. "/" .. rel

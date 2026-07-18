@@ -241,8 +241,8 @@ describe("fs_watcher", function()
       assert.is_nil(reg.get("gone.py"))
     end)
 
-    it("a never-known path disappearing (no registry entry): skip, no emit", function()
-      local reg = registry_mod.new({})
+    it("a never-known watched path disappearing (no registry entry): emits ONE operation=delete with old_hash empty", function()
+      local reg = registry_mod.new({ "never-existed.py" })
       local abs_path = dir .. "/never-existed.py"
       -- never written, so fs_stat already reports non-existence
 
@@ -258,7 +258,20 @@ describe("fs_watcher", function()
       assert.has_no.errors(function()
         watch.handle_path_event("never-existed.py", abs_path)
       end)
-      assert.equals(0, #events)
+
+      assert.equals(1, #events)
+      local ev = events[1]
+      assert.equals("fs.external_change", ev.kind)
+      assert.equals("delete", ev.data.operation)
+      assert.equals("never-existed.py", ev.data.path)
+      assert.equals("", ev.data.old_hash)
+      assert.equals("", ev.data.new_hash)
+      assert.is_nil(ev.data.new_content)
+      assert.is_nil(ev.data.new_content_size)
+      assert.is_nil(ev.data.new_content_head)
+      assert.is_nil(ev.data.new_content_tail)
+
+      assert.is_nil(reg.get("never-existed.py"))
     end)
   end)
 
