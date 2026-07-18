@@ -34,6 +34,8 @@ local checkpoint_scheduler = require("provenance.recorder.session.checkpoint_sch
 local doc_wiring = require("provenance.recorder.wiring.doc_wiring")
 local heartbeat = require("provenance.recorder.events.heartbeat")
 local seal_cmd = require("provenance.recorder.commands.seal")
+local chain_recovery = require("provenance.recorder.startup.chain_recovery")
+local uv_recovery_deps = require("provenance.recorder.startup.uv_recovery_deps")
 
 local M = {}
 
@@ -85,11 +87,19 @@ end
 ---   provenance_dir: string        -- <workspace>/.provenance (must exist)
 ---   manifest: table                -- {assignment_id, semester, sig, files_under_review}
 ---   clock: table                   -- injectable {now(), wall()} (core.clock)
----   prev_session_id: string|nil    -- previous session id for chained sessions
+---   prev_session_id: string|nil    -- explicit override; wins over recovery's decision when set
 ---   env: table|nil                 -- recorder_context env overrides (uuid, hostname, ...)
 ---   checkpoint_interval: number|nil -- entries between signed checkpoints (default 100)
 ---   is_degraded: function|nil      -- () -> boolean; true suppresses checkpoint scheduling
 ---     (a seam for a later degraded-mode task; defaults to always false)
+---   recover: function|nil          -- () -> RecoveryDecision; full injection seam for tests.
+---     Defaults to running chain_recovery.recover_previous_session over the real
+---     vim.uv deps (uv_recovery_deps.new(provenance_dir)). Runs BEFORE this
+---     session's own artifacts (.slog/.slog.meta) exist, so it only ever sees
+---     a PRIOR session. A "previous_session_dangling" decision links
+---     prev_session_id (unless overridden above); "previous_session_corrupt"
+---     additionally emits recorder.recovered_from_corruption as the entry
+---     right after session.start. clean_start/complete do neither.
 --- }
 --- @return table session {
 ---   session_id, slog_path, meta_path, public_key_hex,
@@ -115,6 +125,31 @@ function M.start(opts)
     error(mkdir_err)
   end
 
+  -- 0b. Startup chain recovery (Plan 8, Task 4/5): run BEFORE any of this
+  -- session's own artifacts exist, so recovery only ever sees a PRIOR
+  -- session's .slog(s) — never the one about to be created below. `recover`
+  -- is a full-injection seam for tests; production wires the real vim.uv
+  -- deps layer.
+  local recover = opts.recover
+  local recovery
+  if recover then
+    recovery = recover()
+  else
+    local deps = uv_recovery_deps.new(provenance_dir)
+    recovery = chain_recovery.recover_previous_session(deps)
+  end
+
+  -- Derive prev_session_id from the recovery decision: an explicit
+  -- opts.prev_session_id override always wins (backward compat for callers/
+  -- tests that already pass it); otherwise a DANGLING prior session is
+  -- linked, and clean_start/complete/corrupt leave it nil (no link — a
+  -- complete prior session is reported by recovery but is deliberately not
+  -- linked here, per chain_recovery.lua's own docstring).
+  local prev_session_id = opts.prev_session_id
+  if prev_session_id == nil and recovery.kind == "previous_session_dangling" then
+    prev_session_id = recovery.prev_session_id
+  end
+
   -- 1. Fresh per-session ed25519 keypair (recorder PRD §4.6).
   local keypair = core_session_keys.generate()
 
@@ -123,7 +158,7 @@ function M.start(opts)
   -- from the filename uuid generated below (two-uuid rule).
   local context = recorder_context.build_recorder_context({
     manifest = manifest,
-    prev_session_id = opts.prev_session_id,
+    prev_session_id = prev_session_id,
     session_pubkey_hex = keypair.public_key_hex,
     env = opts.env,
   })
@@ -190,6 +225,16 @@ function M.start(opts)
   -- 8. session.start MUST be the first line of the .slog (seq 0), so this
   -- emit happens before any other wiring is attached.
   host.emit("session.start", context)
+
+  -- 8b. If recovery quarantined a corrupt prior .slog, record that fact as
+  -- the SECOND entry (seq 1), chained right after session.start — before
+  -- any other wiring is attached, mirroring session.start's own placement
+  -- rule. clean_start/complete/dangling emit nothing here (dangling only
+  -- affects prev_session_id above; a complete prior session is reported but
+  -- not linked or announced).
+  if recovery.kind == "previous_session_corrupt" then
+    host.emit("recorder.recovered_from_corruption", { quarantined_path = recovery.quarantined_path })
+  end
 
   -- 9. Doc-wiring: attaches buffer/autocmd listeners and (as part of
   -- attach()'s catch-up pass) emits doc.open for already-open recordable
