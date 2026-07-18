@@ -55,8 +55,8 @@ same golden conformance vectors that pin the format.
 ## What it records
 
 - **Document changes.** File open, save, close, and every edit, recorded from Neovim's
-  `nvim_buf_attach` `on_lines` firehose with per-event handler work kept minimal and the
-  writer buffered.
+  `nvim_buf_attach` `on_bytes` firehose as precise character-range deltas carrying exactly
+  the inserted text, with per-event handler work kept minimal and the writer buffered.
 - **Pastes.** Detected by combining three signals — bracketed paste / `vim.paste()`, the
   resulting `on_lines` edit burst, and clipboard register content (`+`/`*`). Neovim has no
   single paste-command surface, so no one signal is sufficient; the three are reconciled
@@ -95,20 +95,69 @@ same golden conformance vectors that pin the format.
 
 ## Install
 
-Install with any Neovim plugin manager, from the release your course points you at. With
-[lazy.nvim](https://github.com/folke/lazy.nvim):
+Install with any Neovim plugin manager, **pinned to the release tag your course points you
+at** (examples below use `v0.1.1`). Pinning a tag is not optional: the tag ships the master
+public key, and its source tree-hash is the `extension_hash` the analyzer allowlist
+recognizes (see [below](#extension_hash--the-integrity-anchor)). Installing an unpinned
+`HEAD`, a branch, or a fork produces a hash the analyzer does not recognize.
+
+<details open>
+<summary><a href="https://github.com/folke/lazy.nvim">lazy.nvim</a></summary>
 
 ```lua
+-- lua/plugins/provenance.lua  (or inside your lazy spec table)
 {
   "ProvenanceTools/provenance-neovim-recorder",
-  -- pin the tag your course specifies; the tag ships the master public key,
-  -- and its source tree-hash is what the analyzer allowlist recognizes.
-  version = "v0.1.0",
+  version = "v0.1.1",
 }
 ```
+</details>
 
+<details>
+<summary><a href="https://github.com/wbthomason/packer.nvim">packer.nvim</a></summary>
+
+```lua
+use({
+  "ProvenanceTools/provenance-neovim-recorder",
+  tag = "v0.1.1",
+})
+```
+</details>
+
+<details>
+<summary><a href="https://github.com/junegunn/vim-plug">vim-plug</a></summary>
+
+```vim
+" in your init.vim (or init.lua inside a vim.cmd block)
+Plug 'ProvenanceTools/provenance-neovim-recorder', { 'tag': 'v0.1.1' }
+```
+</details>
+
+<details>
+<summary><a href="https://github.com/echasnovski/mini.deps">mini.deps</a></summary>
+
+```lua
+require("mini.deps").add({
+  source = "ProvenanceTools/provenance-neovim-recorder",
+  checkout = "v0.1.1",
+})
+```
+</details>
+
+<details>
+<summary>Built-in packages (no plugin manager)</summary>
+
+```sh
+git clone --branch v0.1.1 --depth 1 \
+  https://github.com/ProvenanceTools/provenance-neovim-recorder \
+  ~/.config/nvim/pack/provenance/start/provenance-neovim-recorder
+```
+</details>
+
+No native dependencies, no build step — every manager just clones the tagged git checkout.
 The plugin does nothing until you open a workspace containing a course-signed
-`.provenance-manifest` — so it is safe to have installed all the time.
+`.provenance-manifest`, so it is safe to have installed all the time. When you finish, run
+`:ProvenanceSeal` to write the signed submission bundle.
 
 > **Why a tag matters.** Neovim plugins are git checkouts, not signed artifacts. The
 > recorder's `extension_hash` is a deterministic hash of its own installed Lua source at
