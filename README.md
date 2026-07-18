@@ -116,6 +116,72 @@ The plugin does nothing until you open a workspace containing a course-signed
 > commit or a fork with modified source will produce a hash the analyzer does not recognize,
 > and every submission from it gets flagged.
 
+## Distribution & course key model
+
+A course does not run a canonical release — it publishes its own. Distribution works like this:
+
+- The course maintains a **fork or tagged release** of this repo that commits its own public key
+  as a Lua constant in `lua/provenance/course_public_key.lua`. This is the **public key** — not a
+  secret, committed as part of the source code. (Neovim has no build step, so there is no
+  separate build-time embedding.)
+- Students install the plugin from that course-specific release (e.g.,
+  `version = "cs101/v1.0"`), and it records events only for a workspace that contains a
+  `.provenance-manifest` signed with that same course public key.
+- Because the course public key is part of the plugin's source tree, and the `extension_hash`
+  is a hash of that source tree (§ `extension_hash` below), each course's release produces a
+  **distinct `extension_hash`** — a different course key → a different tree hash → a different
+  allowlist entry in the analyzer. This binds each course to its own key with no configuration.
+
+The sealed bundle's `manifest.json` and `manifest.sig` are **never modified after seal**. The
+stored bundle must remain signature and chain verifiable.
+
+## `extension_hash` — the integrity anchor
+
+Neovim plugins are not signed build artifacts (no VSIX or `.zip` to sign); a plugin manager
+simply clones a git repo. So the recorder produces an **`extension_hash`** — a deterministic
+SHA-256 tree-hash of its own installed Lua source — at session start, and emits it as the
+`extension_hash` field in the sealed bundle.
+
+### How it's computed
+
+The algorithm is:
+
+1. Recursively walk the installed `lua/` directory, collecting regular files (not symlinks).
+2. Compute each file's path *relative* to `lua/` (e.g., `provenance/core/sha256.lua`).
+3. Sort relative paths in **deterministic codepoint order** (using Lua's plain byte-order sort,
+   which on UTF-8 is equivalent to Unicode codepoint order — this is fully deterministic and
+   locale-independent, unlike locale-aware collation).
+4. For each file in sorted order, concatenate:
+   ```
+   <relative-path bytes> ++ "\0" ++ <file raw bytes>
+   ```
+5. Compute SHA-256 of the concatenated result; return the 64-character lowercase hex digest.
+6. An empty tree hashes to `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
+   (the SHA-256 of an empty byte string).
+
+### The analyzer allowlist
+
+The Provenance analyzer's allowlist (`known-good-extension-hashes.json`) pins the known-good
+tree hash for each released tag of this recorder. When analyzing a submission:
+
+- The allowlist recognizes this hash as coming from an approved release.
+- If the hash does not match, the `extension_hash_mismatch` heuristic flags it — but this is
+  only a *heuristic*, not a validation gate. A bundle validates on its own merits (hash chain
+  intact, manifest signature verifies); the allowlist only clears the heuristic flag.
+
+### Computing this release's hash
+
+To register a new release (e.g., for the course to include in its fork), compute the tree hash
+from a **clean checkout** of the tagged release:
+
+```lua
+:lua print(require('provenance.recorder.commands.extension_hash').compute_installed())
+```
+
+This prints the 64-character lowercase hex tree hash of the installed `lua/` source. Because
+the sort is deterministic codepoint order, this hash is reproducible on any machine, any OS,
+any locale.
+
 ## Developing
 
 Lua, tested headless with Neovim.

@@ -292,3 +292,7 @@ Verbatim `ValidationReport` (`bash scripts/e2e/run_full_e2e.sh`,
   "overall": "pass"
 }
 ```
+
+## Plan 9 — full integration
+
+- [ ] **End-to-end installation and manual seal:** Install the plugin in a real `nvim` session via a plugin manager (lazy.nvim or packer.nvim) from a course-specific release tag. Open a workspace containing a valid, course-signed `.provenance-manifest` (one that verifies against the committed course public key). Confirm the status indicator shows "Provenance: recording". Do some work: type in a file, paste some text, save. Run `:ProvenanceSeal` via the command-line. Confirm that a `.provenance.zip` bundle file is produced in the workspace and the seal command outputs its path. Verify that the `.zip` contains a `manifest.json`, `manifest.sig`, and `.provenance/` directory with `.slog` and `.slog.meta` files.
