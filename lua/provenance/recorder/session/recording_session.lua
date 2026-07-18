@@ -43,6 +43,7 @@ local focus_wiring = require("provenance.recorder.wiring.focus_wiring")
 local terminal_wiring = require("provenance.recorder.wiring.terminal_wiring")
 local git_wiring = require("provenance.recorder.wiring.git_wiring")
 local snapshot_wiring = require("provenance.recorder.wiring.snapshot_wiring")
+local ext_activation_wiring = require("provenance.recorder.wiring.ext_activation_wiring")
 local clock_skew_watcher = require("provenance.recorder.events.clock_skew_watcher")
 local explanation_tags = require("provenance.recorder.events.explanation_tags")
 local seal_cmd = require("provenance.recorder.commands.seal")
@@ -149,7 +150,7 @@ function M.start(opts)
   -- Forward-declared signal sub-handles so session.stop()'s closure can
   -- dispose them (they are only assigned below when enable_signals is true;
   -- nil-guarded in stop() so the disabled path is a no-op).
-  local coordinator, paste, term, git, snap, skew, sel, focus
+  local coordinator, paste, term, git, snap, skew, sel, focus, extact
 
   -- Forward-declared: the disk-full handler's on_degraded closure (built
   -- below, before the writer/host exist) must call host.emit(...), but
@@ -378,6 +379,9 @@ function M.start(opts)
     term = terminal_wiring.start({ emit = host.emit })
     git = git_wiring.start({ workspace = workspace, emit = host.emit, tagger = tagger })
     snap = snapshot_wiring.start({ emit = host.emit })
+    -- ext.activate: polls for plugins that load AFTER start (baseline covered
+    -- by snap's immediate ext.snapshot). Mirrors VS Code's activation poller.
+    extact = ext_activation_wiring.start({ emit = host.emit })
     skew = clock_skew_watcher.start({ emit = host.emit })
   end
 
@@ -419,6 +423,7 @@ function M.start(opts)
       terminal = term,
       git = git,
       snapshot = snap,
+      ext_activation = extact,
       clock_skew = skew,
       tagger = tagger,
     }
@@ -484,6 +489,7 @@ function M.start(opts)
     if focus then focus.dispose() end
     if coordinator then coordinator.dispose() end
     if skew then skew.dispose() end
+    if extact then extact.dispose() end
     if snap then snap.dispose() end
     if git then git.dispose() end
     if term then term.dispose() end

@@ -8,45 +8,11 @@
 --- instead of relying on real wall-clock timer firing (CLAUDE.md:
 --- "Determinism. Inject clocks... no real timing in assertions").
 local snapshot_payloads = require("provenance.recorder.events.snapshot_payloads")
+local plugin_list = require("provenance.recorder.wiring.plugin_list")
 
 local M = {}
 
 local DEFAULT_INTERVAL_MS = 300000 -- 5 minutes
-
---- Best-effort default plugin enumeration: every entry on the runtimepath,
---- deduped by basename-as-id. Most Neovim plugins expose no queryable
---- version, so version is always "" here; being on the runtimepath is taken
---- to mean active, so enabled is always true. Exact plugin-manager
---- integration (querying a manager's own plugin list/version) is out of
---- scope — this is a coarse, degraded-by-design signal, wrapped in pcall by
---- the caller so a failure here degrades to an empty list rather than
---- crashing the snapshot.
-local function default_list_plugins()
-  local plugins = {}
-  local seen = {}
-  for _, path in ipairs(vim.api.nvim_list_runtime_paths()) do
-    local id = vim.fs.basename(path)
-    if id and id ~= "" and not seen[id] then
-      seen[id] = true
-      table.insert(plugins, { id = id, version = "", enabled = true })
-    end
-  end
-  return plugins
-end
-
---- list_plugins() -> list of {id, version, enabled}
----
---- Wraps default_list_plugins in pcall so any failure enumerating the
---- runtimepath (missing API, unexpected environment) degrades to an empty
---- list — a missing/broken plugin-manager integration is a degraded signal,
---- never a crash (CLAUDE.md).
-local function safe_default_list_plugins()
-  local ok, result = pcall(default_list_plugins)
-  if not ok then
-    return {}
-  end
-  return result
-end
 
 --- start(opts) -> handle
 --- @param opts table {
@@ -61,7 +27,7 @@ function M.start(opts)
   opts = opts or {}
 
   local emit = opts.emit
-  local list_plugins = opts.list_plugins or safe_default_list_plugins
+  local list_plugins = opts.list_plugins or plugin_list.list
   local interval_ms = opts.interval_ms or DEFAULT_INTERVAL_MS
 
   local disposed = false
