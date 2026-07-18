@@ -6,6 +6,7 @@ local manifest = require("provenance.core.manifest")
 local bundle = require("provenance.core.bundle")
 local hkdf = require("provenance.core.hkdf")
 local session_keys = require("provenance.core.session_keys")
+local checkpoint = require("provenance.core.checkpoint")
 
 local function to_hex(s)
   return (s:gsub(".", function(c) return string.format("%02x", string.byte(c)) end))
@@ -146,5 +147,24 @@ describe("conformance: session-key.json (HKDF + XChaCha20-Poly1305 == @noble/cip
     local enc = session_keys.encrypt_privkey(priv, fx.manifest_sig)
     assert.equals(priv, session_keys.decrypt_privkey(enc, fx.manifest_sig))
     assert.is_nil(session_keys.decrypt_privkey(enc, string.rep("00", 64)))
+  end)
+end)
+
+describe("conformance: checkpoint.json (signed seq->hash checkpoint)", function()
+  local fx = load_fixture("checkpoint.json")
+
+  it("verifies the untouched fixture checkpoint", function()
+    assert.is_true(checkpoint.verify(
+      { seq = fx.seq, hash = fx.hash, sig = fx.sig }, fx.session_pubkey_hex))
+  end)
+
+  it("fails verification if the hash is tampered", function()
+    assert.is_false(checkpoint.verify(
+      { seq = fx.seq, hash = ("cd"):rep(32), sig = fx.sig }, fx.session_pubkey_hex))
+  end)
+
+  it("fails verification if the seq is tampered", function()
+    assert.is_false(checkpoint.verify(
+      { seq = fx.seq + 1, hash = fx.hash, sig = fx.sig }, fx.session_pubkey_hex))
   end)
 end)
