@@ -1,5 +1,5 @@
 {
-  "course_pubkey_hex": "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618",
+  "course_pubkey_hex": "b5bca59ffa918c879d01050dab428e60c630f9d2051508af3d29c60cce985e25",
   "manifest": {
     "assignment_id": "hw3",
     "semester": "fa25",
@@ -8,6 +8,6 @@
       "src/main.py",
       "src/util.py"
     ],
-    "sig": "c8e897fd64389b0bb86cc804181312a05749e83a4d977088655a8ff6d2d7cb0ff0cbe98c9c04b7c833daa8d22fbc911f0cdaf2a5fcc907f19572410ded9ffa0e"
+    "sig": "3f17ecf05ffe407c9e2dda454a8811049712894c62a2db8ba4c52bff257fd019fc784aa2f536d1766bf167e9cc5baa5fb23f15ec874e60f6bf6a00c8a4a87b08"
   }
 }

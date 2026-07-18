@@ -10,9 +10,13 @@
 --- the analyzer allowlists. Rotating the key is therefore a normal new tagged
 --- release plus a new allowlist entry — see docs/design.md §6–§7.
 ---
---- Tests never assume this equals any fixture key: the conformance manifest
---- fixture carries its own dev keypair and is verified by passing that key
---- explicitly (see tests/recorder/activation_loader_spec.lua).
+--- The conformance manifest fixture (tests/conformance/fixtures/manifest.json)
+--- is signed with THIS master key and carries its matching public half in its
+--- own `course_pubkey_hex`, so it both activates against the committed default
+--- (the e2e gate) and verifies when that embedded key is passed explicitly
+--- (the unit specs). Rotating the master key therefore requires re-signing
+--- that fixture with the new offline private key (see tools/sign-manifest.ts
+--- and docs/manual-verification.md).
 local M = {}
 
 M.COURSE_PUBLIC_KEY_HEX = "b5bca59ffa918c879d01050dab428e60c630f9d2051508af3d29c60cce985e25"
