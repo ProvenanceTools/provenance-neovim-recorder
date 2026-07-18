@@ -224,3 +224,16 @@ that matters most: **this repo implements the Provenance log format, it does not
 The format is pinned by conformance vectors, and loosening an assertion or editing a vector
 to make a test pass is not a coding decision — if the format appears to need a change, stop
 and ask.
+
+## Development / Testing
+
+Requires Neovim ≥ 0.10 (developed against 0.12.1) and `plenary.nvim` on the
+runtimepath. Run the suite headless:
+
+    make test
+
+`make test` runs `plenary.nvim`'s busted-style runner over `tests/`. The
+conformance suite (`tests/conformance/`) proves byte-for-byte format parity
+with the Provenance monorepo's `log-core`; a red conformance test means the
+implementation drifted — fix the code, never the vectors. Regenerate vectors
+with `PROVENANCE_REPO=/path/to/provenance make vectors`.
