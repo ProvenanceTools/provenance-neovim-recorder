@@ -118,7 +118,7 @@ function M.seal_bundle(opts)
   local files_under_review = opts.files_under_review or {}
   local session_privkey = opts.session_privkey
   local compute_extension_hash = opts.compute_extension_hash
-    or require("provenance.recorder.commands.extension_hash").compute
+    or require("provenance.recorder.commands.extension_hash").compute_installed
   local now = opts.now
   local output_dir = opts.output_dir or workspace
 
