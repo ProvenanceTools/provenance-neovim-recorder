@@ -1,4 +1,7 @@
-# Provenance Recorder for Neovim
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="brand/exports/lockup-dark.png" />
+  <img alt="Provenance for Neovim" src="brand/exports/lockup-light.png" width="440" />
+</picture>
 
 **Provenance Recorder for Neovim** records a tamper-evident log of how a student's code came
 into existence, and seals it into a signed submission bundle.
