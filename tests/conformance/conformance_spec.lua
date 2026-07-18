@@ -4,6 +4,15 @@ local envelope = require("provenance.core.envelope")
 local ed25519 = require("provenance.core.ed25519")
 local manifest = require("provenance.core.manifest")
 local bundle = require("provenance.core.bundle")
+local hkdf = require("provenance.core.hkdf")
+local session_keys = require("provenance.core.session_keys")
+
+local function to_hex(s)
+  return (s:gsub(".", function(c) return string.format("%02x", string.byte(c)) end))
+end
+local function from_hex(h)
+  return (h:gsub("..", function(cc) return string.char(tonumber(cc, 16)) end))
+end
 
 -- NOTE: `<sfile>` (per the task brief) does not resolve to this file under
 -- plenary's busted runner: specs are loaded via `loadfile()`, not `:source`,
@@ -115,5 +124,27 @@ describe("conformance: golden-bundle.json (real sealed 1.0 manifest validates)",
   it("build() on the 1.0 manifest omits submission_files from the canonical JSON", function()
     local built = bundle.build(fx.manifest)
     assert.is_nil(bundle.to_canonical(built):find("submission_files", 1, true))
+  end)
+end)
+
+describe("conformance: session-key.json (HKDF + XChaCha20-Poly1305 == @noble/ciphers)", function()
+  local fx = load_fixture("session-key.json")
+
+  it("HKDF-SHA256 reproduces the pinned hkdf_key_hex (pins HMAC+HKDF)", function()
+    local key = hkdf.derive(from_hex(fx.manifest_sig), from_hex(fx.salt_hex), fx.info, 32)
+    assert.equals(fx.hkdf_key_hex, to_hex(key))
+  end)
+
+  it("encrypt_privkey reproduces the pinned ciphertext_hex (AEAD framing)", function()
+    local enc = session_keys.encrypt_privkey(
+      from_hex(fx.privkey_hex), fx.manifest_sig, from_hex(fx.salt_hex), from_hex(fx.nonce_hex))
+    assert.equals(fx.ciphertext_hex, enc.ciphertext)
+  end)
+
+  it("round-trips: decrypt(encrypt(priv)) == priv; wrong sig -> nil", function()
+    local priv = from_hex(fx.privkey_hex)
+    local enc = session_keys.encrypt_privkey(priv, fx.manifest_sig)
+    assert.equals(priv, session_keys.decrypt_privkey(enc, fx.manifest_sig))
+    assert.is_nil(session_keys.decrypt_privkey(enc, string.rep("00", 64)))
   end)
 end)

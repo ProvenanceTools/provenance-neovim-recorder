@@ -76,3 +76,71 @@ Full license text (The Unlicense):
     OTHER DEALINGS IN THE SOFTWARE.
 
     For more information, please refer to <http://unlicense.org>
+
+--------------------------------------------------------------------------------
+
+PLC — Pure Lua Crypto (XChaCha20-Poly1305 AEAD)
+-----------------------------------------------
+
+Vendored path : lua/provenance/vendor/xchacha20poly1305.lua
+Upstream       : philanc/plc (Pure Lua Crypto) — https://github.com/philanc/plc
+Version        : commit 9efed4113a1a5dcb12a1f526cd65561756e6d648
+Source files   : plc/chacha20.lua, plc/poly1305.lua, plc/aead_chacha_poly.lua
+License        : MIT
+
+What was taken and how it was adapted
+  The ChaCha20 stream cipher (RFC 8439), the HChaCha20 subkey derivation and
+  XChaCha20 24-byte-nonce variant, the Poly1305 MAC (poly1305-donna 32-bit
+  limb schedule), and the RFC 8439 §2.8 AEAD combiner (16-byte tag appended,
+  empty AAD supported) were ported into a single module. The Salsa20, ec25519,
+  SHA2, and other primitives in plc were NOT vendored.
+
+  Adaptations from the plc source, which targets Lua 5.3+ (native 64-bit
+  integers, the & ~ << >> | bitwise operators, and string.pack/string.unpack):
+    * Neovim's runtime is LuaJIT with Lua 5.1 semantics — numbers are IEEE-754
+      doubles, there is no string.pack, and bitwise work goes through the `bit`
+      library. ChaCha20's 32-bit word operations were rewritten with `bit`
+      (bxor/rol/band/rshift) using bit.tobit for mod-2^32 addition, and all
+      little-endian packing/unpacking is done by hand.
+    * Poly1305's poly1305-donna 32-bit reduction accumulates products/sums that
+      reach ~2^58, relying on Lua 5.3's 64-bit integers. On LuaJIT doubles
+      (53-bit mantissa) that would lose precision, so the d0..d4 multiply-
+      accumulate is performed in an explicit 64-bit {hi,lo} representation
+      (a mul64 helper plus carry propagation) before the >>26 reduction. The
+      26-bit limb schedule and the modular reduction are otherwise plc's,
+      unchanged.
+  Correctness is proven byte-for-byte against RFC 8439 (§2.4.2 ChaCha20,
+  §2.5.2 Poly1305), draft-irtf-cfrg-xchacha-03 §A.3.1 (XChaCha20-Poly1305),
+  and the pinned cross-language vector in tests/conformance/fixtures/
+  session-key.json (produced by @noble/ciphers in the Provenance monorepo).
+
+Copyright
+  Copyright (c) 2018 Phil Leblanc
+  Copyright (c) 2017 Pierre Chapuis (salsa20/box files — not vendored here)
+  The poly1305 implementation is based on Andrew Moon's poly1305-donna
+  (https://github.com/floodyberry/poly1305-donna, public domain / MIT).
+
+Full license text (MIT):
+
+    Copyright (c) 2018 Phil Leblanc
+    Copyright (c) 2017  Pierre Chapuis (files salsa20.lua, test_salsa20,
+    box.lua, test_box.lua)
+
+    Permission is hereby granted, free of charge, to any person
+    obtaining a copy of this software and associated documentation
+    files (the "Software"), to deal in the Software without restriction,
+    including without limitation the rights to use, copy, modify, merge,
+    publish, distribute, sublicense, and/or sell copies of the Software,
+    and to permit persons to whom the Software is furnished to do so,
+    subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be
+    included in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+    IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
