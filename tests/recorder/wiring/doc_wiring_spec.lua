@@ -157,6 +157,38 @@ describe("doc_wiring.attach", function()
     assert.equals("edited2\n", events[3].data.deltas[1].text)
   end)
 
+  it("REGRESSION: a single-char insert on a long line emits delta.text = just that char (not the whole line)", function()
+    -- The paste-detection bug: on_lines reported each edit as a full-line
+    -- replacement, so typing one char onto a >=30-char line produced a
+    -- delta whose text was the whole ~30-char line. That inflated the
+    -- analyzer's charsTyped (summed from delta.text.length) and tripped the
+    -- >=30-char paste classifier. Precise on_bytes deltas must carry ONLY the
+    -- inserted character.
+    local workspace = scratch.workspace()
+    local path = workspace .. "/foo.txt"
+    local long = "def compute(self, a, b, c):" -- 27 chars; +1 char makes 28
+    scratch.write_file(path, long .. "\n")
+
+    local events, emit = new_emit()
+    scratch.handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+
+    local buf = scratch.edit(path)
+    -- Simulate an insert-mode keystroke: insert ":" at end of the long line
+    -- (byte col = #long). This is the real per-keystroke shape, unlike
+    -- set_lines which replaces whole lines.
+    vim.api.nvim_buf_set_text(buf, 0, #long, 0, #long, { "X" })
+
+    assert.equals(1, count(events, "doc.change"))
+    local ev = find(events, "doc.change")
+    assert.equals("typed", ev.data.source)
+    assert.equals(1, #ev.data.deltas)
+    local delta = ev.data.deltas[1]
+    assert.equals("X", delta.text) -- just the char, NOT the whole line
+    -- Precise empty range at the insertion point (byte==UTF-16 for ASCII).
+    assert.same({ line = 0, character = #long }, delta.range.start)
+    assert.same({ line = 0, character = #long }, delta.range["end"])
+  end)
+
   it("emits an empty-text delta for a pure line deletion", function()
     local workspace = scratch.workspace()
     local path = workspace .. "/foo.txt"
@@ -356,6 +388,81 @@ describe("doc_wiring.attach", function()
     end
 
     assert.equals("line1\nEDITED-a\nEDITED-b\nline3\n", content)
+    assert.equals(sha256.hex(content), save_ev.data.sha256)
+  end)
+
+  it("precise mid-line edits (non-zero character) reconstruct via the analyzer's char-honoring splice", function()
+    -- Drives real per-keystroke edits (nvim_buf_set_text) that land in the
+    -- INTERIOR of a line, producing deltas with non-zero `character` columns —
+    -- the shape the old line-granular path never emitted. Proves the analyzer's
+    -- offsetAt(line, character) splice reconstructs them byte-for-byte. Content
+    -- is ASCII, so UTF-16 character == byte column within a line.
+    local workspace = scratch.workspace()
+    local path = workspace .. "/foo.txt"
+    scratch.write_file(path, "abcdef\nghijkl\n")
+
+    local events, emit = new_emit()
+    scratch.handle = doc_wiring.attach({ workspace = workspace, emit = emit })
+
+    local buf = scratch.edit(path)
+    -- Insert "X" mid-line 0 at char 3: "abcdef" -> "abcXdef".
+    vim.api.nvim_buf_set_text(buf, 0, 3, 0, 3, { "X" })
+    -- Delete 2 chars mid-line 1 (chars 2..4): "ghijkl" -> "ghkl".
+    vim.api.nvim_buf_set_text(buf, 1, 2, 1, 4, { "" })
+    -- Replace 1 char with 3 mid-line 0 (char 0..1): "abcXdef" -> "ZZZbcXdef".
+    vim.api.nvim_buf_set_text(buf, 0, 0, 0, 1, { "ZZZ" })
+    vim.cmd("write")
+
+    local open_ev = find(events, "doc.open")
+    local save_ev = find(events, "doc.save")
+    assert.is_not_nil(open_ev)
+    assert.is_not_nil(save_ev)
+
+    -- At least one emitted delta must have a non-zero character column, or this
+    -- test isn't exercising what it claims to.
+    local saw_nonzero_char = false
+    for _, ev in ipairs(events) do
+      if ev.kind == "doc.change" then
+        local d = ev.data.deltas[1]
+        if d.range.start.character > 0 or d.range["end"].character > 0 then
+          saw_nonzero_char = true
+        end
+      end
+    end
+    assert.is_true(saw_nonzero_char)
+
+    -- Analyzer's offsetAt(content, {line, character}) — honors BOTH line and
+    -- character (ASCII: character == byte column within the line).
+    local function offset_at(content, line, character)
+      local cur_line, i = 0, 0
+      while i < #content and cur_line < line do
+        if content:sub(i + 1, i + 1) == "\n" then
+          cur_line = cur_line + 1
+        end
+        i = i + 1
+      end
+      -- clamp character to the remaining line
+      local j = i
+      local consumed = 0
+      while j < #content and content:sub(j + 1, j + 1) ~= "\n" and consumed < character do
+        j = j + 1
+        consumed = consumed + 1
+      end
+      return j
+    end
+
+    local content = open_ev.data.content
+    for _, ev in ipairs(events) do
+      if ev.kind == "doc.change" then
+        for _, delta in ipairs(ev.data.deltas) do
+          local s = offset_at(content, delta.range.start.line, delta.range.start.character)
+          local e = offset_at(content, delta.range["end"].line, delta.range["end"].character)
+          content = content:sub(1, s) .. delta.text .. content:sub(e + 1)
+        end
+      end
+    end
+
+    assert.equals("ZZZbcXdef\nghkl\n", content)
     assert.equals(sha256.hex(content), save_ev.data.sha256)
   end)
 

@@ -6,6 +6,7 @@
 --- carries source="typed" (hardcoded in doc_events.transform_doc_change), and
 --- there is no expected-content model here yet.
 local doc_events = require("provenance.recorder.events.doc_events")
+local precise_delta = require("provenance.recorder.events.precise_delta")
 local default_sha256 = require("provenance.core.sha256")
 
 local M = {}
@@ -208,10 +209,18 @@ function M.attach(opts)
   local closed = {}
 
   -- Buffers we've called nvim_buf_attach on, and the workspace-relative path
-  -- cached at attach time so the on_lines hot path never recomputes
+  -- cached at attach time so the on_bytes hot path never recomputes
   -- recordability per keystroke.
   local attached_bufs = {}
   local buf_rel = {}
+
+  -- Per-buffer PRE-edit line shadow (0-based row r -> shadow[b][r+1]). Kept
+  -- one edit behind the live buffer: at on_bytes time it still reflects the
+  -- content BEFORE the current edit, which is what a precise delta's range
+  -- needs (the analyzer applies deltas against pre-edit content, and a
+  -- deletion/replacement's end column can only be UTF-16-resolved against the
+  -- now-removed pre-edit line). Seeded at attach, updated after each edit.
+  local buf_shadow = {}
 
   -------------------------------------------------------------------------
   -- Recordability filter (single source of truth).
@@ -305,13 +314,26 @@ function M.attach(opts)
 
     attached_bufs[buf] = true
     buf_rel[buf] = rel
+    -- Seed the pre-edit shadow with the buffer's current lines.
+    buf_shadow[buf] = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 
     vim.api.nvim_buf_attach(buf, false, {
       -- MINIMAL hot-path work: no signing, no canonicalization, no
       -- recordability recompute (rel is looked up from the cache filled at
       -- attach time). emit() only builds the event shape; SessionHost does
       -- the actual chaining/hashing/writing elsewhere.
-      on_lines = function(_, b, _changedtick, first, last, new_last, ...)
+      --
+      -- on_bytes (not on_lines): it reports each edit as a precise
+      -- byte-granular splice, which lets us emit a VS-Code-shaped delta
+      -- carrying ONLY the inserted text at a precise character range —
+      -- instead of on_lines' whole-changed-line text. That precision is what
+      -- keeps the analyzer's charsTyped/charsPasted stats honest (they sum
+      -- delta.text.length) and stops ordinary typing on a long line from
+      -- tripping the >=30-char paste classifier. See events/precise_delta.lua.
+      --
+      -- on_bytes args: start (row, col, byte) then old-region and new-region
+      -- spans, each as a DELTA (row, col, byte) from start.
+      on_bytes = function(_, b, _tick, sr, sc, _sb, oer, oec, _oeb, ner, nec, _neb)
         if disposed then
           return true -- detach
         end
@@ -321,25 +343,53 @@ function M.attach(opts)
           return
         end
 
-        -- Single line-granular delta representing lines [first, last)
-        -- replaced by lines [first, new_last). Byte-accurate under the
-        -- fileformat-aware content model (content_bytes): each buffer line
-        -- in that model is eol-terminated (using this buffer's own
-        -- 'fileformat' line-ending), including the (possibly empty) line at
-        -- the old/new line count, so appending the same eol to the new
-        -- lines' join reproduces exactly the bytes being spliced in at
-        -- offsetAt(first,0)..offsetAt(last,0). A pure deletion (new_last ==
-        -- first) has no replacement text, so text is "".
+        local pre_lines = buf_shadow[b]
+        if not pre_lines then
+          return
+        end
+
         local eol = file_eol(b)
-        local new_lines = vim.api.nvim_buf_get_lines(b, first, new_last, false)
-        local text = (new_last > first) and (table.concat(new_lines, eol) .. eol) or ""
-        local delta = {
-          range = {
-            start = { line = first, character = 0 },
-            ["end"] = { line = last, character = 0 },
-          },
-          text = text,
-        }
+
+        -- Inserted text = the exact bytes now occupying the new region
+        -- [start .. new_end], read from the (already-mutated) buffer. Multi-
+        -- line inserts are joined with the buffer's own fileformat EOL so the
+        -- spliced bytes match content_bytes' model (and thus doc.open's
+        -- content).
+        local inserted
+        if ner == 0 and nec == 0 then
+          -- Empty new region: a pure deletion. No text to read.
+          inserted = ""
+        else
+          local new_end_row = sr + ner
+          local new_end_col = (ner == 0) and (sc + nec) or nec
+          local line_count = vim.api.nvim_buf_line_count(b)
+          if new_end_row >= line_count then
+            -- Whole-line ops (o, dd, paste of full lines, :set_lines) report a
+            -- new region that ends at the VIRTUAL row one past the last line —
+            -- i.e. the last line PLUS its trailing EOL. Read to the real buffer
+            -- end and re-add that implied EOL, matching the pre-on_bytes
+            -- content model. (The noeol + last-line residual documented in
+            -- content_bytes still applies and is unchanged by this port.)
+            local last = line_count - 1
+            local last_line = vim.api.nvim_buf_get_lines(b, last, last + 1, false)[1] or ""
+            local ok, txt = pcall(vim.api.nvim_buf_get_text, b, sr, sc, last, #last_line, {})
+            inserted = (ok and table.concat(txt, eol) or "") .. eol
+          else
+            local ok, txt = pcall(
+              vim.api.nvim_buf_get_text, b, sr, sc, new_end_row, new_end_col, {}
+            )
+            inserted = ok and table.concat(txt, eol) or ""
+          end
+        end
+
+        local delta = precise_delta.build(pre_lines, {
+          start_row = sr,
+          start_col = sc,
+          old_end_row = oer,
+          old_end_col = oec,
+          new_end_row = ner,
+          new_end_col = nec,
+        }, inserted)
 
         if change_router then
           local routed = change_router(r, { delta }, delta.range)
@@ -357,10 +407,29 @@ function M.attach(opts)
         if ec_deps then
           ec_deps.apply_change(r, { delta })
         end
+
+        -- Advance the shadow to the post-edit state so the NEXT edit sees
+        -- correct pre-edit content. Replace the old rows [sr, sr+oer] with
+        -- the new rows [sr, sr+ner] read back from the buffer. Single-line
+        -- edits (the keystroke common case: oer == ner == 0) are an O(1)
+        -- in-place line replace; only line-count-changing edits shift the
+        -- array.
+        local new_rows = vim.api.nvim_buf_get_lines(b, sr, sr + ner + 1, false)
+        if oer == 0 and ner == 0 then
+          pre_lines[sr + 1] = new_rows[1]
+        else
+          for _ = 0, oer do
+            table.remove(pre_lines, sr + 1)
+          end
+          for i = #new_rows, 1, -1 do
+            table.insert(pre_lines, sr + 1, new_rows[i])
+          end
+        end
       end,
       on_detach = function(_, b)
         attached_bufs[b] = nil
         buf_rel[b] = nil
+        buf_shadow[b] = nil
       end,
     })
   end
@@ -501,6 +570,7 @@ function M.attach(opts)
     end
     attached_bufs = {}
     buf_rel = {}
+    buf_shadow = {}
     closed = {}
     change_router = nil
   end

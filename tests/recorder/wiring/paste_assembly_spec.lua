@@ -4,32 +4,20 @@
 --- repo's convention for wiring-layer specs (see doc_wiring_spec.lua,
 --- paste_intercept_spec.lua).
 ---
---- PORT NOTE: Neovim's default `vim.paste` always applies pasted text via a
---- CHARWISE `nvim_put`, which — empirically verified against real Neovim
---- 0.12 — ALWAYS reports an on_lines callback that "replaces" exactly the
---- one line the cursor sits on (first == last - 1), even when pasting into
---- an empty line. It NEVER produces a first == last ("empty range",
---- zero-existing-lines-touched) delta; that shape only arises from a pure
---- new-line INSERT (no deletion), e.g. `nvim_buf_set_lines(buf, N, N, ...)`.
+--- PORT NOTE: doc_wiring drives paste detection off `on_bytes` (precise,
+--- byte-granular edits), not `on_lines`. A single-shot `vim.paste()` produces
+--- exactly one on_bytes edit, so the correlator still sees exactly one delta —
+--- but that delta now carries the PRECISE character range and EXACTLY the
+--- pasted text (no synthetic trailing EOL), the same shape VS Code emits. The
+--- "real paste" test below drives the paste through the genuine path: a real
+--- global `vim.paste` (wrapped by the real paste_intercept, feeding signals
+--- 2/3) applied directly to the RECORDABLE buffer (a real on_bytes callback,
+--- through the real doc_wiring attach + real router + real correlator) — no
+--- decoy buffer or manual buffer-mutation workaround needed.
 ---
---- paste_correlator.is_paste_shaped no longer requires an empty range (see
---- that module's header for why the empty-range check was a VS Code
---- artifact that never fit Neovim's line-granular on_lines deltas) — it
---- only requires a SINGLE delta, which a real, single-shot `vim.paste()`
---- always produces. So the "real paste" test below drives the paste
---- straight through the genuine path: a real global `vim.paste` (wrapped by
---- the real paste_intercept, feeding signals 2/3) applied directly to the
---- RECORDABLE buffer (a real on_lines callback, through the real
---- doc_wiring attach + real router + real correlator) — no decoy buffer or
---- manual buffer-mutation workaround needed.
----
---- Per doc_wiring's own fileformat-aware content model (see
---- doc_wiring_spec.lua: "Delta text carries a trailing \n per replaced-line"),
---- a replaced line's delta text always carries a trailing eol, so the pasted
---- content the correlator sees (and thus the emitted `paste` event's
---- `content`) is `<clip> .. "\n"`, not the bare clipboard string. This is
---- doc_wiring's existing, pre-Plan-6 content model — not something this
---- assembly changes.
+--- paste_correlator.is_paste_shaped requires a SINGLE delta (never an empty
+--- range specifically), which a real single-shot `vim.paste()` always
+--- produces.
 local doc_wiring = require("provenance.recorder.wiring.doc_wiring")
 local paste_assembly = require("provenance.recorder.wiring.paste_assembly")
 local sha256 = require("provenance.core.sha256")
@@ -202,23 +190,20 @@ describe("paste_assembly.attach", function()
     local ev = find(events, "paste")
     assert.equals("foo.txt", ev.data.path)
 
-    local expected_content = clip .. "\n" -- doc_wiring's trailing-eol content model
-    assert.equals(expected_content, ev.data.content)
-    assert.equals(#expected_content, ev.data.length)
-    assert.equals(sha256.hex(expected_content), ev.data.sha256)
+    -- Precise on_bytes deltas carry EXACTLY the pasted text (no synthetic
+    -- trailing EOL), matching VS Code's paste content shape.
+    assert.equals(clip, ev.data.content)
+    assert.equals(#clip, ev.data.length)
+    assert.equals(sha256.hex(clip), ev.data.sha256)
     assert.is_nil(ev.data.content_head)
     assert.is_nil(ev.data.content_tail)
 
-    -- Real vim.paste's charwise nvim_put replaces exactly the one line the
-    -- cursor sits on (first == last - 1, per the module header note) -- a
-    -- non-empty range, which is exactly the case the correlator fix makes
-    -- reachable. `character` is always 0 on both ends (doc_wiring hardcodes
-    -- it; see doc_wiring.lua's on_lines delta construction).
+    -- A pure insertion into the empty line: a precise empty range at the
+    -- insertion point (start == end), UTF-16 character columns. This is the
+    -- same shape VS Code emits for a paste.
     assert.is_not_nil(ev.data.range)
-    assert.equals(0, ev.data.range.start.line)
-    assert.equals(1, ev.data.range["end"].line)
-    assert.equals(0, ev.data.range.start.character)
-    assert.equals(0, ev.data.range["end"].character)
+    assert.same({ line = 0, character = 0 }, ev.data.range.start)
+    assert.same({ line = 0, character = 0 }, ev.data.range["end"])
 
     -- No doc.change fired for this same edit (routed to `paste` instead).
     assert.equals(0, count(events, "doc.change"))
