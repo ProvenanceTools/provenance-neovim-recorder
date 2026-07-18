@@ -232,6 +232,102 @@ describe("recorder.setup :ProvenanceSeal live command", function()
     assert.is_not_nil(string.find(calls[1].message, "not an activated assignment workspace", 1, true))
   end)
 
+  it("round-trip active->inactive->active: :ProvenanceSeal always reflects the current workspace state (regression: stale live command must not survive deactivation)", function()
+    local tmp_a = vim.fn.tempname()
+    local tmp_b = vim.fn.tempname()
+    vim.fn.mkdir(tmp_a, "p")
+    vim.fn.mkdir(tmp_b, "p")
+
+    local orig_cwd = vim.fn.getcwd()
+    vim.cmd("cd " .. vim.fn.fnameescape(tmp_a))
+    -- getcwd() may resolve symlinks (e.g. /var -> /private/var on macOS), so
+    -- compare against the resolved cwd rather than the raw tempname() path.
+    local resolved_a = vim.fn.getcwd()
+
+    local seal_calls = 0
+    local fake_controller = {
+      seal = function()
+        seal_calls = seal_calls + 1
+        return {
+          kind = "ok",
+          bundle_path = "/tmp/hw3-bundle.zip",
+          warnings = { chain_broken = false, unreadable_session = false },
+        }
+      end,
+      stop = function() end,
+    }
+
+    handle = recorder.setup({
+      -- No workspace override: resolve_and_apply falls back to
+      -- vim.fn.getcwd(), so a real :cd fires DirChanged and drives a
+      -- genuine re-resolve through the SAME resolve_and_apply path exercised
+      -- by init_controller_spec.lua's workspace-change test. Active only for
+      -- workspace A; every other cwd (workspace B) resolves inactive.
+      load_and_verify = function(workspace)
+        if workspace == resolved_a then
+          return { status = "active", manifest = { assignment_id = "hw3" } }
+        end
+        return { status = "inactive", reason = "no_manifest_file" }
+      end,
+      start_recording = function()
+        return fake_controller
+      end,
+    })
+
+    -- Phase 1: ACTIVE (workspace A). :ProvenanceSeal is the LIVE command.
+    local calls, restore = capture_notify()
+    restore_notify = restore
+
+    vim.cmd("ProvenanceSeal")
+
+    assert.equals(1, seal_calls)
+    assert.equals(1, #calls)
+    assert.equals(vim.log.levels.INFO, calls[1].level)
+    assert.is_not_nil(string.find(calls[1].message, "/tmp/hw3-bundle.zip", 1, true))
+
+    restore()
+    restore_notify = nil
+
+    -- Phase 2: leave for workspace B (INACTIVE). Before the fix, the
+    -- INACTIVE branch's `vim.fn.exists(":ProvenanceSeal") == 0` guard saw
+    -- the live command left behind by phase 1 (exists() == 2) and skipped
+    -- re-registering the stub -- the stale live callback (closing over a
+    -- now-nil controller) stayed bound, so :ProvenanceSeal wrongly reported
+    -- "no active recording session to seal" instead of the inactive
+    -- guidance. Assert the inert stub message and that seal is NOT invoked.
+    vim.cmd("cd " .. vim.fn.fnameescape(tmp_b))
+
+    calls, restore = capture_notify()
+    restore_notify = restore
+
+    vim.cmd("ProvenanceSeal")
+
+    assert.equals(1, seal_calls) -- unchanged: the fake controller was NOT sealed again
+    assert.equals(1, #calls)
+    assert.equals(vim.log.levels.INFO, calls[1].level)
+    assert.is_not_nil(string.find(calls[1].message, "not an activated assignment workspace", 1, true))
+    assert.is_nil(string.find(calls[1].message, "no active recording session", 1, true))
+
+    restore()
+    restore_notify = nil
+
+    -- Phase 3: back to ACTIVE (workspace A). The live command must be
+    -- restored (nvim_create_user_command overwrites the inert stub).
+    vim.cmd("cd " .. vim.fn.fnameescape(resolved_a))
+
+    calls, restore = capture_notify()
+    restore_notify = restore
+
+    vim.cmd("ProvenanceSeal")
+
+    assert.equals(2, seal_calls)
+    assert.equals(1, #calls)
+    assert.equals(vim.log.levels.INFO, calls[1].level)
+    assert.is_not_nil(string.find(calls[1].message, "/tmp/hw3-bundle.zip", 1, true))
+
+    vim.cmd("cd " .. vim.fn.fnameescape(orig_cwd))
+  end)
+
   it("dispose(): removes the live :ProvenanceSeal command entirely", function()
     local fake_controller = {
       seal = function()

@@ -144,16 +144,25 @@ function M.setup(opts)
       end
       state.deactivate()
 
-      if vim.fn.exists(":" .. SEAL_COMMAND_NAME) == 0 then
-        vim.api.nvim_create_user_command(SEAL_COMMAND_NAME, function()
-          vim.notify(
-            "Provenance: not an activated assignment workspace; nothing to seal.",
-            vim.log.levels.INFO
-          )
-        end, {
-          desc = "Provenance: seal the recorded submission bundle (inactive stub)",
-        })
-      end
+      -- Register the INERT :ProvenanceSeal stub unconditionally.
+      -- nvim_create_user_command overwrites any prior definition by default,
+      -- so this always replaces a stale LIVE command (registered by the
+      -- ACTIVE branch above) with the inert stub. Without this, a prior
+      -- vim.fn.exists guard here meant that once the live command had ever
+      -- been registered, this branch would skip re-registering the stub —
+      -- leaving the stale live callback (closing over a now-nil controller)
+      -- bound after deactivation, producing the wrong "no active recording
+      -- session to seal" message instead of the inactive-workspace guidance.
+      -- Repeated inactive re-fires just re-register the same stub, which is
+      -- harmless (idempotent).
+      vim.api.nvim_create_user_command(SEAL_COMMAND_NAME, function()
+        vim.notify(
+          "Provenance: not an activated assignment workspace; nothing to seal.",
+          vim.log.levels.INFO
+        )
+      end, {
+        desc = "Provenance: seal the recorded submission bundle (inactive stub)",
+      })
     end
   end
 
