@@ -95,6 +95,39 @@ describe("recorder.setup controller lifecycle", function()
     end
   end)
 
+  it("VimLeavePre: stops the live controller so session.end is emitted before Neovim exits", function()
+    -- Regression: without a VimLeavePre teardown, a normal :q never calls
+    -- session.stop(), so session.end is never written and the session is left
+    -- "open" on disk. Two such never-closed sessions in one workspace's
+    -- .provenance/ read to the analyzer as impossible overlapping sessions
+    -- (an open range always overlaps a later one), falsely tripping its
+    -- clock-manipulation heuristic even though the student did nothing wrong.
+    local start_recording, calls = make_start_recording_spy()
+
+    handle = recorder.setup({
+      workspace = "/tmp/ws-a",
+      load_and_verify = function()
+        return { status = "active", manifest = { assignment_id = "hw3" } }
+      end,
+      start_recording = start_recording,
+    })
+
+    assert.equals(1, #calls)
+    local fake_controller = calls[1].controller
+    assert.equals(0, #fake_controller.stop_calls)
+
+    -- Fire VimLeavePre exactly as Neovim would on quit.
+    vim.api.nvim_exec_autocmds("VimLeavePre", { group = "Provenance" })
+
+    assert.equals(1, #fake_controller.stop_calls)
+
+    -- Idempotent: a subsequent dispose() (after_each) must not double-stop the
+    -- already-stopped controller into a second session.end.
+    handle.dispose()
+    handle = nil
+    assert.equals(1, #fake_controller.stop_calls)
+  end)
+
   it("inactive loader: start_recording is never called", function()
     local start_recording, calls = make_start_recording_spy()
 

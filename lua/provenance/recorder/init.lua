@@ -174,6 +174,21 @@ function M.setup(opts)
     desc = "Provenance: re-evaluate activation on workspace entry/change",
   })
 
+  -- End the live session before Neovim exits. Without this, a normal :q never
+  -- calls session.stop(), so session.end is never emitted and the session is
+  -- left "open" on disk forever. Two such never-closed sessions in one
+  -- workspace's .provenance/ (a student opening the assignment more than once
+  -- before sealing — the normal case) read to the analyzer as impossible
+  -- overlapping sessions, since an open range always overlaps a later one,
+  -- falsely tripping its clock-manipulation heuristic. stop_controller() is
+  -- idempotent (it nils the controller and session.stop() guards on a
+  -- `stopped` flag), so a following handle.dispose() cannot double-emit.
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = augroup,
+    callback = stop_controller,
+    desc = "Provenance: end the recording session before Neovim exits",
+  })
+
   -- Run once immediately so tests (and a setup() call after VimEnter has
   -- already fired) see the resolved state without waiting for the next
   -- autocmd event.
