@@ -150,6 +150,57 @@ describe("external_change_coordinator", function()
     assert.equals(1, #events, "total emits across both paths must be exactly one")
   end)
 
+  it("no double-emit when Path 2 fires AFTER the tolerance window (mechanism 2 / reset alone)", function()
+    local workspace = scratch.workspace()
+    local abs_path = workspace .. "/a.py"
+    local original = "before\n"
+    scratch.write_file(abs_path, original)
+
+    local now = 0
+    local events, emit = new_emit()
+    local coordinator = scratch.track(coordinator_mod.start({
+      workspace = workspace,
+      files_under_review = { "a.py" },
+      emit = emit,
+      get_now = function() return now end,
+      -- default tolerance_ms (250) — deliberately not overridden, so this
+      -- test exercises the realistic default relationship where
+      -- poll_interval_ms (1000) > tolerance_ms.
+    }))
+
+    coordinator.seed_open("a.py", original)
+
+    -- note_save at now=0, mirroring doc-wiring's real ordering (note_save
+    -- BEFORE the on-disk write is observed/checked).
+    coordinator.note_save("a.py")
+
+    local disk_content = "after\n"
+    scratch.write_file(abs_path, disk_content)
+
+    -- Path 1 fires first (BufWritePost order): claims the event AND resets
+    -- the shared ExpectedContent to disk_content.
+    coordinator.check_after_save("a.py", abs_path)
+    assert.equals(1, #events)
+
+    -- Advance the clock PAST the tolerance window (250ms). recent_saves'
+    -- tolerance (mechanism 1) is now EXPIRED — it can no longer suppress
+    -- Path 2. If mechanism 2 (ec.reset after emit) were absent, Path 2
+    -- firing for the SAME unchanged-since disk content would double-emit.
+    now = 251
+
+    -- Path 2 fires for the SAME disk write (the file on disk is still
+    -- disk_content — no new external change happened). Reached the same way
+    -- the "NO DOUBLE-EMIT" test above reaches Path 2: the exposed test-only
+    -- watcher seam.
+    coordinator._watcher.handle_path_event("a.py", abs_path)
+
+    -- Still exactly one event: with the tolerance window expired, ONLY the
+    -- reset (Path 1 having already updated the shared ExpectedContent to
+    -- disk_content) makes Path 2's compare_saved_content see a clean_save
+    -- (disk == expected) and emit nothing.
+    assert.equals(1, #events, "mechanism 2 (ec.reset) alone must suppress Path 2 past the tolerance window")
+  end)
+
   it("PATH 3 alone: reload-from-disk emits ONE external_change", function()
     local workspace = scratch.workspace()
     local abs_path = workspace .. "/b.py"
