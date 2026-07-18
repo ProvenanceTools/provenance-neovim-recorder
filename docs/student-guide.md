@@ -23,7 +23,7 @@ Add the plugin **pinned to the tag your course specifies** (examples below use `
 **lazy.nvim** — add to your plugin spec:
 
 ```lua
-{ "ProvenanceTools/provenance-neovim-recorder", version = "v0.1.1" }
+{ "ProvenanceTools/provenance-neovim-recorder", version = "v0.1.1", lazy = false }
 ```
 
 **packer.nvim:**
@@ -39,6 +39,8 @@ Plug 'ProvenanceTools/provenance-neovim-recorder', { 'tag': 'v0.1.1' }
 ```
 
 Then install (`:Lazy sync`, `:PackerSync`, or `:PlugInstall` respectively) and restart Neovim. Other managers work too — see the [README install section](https://github.com/ProvenanceTools/provenance-neovim-recorder#install). You don't need an account; the plugin makes no network requests during a session.
+
+> **Don't lazy-load it.** The recorder has to load every time Neovim starts so it can notice when you open an assignment folder. The `lazy = false` above is what guarantees that for lazy.nvim (some configs lazy-load everything by default). For packer/vim-plug, just don't add on-demand loading options (`opt`, `cmd`, `ft`, `event`, `{ 'on': ... }`, `{ 'for': ... }`). If the plugin only loads on demand, **your work won't be recorded** even though it looks installed.
 
 ### 2. Open the assignment folder
 

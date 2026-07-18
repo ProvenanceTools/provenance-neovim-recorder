@@ -112,8 +112,14 @@ recognizes (see [below](#extension_hash--the-integrity-anchor)). Installing an u
 {
   "ProvenanceTools/provenance-neovim-recorder",
   version = "v0.1.1",
+  lazy = false, -- REQUIRED: must load at startup, never on a trigger (see note below)
 }
 ```
+
+`lazy = false` is not optional. lazy.nvim treats a bare spec as eager *unless* your
+config sets `defaults.lazy = true` (LazyVim and many derived configs do), which would
+silently defer this plugin. Setting it explicitly makes activation independent of your
+defaults.
 </details>
 
 <details>
@@ -123,6 +129,8 @@ recognizes (see [below](#extension_hash--the-integrity-anchor)). Installing an u
 use({
   "ProvenanceTools/provenance-neovim-recorder",
   tag = "v0.1.1",
+  -- Do NOT add `opt = true`, `cmd`, `ft`, or `event` — those lazy-load the
+  -- plugin and prevent it from registering its activation autocmds at startup.
 })
 ```
 </details>
@@ -132,6 +140,8 @@ use({
 
 ```vim
 " in your init.vim (or init.lua inside a vim.cmd block)
+" Do NOT add { 'on': ... } or { 'for': ... } — on-demand loading stops the
+" plugin from registering its activation autocmds at startup.
 Plug 'ProvenanceTools/provenance-neovim-recorder', { 'tag': 'v0.1.1' }
 ```
 </details>
@@ -140,6 +150,8 @@ Plug 'ProvenanceTools/provenance-neovim-recorder', { 'tag': 'v0.1.1' }
 <summary><a href="https://github.com/echasnovski/mini.deps">mini.deps</a></summary>
 
 ```lua
+-- Use a bare add() at startup. Do NOT wrap this in MiniDeps.later(), which
+-- would defer sourcing and delay/skip activation for the session you launch into.
 require("mini.deps").add({
   source = "ProvenanceTools/provenance-neovim-recorder",
   checkout = "v0.1.1",
@@ -161,6 +173,16 @@ No native dependencies, no build step — every manager just clones the tagged g
 The plugin does nothing until you open a workspace containing a course-signed
 `.provenance-manifest`, so it is safe to have installed all the time. When you finish, run
 `:ProvenanceSeal` to write the signed submission bundle.
+
+> [!IMPORTANT]
+> **Do not lazy-load this plugin.** It must be sourced at every Neovim startup. On load
+> it registers the autocmds that watch for you entering an activated assignment
+> workspace — that is the entire activation mechanism. If your plugin manager defers
+> loading it behind a command, filetype, or event trigger (e.g. `cmd = "ProvenanceSeal"`,
+> `ft = "python"`), those autocmds never register and **nothing is recorded** — yet the
+> plugin still appears installed. For an integrity tool that is the worst outcome: your
+> work goes unrecorded and you find out only when the sealed bundle is empty or missing.
+> The install snippets above are already configured for eager loading; keep them that way.
 
 ## Status indicator
 
