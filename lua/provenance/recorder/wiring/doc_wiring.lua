@@ -13,6 +13,15 @@ local M = {}
 
 local AUGROUP_NAME = "ProvenanceDocWiring"
 
+-- Concurrent multi-session support: two sessions may both call attach() in
+-- the same Neovim process (one per assignment root). nvim_create_augroup
+-- with a FIXED name and clear=true would wipe the FIRST session's autocmds
+-- the moment the SECOND session attaches. Each attach() therefore gets its
+-- own uniquely-suffixed augroup name; teardown uses the returned integer id
+-- (nvim_del_augroup_by_id), never the name, so uniqueness is the only thing
+-- that matters here.
+local instance_seq = 0
+
 -- The activation manifest at the workspace root — never recorded, mirrors
 -- activation.lua's MANIFEST_NAMES (not exported there, so duplicated here;
 -- both must change together if the manifest filename ever changes).
@@ -438,7 +447,9 @@ function M.attach(opts)
   -- Autocmds
   -------------------------------------------------------------------------
 
-  local augroup = vim.api.nvim_create_augroup(AUGROUP_NAME, { clear = true })
+  instance_seq = instance_seq + 1
+  local augroup_name = AUGROUP_NAME .. ":" .. instance_seq
+  local augroup = vim.api.nvim_create_augroup(augroup_name, { clear = true })
 
   vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile" }, {
     group = augroup,
@@ -570,7 +581,7 @@ function M.attach(opts)
     end
     disposed = true
 
-    pcall(vim.api.nvim_del_augroup_by_name, AUGROUP_NAME)
+    pcall(vim.api.nvim_del_augroup_by_id, augroup)
 
     for buf in pairs(attached_bufs) do
       if vim.api.nvim_buf_is_valid(buf) then
@@ -583,6 +594,8 @@ function M.attach(opts)
     closed = {}
     change_router = nil
   end
+
+  handle._augroup_id = augroup
 
   return handle
 end
