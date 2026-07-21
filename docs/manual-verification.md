@@ -347,3 +347,17 @@ items below cover what headless cannot.
 ## Plan 9 — full integration
 
 - [ ] **End-to-end installation and manual seal:** Install the plugin in a real `nvim` session via a plugin manager (lazy.nvim or packer.nvim) from a course-specific release tag. Open a workspace containing a valid, course-signed `.provenance-manifest` (one that verifies against the committed course public key). Confirm the status indicator shows "Provenance: recording". Do some work: type in a file, paste some text, save. Run `:ProvenanceSeal` via the command-line. Confirm that a `.provenance.zip` bundle file is produced in the workspace and the seal command outputs its path. Verify that the `.zip` contains a `manifest.json`, `manifest.sig`, and `.provenance/` directory with `.slog` and `.slog.meta` files.
+
+## Upward manifest discovery + concurrent multi-session (2026-07-20)
+
+- [ ] **Bare `nvim` in `~`, then open a nested assignment file:** From your home directory, run plain `nvim` (no file argument), then `:e ~/<course>/<assignment>/<file>` where `<assignment>/` contains a valid signed `.provenance-manifest`. Confirm the status segment shows "Provenance: recording" as soon as the buffer opens — activation must not require `:cd`-ing into the assignment first.
+
+- [ ] **Two assignments open at once:** `nvim ~/<course>/<assignment-1>/<file1> ~/<course>/<assignment-2>/<file2>` (two DIFFERENT assignment roots, each with its own valid manifest). Confirm both activate; inspect `<assignment-1>/.provenance/` and `<assignment-2>/.provenance/` and confirm each has its own `.slog` growing independently as you edit each buffer in turn.
+
+- [ ] **`:ProvenanceSeal` picker:** With the two-assignment session above still open, run `:ProvenanceSeal`. Confirm a picker (`vim.ui.select`, typically `inputlist`-style or your configured `vim.ui.select` provider) appears listing both assignment ids; choosing one seals only that assignment's bundle (confirm only ONE new `*-bundle-*.zip` appears, in the CHOSEN assignment's directory).
+
+- [ ] **Single assignment: no picker.** With only one assignment active, run `:ProvenanceSeal`. Confirm it seals immediately with no picker prompt (regression check for the pre-existing single-workspace flow).
+
+- [ ] **Terminal attribution by cwd:** With the two-assignment session from above, open a `:terminal` while your shell's cwd is inside assignment-1's root. Confirm `assignment-1/.provenance/`'s `.slog` gets a `terminal.open` and assignment-2's does not.
+
+- [ ] **cd away does not stop a session:** With one assignment active, `:cd` to an unrelated directory with no manifest. Confirm the status segment still shows "Provenance: recording" and further edits to the assignment's still-open buffers keep being recorded (locked design: session lifetime is the editor process, until `:q`/`VimLeavePre`, not the active cwd).
