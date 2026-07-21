@@ -57,6 +57,9 @@ local explanation_tags = require("provenance.recorder.events.explanation_tags")
 local M = {}
 
 local AUGROUP_NAME = "ProvenanceExternalChange"
+-- See doc_wiring.lua's identical comment: concurrent sessions each call
+-- start() once, so the augroup name must be unique per instance.
+local instance_seq = 0
 local DEFAULT_TOLERANCE_MS = 250
 
 local function default_get_now()
@@ -119,7 +122,8 @@ function M.start(opts)
 
   local disposed = false
 
-  local augroup = vim.api.nvim_create_augroup(AUGROUP_NAME, { clear = true })
+  instance_seq = instance_seq + 1
+  local augroup = vim.api.nvim_create_augroup(AUGROUP_NAME .. ":" .. instance_seq, { clear = true })
   vim.api.nvim_create_autocmd("FileChangedShellPost", {
     group = augroup,
     desc = "Provenance: external-change reload-from-disk (Path 3)",
@@ -219,8 +223,10 @@ function M.start(opts)
     disposed = true
 
     watcher.dispose()
-    pcall(vim.api.nvim_del_augroup_by_name, AUGROUP_NAME)
+    pcall(vim.api.nvim_del_augroup_by_id, augroup)
   end
+
+  handle._augroup_id = augroup
 
   return handle
 end

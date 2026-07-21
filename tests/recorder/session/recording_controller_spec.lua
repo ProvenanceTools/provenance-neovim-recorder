@@ -207,7 +207,11 @@ describe("recording_controller.start (full-signals capstone)", function()
     assert.is_number(scratch.session._doc_wiring_augroup_id)
     assert.is_true(group_gone(scratch.session._doc_wiring_augroup_id), "ProvenanceDocWiring augroup leaked")
     assert.is_true(group_gone("ProvenanceTerminal"), "ProvenanceTerminal augroup leaked")
-    assert.is_true(group_gone("ProvenanceExternalChange"), "ProvenanceExternalChange augroup leaked")
+    assert.is_number(scratch.session._external_change_augroup_id)
+    assert.is_true(
+      group_gone(scratch.session._external_change_augroup_id),
+      "ProvenanceExternalChange augroup leaked"
+    )
 
     -- stop() is idempotent.
     assert.has_no.errors(function()

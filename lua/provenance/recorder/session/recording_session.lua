@@ -412,6 +412,10 @@ function M.start(opts)
     -- actual instance's augroup for leak checks instead of a fixed name that
     -- may never have existed (see doc_wiring.lua's per-instance suffixing).
     _doc_wiring_augroup_id = wiring._augroup_id,
+    -- Same seam for the external-change coordinator's augroup. Only non-nil
+    -- when enable_signals is true (coordinator is nil otherwise), same as
+    -- the coordinator itself in _signals below.
+    _external_change_augroup_id = coordinator and coordinator._augroup_id or nil,
   }
 
   -- TEST SEAM (Plan 9): expose the signal sub-handles so the integration test
