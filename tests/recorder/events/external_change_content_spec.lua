@@ -17,7 +17,7 @@ end
 
 describe("external_change_content.build_external_change_content", function()
   it("constants match the monorepo source", function()
-    assert.equals(4096, ecc.MAX_INLINE_BYTES)
+    assert.equals(65536, ecc.MAX_INLINE_BYTES)
     assert.equals(512, ecc.HEAD_TAIL_BYTES)
   end)
 
@@ -37,19 +37,19 @@ describe("external_change_content.build_external_change_content", function()
     assert.is_nil(fields.new_content_tail)
   end)
 
-  it("exactly MAX_INLINE_BYTES (4096) bytes: still inline (<=, not <)", function()
-    local text = string.rep("a", 4096)
+  it("exactly MAX_INLINE_BYTES (65536) bytes: still inline (<=, not <)", function()
+    local text = string.rep("a", 65536)
     local fields = ecc.build_external_change_content(text)
-    assert.equals(4096, fields.new_content_size)
+    assert.equals(65536, fields.new_content_size)
     assert.equals(text, fields.new_content)
     assert.is_nil(fields.new_content_head)
     assert.is_nil(fields.new_content_tail)
   end)
 
   it("> MAX_INLINE_BYTES: head/tail set, new_content absent, sizes correct", function()
-    local text = string.rep("a", 5000)
+    local text = string.rep("a", 70000)
     local fields = ecc.build_external_change_content(text)
-    assert.equals(5000, fields.new_content_size)
+    assert.equals(70000, fields.new_content_size)
     assert.is_nil(fields.new_content)
     assert.equals(512, #fields.new_content_head)
     assert.equals(string.rep("a", 512), fields.new_content_head)
@@ -57,7 +57,7 @@ describe("external_change_content.build_external_change_content", function()
     assert.equals(string.rep("a", 512), fields.new_content_tail)
   end)
 
-  it("multibyte text under 4096 bytes: new_content_size is UTF-8 byte length, > char count", function()
+  it("multibyte text under the cap: new_content_size is UTF-8 byte length, > char count", function()
     -- "日本語" = 3 codepoints, 3 bytes each in UTF-8 = 9 bytes.
     local text = "日本語"
     local fields = ecc.build_external_change_content(text)

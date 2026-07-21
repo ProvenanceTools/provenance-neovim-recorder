@@ -346,9 +346,9 @@ end)
 -- ---------------------------------------------------------------------------
 
 describe("paste_correlator: single-delta bulk insert exceeding MAX_INLINE_BYTES", function()
-  it("CONFIRMED single-delta paste whose inserted text is >4096 bytes -> doc.change source=paste_likely (NOT paste)", function()
+  it("CONFIRMED single-delta paste whose inserted text is > 64 KB -> doc.change source=paste_likely (NOT paste)", function()
     local c = new_correlator()
-    local big = string.rep("a", 5000)
+    local big = string.rep("a", 70000)
     assert.is_true(#big > paste_payload.MAX_INLINE_BYTES)
 
     c.on_paste_intercept(big, 0)
@@ -361,9 +361,9 @@ describe("paste_correlator: single-delta bulk insert exceeding MAX_INLINE_BYTES"
     assert.same({ delta(big, range) }, decision.deltas)
   end)
 
-  it("paste_likely single-delta bulk insert (no intercept) >4096 bytes -> doc.change source=paste_likely (NOT paste)", function()
+  it("paste_likely single-delta bulk insert (no intercept) > 64 KB -> doc.change source=paste_likely (NOT paste)", function()
     local c = new_correlator()
-    local big = string.rep("z", 4200)
+    local big = string.rep("z", 70000)
     assert.is_true(#big > paste_payload.MAX_INLINE_BYTES)
 
     local range = empty_range()

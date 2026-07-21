@@ -33,7 +33,21 @@
 --- Lua output agree byte-for-byte.
 local M = {}
 
-M.MAX_INLINE_BYTES = 4096
+--- Max UTF-8 byte length inlined into one `fs.external_change` payload.
+---
+--- Raised from 4 KB to 64 KB (recorder PRD §4.5), matching `doc.open`'s existing
+--- ceiling. Below 64 KB, a genuine external write to any real-sized source file was
+--- unrecoverable by construction: the evidence was discarded at record time, so no
+--- analyzer-side fix could bring it back, and `mass_external_replacement` could not
+--- evaluate the change at all.
+---
+--- Threshold change only — `new_content` is an optional field, so old and new
+--- analyzers interoperate in both directions and `format_version` is NOT bumped.
+---
+--- Deliberately duplicated in events/paste_payload.lua rather than shared: these two
+--- modules are independent faithful ports of separate TS files and the repo's module
+--- isolation convention keeps them that way. Both must move together.
+M.MAX_INLINE_BYTES = 64 * 1024
 M.HEAD_TAIL_BYTES = 512
 
 --- Decode a UTF-8 string into a list of codepoints, each carrying its byte
