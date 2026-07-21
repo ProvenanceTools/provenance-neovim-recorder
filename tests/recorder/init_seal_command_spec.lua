@@ -72,8 +72,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })
@@ -103,8 +103,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })
@@ -130,8 +130,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })
@@ -156,8 +156,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })
@@ -182,8 +182,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })
@@ -214,7 +214,7 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
+      resolve = function()
         return { status = "inactive", reason = "no_manifest_file" }
       end,
       start_recording = start_recording,
@@ -232,7 +232,19 @@ describe("recorder.setup :ProvenanceSeal live command", function()
     assert.is_not_nil(string.find(calls[1].message, "not an activated assignment workspace", 1, true))
   end)
 
-  it("round-trip active->inactive->active: :ProvenanceSeal always reflects the current workspace state (regression: stale live command must not survive deactivation)", function()
+  it("cd to an inactive directory does NOT stop or hide an already-active session: :ProvenanceSeal keeps sealing it (locked design: session lifetime is VimLeavePre/dispose, not cwd)", function()
+    -- Repurposed from a pre-registry regression test whose original premise
+    -- (a stale LIVE-vs-inert-stub command surviving deactivation) is
+    -- structurally impossible now that :ProvenanceSeal is registered ONCE,
+    -- unconditionally, and always queries the registry live (see init.lua).
+    -- The new invariant this test documents is the locked design decision
+    -- (docs/superpowers/specs/2026-07-20-nested-manifest-discovery-design.md):
+    -- a session is anchored to its assignment ROOT and lives until
+    -- VimLeavePre/dispose -- matching VS Code/JetBrains -- so a mere `:cd`
+    -- into a directory with no manifest of its own must NOT stop, hide, or
+    -- otherwise affect an already-active session elsewhere. This mirrors
+    -- init_controller_spec.lua's rewritten "workspace change" test, but
+    -- proves it specifically through the seal command's own behavior.
     local tmp_a = vim.fn.tempname()
     local tmp_b = vim.fn.tempname()
     vim.fn.mkdir(tmp_a, "p")
@@ -263,9 +275,9 @@ describe("recorder.setup :ProvenanceSeal live command", function()
       -- genuine re-resolve through the SAME resolve_and_apply path exercised
       -- by init_controller_spec.lua's workspace-change test. Active only for
       -- workspace A; every other cwd (workspace B) resolves inactive.
-      load_and_verify = function(workspace)
-        if workspace == resolved_a then
-          return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function(start_dir)
+        if start_dir == resolved_a then
+          return { status = "active", root = start_dir, manifest = { assignment_id = "hw3" } }
         end
         return { status = "inactive", reason = "no_manifest_file" }
       end,
@@ -274,7 +286,7 @@ describe("recorder.setup :ProvenanceSeal live command", function()
       end,
     })
 
-    -- Phase 1: ACTIVE (workspace A). :ProvenanceSeal is the LIVE command.
+    -- Phase 1: active workspace A. :ProvenanceSeal seals it.
     local calls, restore = capture_notify()
     restore_notify = restore
 
@@ -288,13 +300,10 @@ describe("recorder.setup :ProvenanceSeal live command", function()
     restore()
     restore_notify = nil
 
-    -- Phase 2: leave for workspace B (INACTIVE). Before the fix, the
-    -- INACTIVE branch's `vim.fn.exists(":ProvenanceSeal") == 0` guard saw
-    -- the live command left behind by phase 1 (exists() == 2) and skipped
-    -- re-registering the stub -- the stale live callback (closing over a
-    -- now-nil controller) stayed bound, so :ProvenanceSeal wrongly reported
-    -- "no active recording session to seal" instead of the inactive
-    -- guidance. Assert the inert stub message and that seal is NOT invoked.
+    -- Phase 2: cd to workspace B, which resolves INACTIVE (no manifest of
+    -- its own). A's session must stay registered and live -- :ProvenanceSeal
+    -- still seals it (still exactly one active session), NOT the "not an
+    -- activated assignment workspace" guidance, and NOT a no-op.
     vim.cmd("cd " .. vim.fn.fnameescape(tmp_b))
 
     calls, restore = capture_notify()
@@ -302,28 +311,14 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     vim.cmd("ProvenanceSeal")
 
-    assert.equals(1, seal_calls) -- unchanged: the fake controller was NOT sealed again
-    assert.equals(1, #calls)
-    assert.equals(vim.log.levels.INFO, calls[1].level)
-    assert.is_not_nil(string.find(calls[1].message, "not an activated assignment workspace", 1, true))
-    assert.is_nil(string.find(calls[1].message, "no active recording session", 1, true))
-
-    restore()
-    restore_notify = nil
-
-    -- Phase 3: back to ACTIVE (workspace A). The live command must be
-    -- restored (nvim_create_user_command overwrites the inert stub).
-    vim.cmd("cd " .. vim.fn.fnameescape(resolved_a))
-
-    calls, restore = capture_notify()
-    restore_notify = restore
-
-    vim.cmd("ProvenanceSeal")
-
-    assert.equals(2, seal_calls)
+    assert.equals(2, seal_calls) -- A was sealed AGAIN -- its session is still live
     assert.equals(1, #calls)
     assert.equals(vim.log.levels.INFO, calls[1].level)
     assert.is_not_nil(string.find(calls[1].message, "/tmp/hw3-bundle.zip", 1, true))
+    assert.is_nil(string.find(calls[1].message, "not an activated assignment workspace", 1, true))
+
+    restore()
+    restore_notify = nil
 
     vim.cmd("cd " .. vim.fn.fnameescape(orig_cwd))
   end)
@@ -338,8 +333,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })

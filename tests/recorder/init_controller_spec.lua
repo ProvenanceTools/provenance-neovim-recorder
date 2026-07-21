@@ -54,8 +54,8 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = manifest }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = manifest }
       end,
       start_recording = start_recording,
     })
@@ -71,8 +71,8 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = start_recording,
     })
@@ -106,8 +106,8 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = start_recording,
     })
@@ -133,7 +133,7 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
+      resolve = function()
         return { status = "inactive", reason = "no_manifest_file" }
       end,
       start_recording = start_recording,
@@ -149,8 +149,8 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = start_recording,
     })
@@ -167,7 +167,17 @@ describe("recorder.setup controller lifecycle", function()
     assert.equals(0, #first_controller.stop_calls)
   end)
 
-  it("workspace change: stops the old controller and starts a new one for the new workspace", function()
+  it("workspace change: the OLD session keeps running (registry parity, locked design) AND a new session starts for the new cwd", function()
+    -- Locked design decision (docs/superpowers/specs/2026-07-20-nested-manifest-discovery-design.md):
+    -- a session is anchored to its assignment ROOT and lives until
+    -- VimLeavePre/dispose, matching VS Code/JetBrains (session lifetime is
+    -- the editor process, not the active folder/cwd) -- this is required so
+    -- a student who keeps editing assignment A's buffers after `:cd`-ing
+    -- elsewhere is still recorded. cwd is only ever a FALLBACK anchor
+    -- (BufEnter/BufReadPost/BufNewFile is primary); a mere `:cd` must never
+    -- stop a still-live session for a DIFFERENT root. Privacy is unaffected:
+    -- session A only ever records files under A's own root regardless of
+    -- what cwd currently is.
     local start_recording, calls = make_start_recording_spy()
 
     local tmp_a = vim.fn.tempname()
@@ -183,9 +193,9 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       -- No workspace override: resolve_and_apply falls back to
-      -- vim.fn.getcwd(), so a real :cd triggers a genuine workspace change.
-      load_and_verify = function(workspace)
-        return { status = "active", manifest = { assignment_id = "hw3", workspace = workspace } }
+      -- vim.fn.getcwd(), so a real :cd triggers a genuine cwd re-resolve.
+      resolve = function(start_dir)
+        return { status = "active", root = start_dir, manifest = { assignment_id = "hw3", workspace = start_dir } }
       end,
       start_recording = start_recording,
     })
@@ -198,9 +208,19 @@ describe("recorder.setup controller lifecycle", function()
     vim.cmd("cd " .. vim.fn.fnameescape(tmp_b))
     local resolved_b = vim.fn.getcwd()
 
+    -- A new session for B is started...
     assert.equals(2, #calls)
     assert.equals(resolved_b, calls[2].args.workspace)
+    local controller_b = calls[2].controller
+
+    -- ...and A's session is NOT stopped just because cwd moved away from it.
+    assert.equals(0, #controller_a.stop_calls)
+    assert.equals(0, #controller_b.stop_calls)
+
+    -- Both remain live until VimLeavePre/dispose stops every session.
+    vim.api.nvim_exec_autocmds("VimLeavePre", { group = "Provenance" })
     assert.equals(1, #controller_a.stop_calls)
+    assert.equals(1, #controller_b.stop_calls)
 
     vim.cmd("cd " .. vim.fn.fnameescape(orig_cwd))
   end)
