@@ -25,8 +25,6 @@
 --- (untrack the buf) and must emit nothing.
 local terminal_wiring = require("provenance.recorder.wiring.terminal_wiring")
 
-local AUGROUP_NAME = "ProvenanceTerminal"
-
 local function new_emit()
   local events = {}
   local function emit(kind, data)
@@ -81,7 +79,7 @@ local function new_scratch()
   --- it, mirroring what a real `:terminal` open does but without a shell.
   function scratch.open_terminal(opts)
     local buf = scratch.new_term_buf(opts)
-    vim.api.nvim_exec_autocmds("TermOpen", { group = AUGROUP_NAME, buffer = buf })
+    vim.api.nvim_exec_autocmds("TermOpen", { buffer = buf })
     return buf
   end
 
@@ -142,7 +140,7 @@ describe("terminal_wiring.start", function()
     assert.equals(1, #events)
 
     assert.has_no.errors(function()
-      vim.api.nvim_exec_autocmds("TermClose", { group = AUGROUP_NAME, buffer = buf })
+      vim.api.nvim_exec_autocmds("TermClose", { buffer = buf })
     end)
 
     assert.equals(1, #events) -- still just the one terminal.open
@@ -153,7 +151,6 @@ describe("terminal_wiring.start", function()
     -- has nothing to attribute to, so it too emits nothing.
     assert.has_no.errors(function()
       vim.api.nvim_exec_autocmds("TermRequest", {
-        group = AUGROUP_NAME,
         buffer = buf,
         data = { sequence = "\27]133;D;0" },
       })
@@ -174,7 +171,6 @@ describe("terminal_wiring.start", function()
     -- confirmed against a literal printf'd sequence in a live Neovim 0.12
     -- terminal: args.data.sequence == "\27]133;D;0" (see module docstring).
     vim.api.nvim_exec_autocmds("TermRequest", {
-      group = AUGROUP_NAME,
       buffer = buf,
       data = { sequence = "\27]133;D;0" },
     })
@@ -192,7 +188,6 @@ describe("terminal_wiring.start", function()
     local buf = scratch.open_terminal()
 
     vim.api.nvim_exec_autocmds("TermRequest", {
-      group = AUGROUP_NAME,
       buffer = buf,
       data = { sequence = "\27]133;D;137" },
     })
@@ -211,7 +206,6 @@ describe("terminal_wiring.start", function()
 
     assert.has_no.errors(function()
       vim.api.nvim_exec_autocmds("TermRequest", {
-        group = AUGROUP_NAME,
         buffer = buf,
         data = { sequence = "\27]133;C" },
       })
@@ -229,7 +223,6 @@ describe("terminal_wiring.start", function()
 
     assert.has_no.errors(function()
       vim.api.nvim_exec_autocmds("TermRequest", {
-        group = AUGROUP_NAME,
         buffer = buf,
         data = { sequence = "not an OSC sequence at all" },
       })
@@ -246,7 +239,6 @@ describe("terminal_wiring.start", function()
 
     assert.has_no.errors(function()
       vim.api.nvim_exec_autocmds("TermRequest", {
-        group = AUGROUP_NAME,
         buffer = scratch_buf,
         data = { sequence = "\27]133;D;0" },
       })
@@ -264,7 +256,9 @@ describe("terminal_wiring.start", function()
 
     handle.dispose()
 
-    local ok, autocmds = pcall(vim.api.nvim_get_autocmds, { group = AUGROUP_NAME })
+    local augroup_id = handle._augroup_id
+    assert.is_number(augroup_id)
+    local ok, autocmds = pcall(vim.api.nvim_get_autocmds, { group = augroup_id })
     assert.is_true(not ok or #autocmds == 0)
 
     local before = #events
@@ -273,13 +267,71 @@ describe("terminal_wiring.start", function()
     -- down the wiring; no event is emitted either way.
     pcall(function()
       local buf2 = scratch.new_term_buf()
-      vim.api.nvim_exec_autocmds("TermOpen", { group = AUGROUP_NAME, buffer = buf2 })
+      vim.api.nvim_exec_autocmds("TermOpen", { buffer = buf2 })
     end)
     assert.equals(before, #events)
 
     -- dispose() is idempotent.
     assert.has_no.errors(function()
       handle.dispose()
+    end)
+  end)
+
+  describe("workspace-scoped attribution (concurrency)", function()
+    it("no workspace opt (legacy default): every terminal is recorded regardless of cwd", function()
+      local events, emit = new_emit()
+      scratch.handle = terminal_wiring.start({ emit = emit })
+
+      scratch.open_terminal()
+      assert.equals(1, count(events, "terminal.open"))
+    end)
+
+    it("workspace opt set: a terminal whose cwd is NOT under workspace is dropped (tracked but silent)", function()
+      local other_dir = vim.fs.normalize(vim.fn.tempname())
+      vim.fn.mkdir(other_dir, "p")
+
+      local events, emit = new_emit()
+      scratch.handle = terminal_wiring.start({ emit = emit, workspace = other_dir .. "-not-the-real-cwd" })
+
+      local buf = scratch.open_terminal()
+      assert.equals(0, count(events, "terminal.open"))
+
+      -- Still tracked (not owned): a TermRequest on it must not emit either,
+      -- and must not error.
+      assert.has_no.errors(function()
+        vim.api.nvim_exec_autocmds("TermRequest", { buffer = buf, data = { sequence = "\27]133;D;0" } })
+      end)
+      assert.equals(0, #events)
+
+      pcall(vim.fn.delete, other_dir, "rf")
+    end)
+
+    it("workspace opt set: a terminal whose cwd IS workspace is recorded", function()
+      local events, emit = new_emit()
+      scratch.handle = terminal_wiring.start({ emit = emit, workspace = vim.fn.getcwd() })
+
+      scratch.open_terminal()
+      assert.equals(1, count(events, "terminal.open"))
+    end)
+
+    it("CONCURRENCY: two workspace-scoped instances only the matching one records a given terminal", function()
+      local events_a, emit_a = new_emit()
+      local events_b, emit_b = new_emit()
+      local other_dir = vim.fs.normalize(vim.fn.tempname())
+      vim.fn.mkdir(other_dir, "p")
+
+      local handle_a = terminal_wiring.start({ emit = emit_a, workspace = vim.fn.getcwd() })
+      local handle_b = terminal_wiring.start({ emit = emit_b, workspace = other_dir })
+      scratch.handle = nil -- disposed manually
+
+      scratch.open_terminal()
+
+      assert.equals(1, count(events_a, "terminal.open"))
+      assert.equals(0, count(events_b, "terminal.open"))
+
+      handle_a.dispose()
+      handle_b.dispose()
+      pcall(vim.fn.delete, other_dir, "rf")
     end)
   end)
 end)

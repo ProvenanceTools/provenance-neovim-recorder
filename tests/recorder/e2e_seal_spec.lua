@@ -251,10 +251,22 @@ describe("e2e: recording_controller.start (full-signals) -> seal (local gates)",
     -- terminal.open: synthetic TermOpen fire on a scratch buffer with
     -- terminal-shaped buffer-locals (mirrors terminal_wiring_spec.lua).
     -- Never spawns a real shell/PTY.
+    --
+    -- terminal_wiring's workspace filter reads vim.fn.getcwd() at TermOpen
+    -- time (see terminal_wiring.lua's module docstring), so this synthetic
+    -- fire must happen with Neovim's real cwd actually inside `workspace`
+    -- for the terminal to be attributed to this session -- a real
+    -- `:terminal` opened while editing here would naturally have that cwd.
+    -- Scoped cd/restore around just the fire, same pattern already used in
+    -- tests/recorder/init_controller_spec.lua (global `:cd`, restored
+    -- immediately after, synchronous so it cannot leak into later tests).
+    local orig_cwd = vim.fn.getcwd()
+    vim.cmd("cd " .. vim.fn.fnameescape(workspace))
     term_buf = vim.api.nvim_create_buf(false, true)
     vim.b[term_buf].terminal_job_id = 4242
     vim.b[term_buf].term_title = "/bin/fake-shell"
-    vim.api.nvim_exec_autocmds("TermOpen", { group = "ProvenanceTerminal", buffer = term_buf })
+    vim.api.nvim_exec_autocmds("TermOpen", { buffer = term_buf })
+    vim.cmd("cd " .. vim.fn.fnameescape(orig_cwd))
 
     -- session.heartbeat: force a deterministic tick (no real timer wait).
     session._signals.heartbeat._tick()
