@@ -370,4 +370,46 @@ describe("paste_assembly.attach", function()
       assembly.dispose()
     end)
   end)
+
+  it("CONCURRENCY: a paste in session B's buffer is never seen by session A's correlator", function()
+    local workspace_a = scratch.workspace()
+    local workspace_b = scratch.workspace()
+    local path_a = workspace_a .. "/a.txt"
+    local path_b = workspace_b .. "/b.txt"
+    scratch.write_file(path_a, "aaa\n")
+    scratch.write_file(path_b, "bbb\n")
+
+    local events_a, emit_a = new_emit()
+    local events_b, emit_b = new_emit()
+
+    local doc_a = doc_wiring.attach({ workspace = workspace_a, emit = emit_a })
+    local doc_b = doc_wiring.attach({ workspace = workspace_b, emit = emit_b })
+    local assembly_a = paste_assembly.attach({ emit = emit_a, doc_wiring_handle = doc_a })
+    local assembly_b = paste_assembly.attach({ emit = emit_b, doc_wiring_handle = doc_b })
+
+    local buf_b = scratch.edit(path_b)
+    local clip = string.rep("X", 40) -- >= 30 chars: paste_likely shape
+    vim.fn.setreg("+", clip)
+    vim.paste({ clip }, -1)
+
+    -- Session B (the owning session) sees the paste.
+    local paste_ev_b = find(events_b, "paste")
+    assert.is_not_nil(paste_ev_b)
+
+    -- Session A never sees a paste event, and its own next typed edit (in
+    -- its OWN buffer) is not misattributed as a confirmed paste just
+    -- because A's correlator saw B's clipboard capture.
+    assert.is_nil(find(events_a, "paste"))
+
+    local buf_a = scratch.edit(path_a)
+    vim.api.nvim_buf_set_lines(buf_a, 0, 1, false, { "short" })
+    local change_ev_a = find(events_a, "doc.change")
+    assert.is_not_nil(change_ev_a)
+    assert.equals("typed", change_ev_a.data.source)
+
+    assembly_a.dispose()
+    assembly_b.dispose()
+    doc_a.dispose()
+    doc_b.dispose()
+  end)
 end)

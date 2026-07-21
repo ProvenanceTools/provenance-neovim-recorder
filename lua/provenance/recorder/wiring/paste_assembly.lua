@@ -53,6 +53,18 @@ function M.attach(opts)
 
   local intercept = paste_intercept.attach({
     on_intercept = function(text, at)
+      -- Concurrency: the shared vim.paste wrap (paste_intercept.lua)
+      -- broadcasts to every attached session. Only forward this intercept
+      -- to THIS session's correlator if the paste landed in a buffer this
+      -- session actually owns -- otherwise a paste in a sibling session's
+      -- buffer would pollute this session's paste_correlator with a
+      -- foreign clipboard capture, risking a misattributed `paste` event
+      -- (or an inflated paste.anomaly count) on a later, unrelated edit of
+      -- THIS session's own buffer.
+      local buf = vim.api.nvim_get_current_buf()
+      if not doc_wiring_handle.recordable_rel(buf) then
+        return
+      end
       correlator.on_paste_intercept(text, at)
     end,
     get_now = get_now,
