@@ -3,7 +3,7 @@
 ---
 --- Faithful port of the monorepo's events/paste-payload.ts (recorder PRD
 --- §4.2 paste row + §4.3). Close variant of the fs.external_change content
---- builder (events/external_change_content.lua): same 4096/512 constants
+--- builder (events/external_change_content.lua): same 65536/512 constants
 --- and the same UTF-16-code-unit head/tail slicing, plus a `sha256` field
 --- over the full pasted text.
 ---
@@ -37,7 +37,21 @@ local sha256 = require("provenance.core.sha256")
 
 local M = {}
 
-M.MAX_INLINE_BYTES = 4096
+--- Max UTF-8 byte length inlined into one `paste` payload.
+---
+--- Raised from 4 KB to 64 KB (recorder PRD §4.3), matching `doc.open`'s existing
+--- ceiling. A `paste` event is NOT duplicated by a `doc.change`, so anything dropped
+--- here is dropped from reconstruction AND from the paste heuristics for good — which
+--- made a pasted solution above 4 KB, the single most load-bearing detection case in
+--- the product, invisible.
+---
+--- Threshold change only — `content` is an optional field, so old and new analyzers
+--- interoperate in both directions and `format_version` is NOT bumped.
+---
+--- Deliberately duplicated in events/external_change_content.lua rather than shared:
+--- these two modules are independent faithful ports of separate TS files and the
+--- repo's module isolation convention keeps them that way. Both must move together.
+M.MAX_INLINE_BYTES = 64 * 1024
 M.HEAD_TAIL_BYTES = 512
 
 --- Decode a UTF-8 string into a list of codepoints, each carrying its byte

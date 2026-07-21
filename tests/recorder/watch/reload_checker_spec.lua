@@ -107,7 +107,7 @@ describe("reload_checker", function()
     assert.equals("modify", ev.data.operation)
     assert.is_number(ev.data.new_content_size)
     assert.equals(#disk_content, ev.data.new_content_size)
-    assert.equals(disk_content, ev.data.new_content) -- <= 4096 bytes: inlined
+    assert.equals(disk_content, ev.data.new_content) -- <= 64 KB: inlined
     assert.is_nil(ev.data.explanation) -- no tagger mark
 
     -- The ExpectedContent model must be reset to disk reality AFTER emitting.
@@ -246,7 +246,7 @@ describe("reload_checker", function()
     assert.is_nil(events[1].data.explanation)
   end)
 
-  it("large content (> 4096 bytes): new_content_head/new_content_tail set instead of new_content", function()
+  it("large content (> 64 KB): new_content_head/new_content_tail set instead of new_content", function()
     local workspace = scratch.workspace()
     local path = workspace .. "/big.py"
     scratch.write_file(path, "small\n")
@@ -256,7 +256,7 @@ describe("reload_checker", function()
     local reg = registry_mod.new({ "big.py" })
     reg.get_or_create("big.py", "small\n")
 
-    local disk_content = string.rep("x", 5000)
+    local disk_content = string.rep("x", 70000)
     scratch.write_file(path, disk_content)
 
     local events, emit = new_emit()
@@ -267,7 +267,7 @@ describe("reload_checker", function()
 
     assert.equals(1, #events)
     local data = events[1].data
-    assert.equals(5000, data.new_content_size)
+    assert.equals(70000, data.new_content_size)
     assert.is_nil(data.new_content)
     assert.is_string(data.new_content_head)
     assert.is_string(data.new_content_tail)

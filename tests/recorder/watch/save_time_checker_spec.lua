@@ -77,7 +77,7 @@ describe("save_time_checker", function()
     assert.equals("modify", ev.data.operation)
     assert.is_number(ev.data.new_content_size)
     assert.equals(#disk_content, ev.data.new_content_size)
-    assert.equals(disk_content, ev.data.new_content) -- <= 4096 bytes: inlined
+    assert.equals(disk_content, ev.data.new_content) -- <= 64 KB: inlined
     assert.is_nil(ev.data.explanation) -- no tagger mark
 
     -- The ExpectedContent model must be reset to disk reality AFTER emitting.
@@ -154,11 +154,11 @@ describe("save_time_checker", function()
     assert.equals(0, #events)
   end)
 
-  it("large content (> 4096 bytes): new_content_head/new_content_tail set instead of new_content", function()
+  it("large content (> 64 KB): new_content_head/new_content_tail set instead of new_content", function()
     local reg = registry_mod.new({ "big.py" })
     reg.get_or_create("big.py", "small\n")
 
-    local disk_content = string.rep("x", 5000)
+    local disk_content = string.rep("x", 70000)
     local abs_path = dir .. "/big.py"
     write_file(abs_path, disk_content)
 
@@ -170,7 +170,7 @@ describe("save_time_checker", function()
 
     assert.equals(1, #events)
     local data = events[1].data
-    assert.equals(5000, data.new_content_size)
+    assert.equals(70000, data.new_content_size)
     assert.is_nil(data.new_content)
     assert.is_string(data.new_content_head)
     assert.is_string(data.new_content_tail)

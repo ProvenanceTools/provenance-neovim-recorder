@@ -24,7 +24,7 @@
 --- `source = "paste_likely"` instead — preserving every delta faithfully.
 ---
 --- THE INLINE-SIZE GATE: `paste_payload.build_paste_payload` only inlines
---- the full text up to `MAX_INLINE_BYTES` (4096); beyond that it TRUNCATES
+--- the full text up to `MAX_INLINE_BYTES` (64 KB); beyond that it TRUNCATES
 --- to a head/tail preview (see paste_payload.lua). A `paste` event built
 --- from truncated content cannot be replayed by the analyzer — its
 --- `applyPasteBuf` returns applied=false and RESETS the reconstruction
