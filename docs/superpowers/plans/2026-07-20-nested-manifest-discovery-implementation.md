@@ -263,6 +263,9 @@ git commit --no-gpg-sign -m "fix(recorder): unique per-instance augroup for focu
 **Files:**
 - Modify: `lua/provenance/recorder/watch/external_change_coordinator.lua:59,122,222`
 - Modify: `tests/recorder/watch/external_change_coordinator_spec.lua:313-332`
+- Modify: `tests/recorder/session/recording_controller_spec.lua:104-107,209` (close out this module's slice of a regression Task 1 found and started fixing — see Step 2b below)
+
+**Regression this step closes (found during Task 1's review, tracked across Tasks 1/3/4):** `tests/recorder/session/recording_controller_spec.lua`'s one full-signals integration test asserts no augroup leaked after `session.stop()` via a `group_gone(name)` helper (line 104) that does `pcall(vim.api.nvim_get_autocmds, {group = name})` against a FIXED name. Once a module's real augroup name is suffixed (this task's Step 1), `nvim_get_autocmds` against the old fixed name always errors (group never existed under that exact name), so `pcall` always returns `ok=false` — the assertion becomes **vacuously true** regardless of whether the real (suffixed) augroup actually leaked. Task 1 fixed its own slice of this (the `"ProvenanceDocWiring"` line) by exposing the augroup id via a new always-present `session._doc_wiring_augroup_id` field. This task closes the `"ProvenanceExternalChange"` slice the same way.
 
 **Interfaces:**
 - Produces: `handle._augroup_id` on `external_change_coordinator.start(opts)`'s returned handle.
@@ -330,15 +333,41 @@ Replace both `"ProvenanceExternalChange"` occurrences with `coordinator._augroup
       end)
 ```
 
+- [ ] **Step 2b: Close out this module's slice of the `recording_controller_spec.lua` leak-check regression**
+
+In `lua/provenance/recorder/session/recording_session.lua`, find where `session._doc_wiring_augroup_id` was added (Task 1's fix — search for it if the exact line has moved) and add a sibling field right next to it, sourced from the `coordinator` local (the external_change_coordinator handle, only non-nil when `enable_signals` is true):
+
+```lua
+  session._external_change_augroup_id = coordinator and coordinator._augroup_id or nil
+```
+
+In `tests/recorder/session/recording_controller_spec.lua`, replace:
+
+```lua
+    assert.is_true(group_gone("ProvenanceExternalChange"), "ProvenanceExternalChange augroup leaked")
+```
+
+with:
+
+```lua
+    assert.is_number(scratch.session._external_change_augroup_id)
+    assert.is_true(
+      group_gone(scratch.session._external_change_augroup_id),
+      "ProvenanceExternalChange augroup leaked"
+    )
+```
+
+(`group_gone(name)` at line 104 already works unchanged for an integer id — `nvim_api.nvim_get_autocmds({group = <id>})` accepts either — no change needed to the helper itself.)
+
 - [ ] **Step 3: Run the suite**
 
-Run: `make test 2>&1 | grep -A 15 "external_change_coordinator_spec"`
-Expected: all tests pass.
+Run: `make test 2>&1 | grep -A 15 "external_change_coordinator_spec\|recording_controller_spec"`
+Expected: all tests pass, including the retargeted leak-check assertion.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add lua/provenance/recorder/watch/external_change_coordinator.lua tests/recorder/watch/external_change_coordinator_spec.lua
+git add lua/provenance/recorder/watch/external_change_coordinator.lua tests/recorder/watch/external_change_coordinator_spec.lua lua/provenance/recorder/session/recording_session.lua tests/recorder/session/recording_controller_spec.lua
 git commit --no-gpg-sign -m "fix(recorder): unique per-instance augroup for external_change_coordinator (concurrency)"
 ```
 
@@ -351,6 +380,7 @@ git commit --no-gpg-sign -m "fix(recorder): unique per-instance augroup for exte
 - Modify: `lua/provenance/recorder/session/recording_session.lua:379`
 - Modify: `tests/recorder/wiring/terminal_wiring_spec.lua` (multiple `group = AUGROUP_NAME` sites)
 - Modify: `tests/recorder/e2e_seal_spec.lua:257`
+- Modify: `tests/recorder/session/recording_controller_spec.lua:208` (close out this module's slice of the leak-check regression Task 1 found and Task 3 partially closed — see the new step between Steps 6 and 7 below)
 
 **Interfaces:**
 - Produces: `terminal_wiring.start(opts)` gains an optional `opts.workspace` (string|nil). `nil` (the default) preserves EXACT current behavior — every terminal is recorded, no filtering — so every existing call site that never passes `workspace` is unaffected. When set, a terminal opened with a cwd (`vim.fn.getcwd()` at `TermOpen` time) that is not `workspace` or a descendant of it is silently dropped (no `terminal.open`/`terminal.command` emitted, no error). `handle._augroup_id` exposed, same as Tasks 1-3.
@@ -616,6 +646,29 @@ becomes:
 
 (`workspace` is already the function's own top-level local; no new parameter needed.)
 
+- [ ] **Step 6b: Close out this module's slice of the `recording_controller_spec.lua` leak-check regression**
+
+Right next to `session._external_change_augroup_id` (added by Task 3) in `lua/provenance/recorder/session/recording_session.lua`, add:
+
+```lua
+  session._terminal_augroup_id = term and term._augroup_id or nil
+```
+
+In `tests/recorder/session/recording_controller_spec.lua`, replace:
+
+```lua
+    assert.is_true(group_gone("ProvenanceTerminal"), "ProvenanceTerminal augroup leaked")
+```
+
+with:
+
+```lua
+    assert.is_number(scratch.session._terminal_augroup_id)
+    assert.is_true(group_gone(scratch.session._terminal_augroup_id), "ProvenanceTerminal augroup leaked")
+```
+
+After this step, all three `group_gone(...)` assertions in that file (doc_wiring from Task 1, external_change_coordinator from Task 3, terminal from this task) target real per-instance ids instead of the now-stale fixed names — the leak-check regression flagged during Task 1's review is fully closed.
+
 - [ ] **Step 7: Fix `tests/recorder/e2e_seal_spec.lua`'s one hardcoded terminal group reference**
 
 At line 257:
@@ -634,13 +687,13 @@ becomes:
 
 - [ ] **Step 8: Run everything touched**
 
-Run: `make test 2>&1 | grep -A 40 "terminal_wiring_spec\|e2e_seal_spec\|recording_session_spec"`
-Expected: all pass, including the four new concurrency/filter tests.
+Run: `make test 2>&1 | grep -A 40 "terminal_wiring_spec\|e2e_seal_spec\|recording_session_spec\|recording_controller_spec"`
+Expected: all pass, including the four new concurrency/filter tests and the retargeted leak-check assertions.
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add lua/provenance/recorder/wiring/terminal_wiring.lua lua/provenance/recorder/session/recording_session.lua tests/recorder/wiring/terminal_wiring_spec.lua tests/recorder/e2e_seal_spec.lua
+git add lua/provenance/recorder/wiring/terminal_wiring.lua lua/provenance/recorder/session/recording_session.lua tests/recorder/wiring/terminal_wiring_spec.lua tests/recorder/e2e_seal_spec.lua tests/recorder/session/recording_controller_spec.lua
 git commit --no-gpg-sign -m "fix(recorder): workspace-scoped terminal attribution + unique augroup (concurrency)"
 ```
 
@@ -1695,8 +1748,24 @@ function M.setup(opts)
     return result
   end
 
+  --- The cwd-anchor path (VimEnter/DirChanged): fires rarely (only on a real
+  --- :cd or Neovim startup), so it keeps the pre-existing debug notification
+  --- on an inactive resolve -- exactly the old single-workspace behavior,
+  --- byte-for-byte. Deliberately NOT added to resolve_buf below: BufEnter/
+  --- BufReadPost/BufNewFile fire on every buffer open, so the same
+  --- notification there would spam vim.g.provenance_debug users on every
+  --- non-assignment file they open (a scratch buffer, their own dotfiles,
+  --- etc.) -- a real behavioral difference from the old cwd-only design that
+  --- this task deliberately does not carry forward into the new per-buffer
+  --- trigger.
   local function resolve_cwd()
-    resolve_and_activate(opts.workspace or vim.fn.getcwd())
+    local result = resolve_and_activate(opts.workspace or vim.fn.getcwd())
+    if result.status ~= "active" and vim.g.provenance_debug then
+      vim.notify(
+        string.format("Provenance: workspace not activated (%s)", tostring(result.reason)),
+        vim.log.levels.DEBUG
+      )
+    end
   end
 
   local augroup = vim.api.nvim_create_augroup(AUGROUP_NAME, { clear = true })
@@ -1794,10 +1863,15 @@ becomes:
       resolve = function()
         return { status = "active", root = "/tmp/ws", manifest = { assignment_id = "hw3" } }
       end,
+      start_recording = function()
+        return { seal = function() end, stop = function() end }
+      end,
     })
 ```
 
-Apply this same `load_and_verify` -> `resolve` rename (adding `root = "/tmp/ws"` to every `active` result) across **every** test in this file. The `"inactive loader: :ProvenanceSeal command is registered"` test's assertion `assert.equals(2, vim.fn.exists(":ProvenanceSeal"))` and the `"invoking :ProvenanceSeal records nothing and does not error"` test both still hold verbatim under Phase A's design (the command is always registered; an inactive/empty registry produces the same "not an activated assignment workspace" message). No other assertions in this file need to change.
+**Why `start_recording` must now be injected here too (it wasn't before):** the OLD `init.lua` had a `should_start_recording` guard — `(opts.load_and_verify == nil) or (opts.start_recording ~= nil)` — specifically so a test that injects a fake `load_and_verify` but NOT a fake `start_recording` would skip starting a real `recording_controller` (whose fake manifest here has no `sig`/`files_under_review` and would throw deep inside `core_session_keys.encrypt_privkey`). The new registry-based design has no equivalent guard: `registry.ensure_session` always calls whatever `start_recording` it was given (real `recording_controller.start` by default). Every test in this file whose `resolve` returns `status = "active"` MUST now also pass a `start_recording` that returns an inert fake controller (as shown above — a table with no-op `seal`/`stop` functions is enough; these tests only assert on `status.segment()`/augroup/command existence, never on controller behavior) — otherwise the real `recording_controller.start` runs against an invalid manifest, throws, gets silently swallowed by `registry.ensure_session`'s own `pcall`, and the test's active-workspace assertions fail because no session actually started. Tests whose `resolve` returns `status = "inactive"` do NOT need a `start_recording` seam (never called).
+
+Apply this same `load_and_verify` -> `resolve` rename (adding `root = "/tmp/ws"` to every `active` result, and a fake `start_recording` to every test that resolves active) across **every** test in this file. The `"inactive loader: :ProvenanceSeal command is registered"` test's assertion `assert.equals(2, vim.fn.exists(":ProvenanceSeal"))` and the `"invoking :ProvenanceSeal records nothing and does not error"` test both still hold verbatim under Phase A's design (the command is always registered; an inactive/empty registry produces the same "not an activated assignment workspace" message). No other assertions in this file need to change.
 
 - [ ] **Step A3: Rewrite `tests/recorder/init_controller_spec.lua`'s seam usage**
 
@@ -2600,5 +2674,7 @@ git commit --no-gpg-sign -m "test(recorder): e2e concurrency proof + manual veri
 - `terminal_wiring.start(opts)`'s new `opts.workspace` (Task 4) is threaded from `recording_session.lua`'s existing `workspace` local — confirmed present at that exact call site during planning.
 - `paste_intercept.attach(opts)` (Task 5) keeps its exact pre-existing signature and `handle.dispose()` contract — `paste_assembly.lua` (Task 6) needs no signature change, only its `on_intercept` closure body.
 - Every module exposing `handle._augroup_id` (Tasks 1, 3, 4; also added to Task 2's two modules for consistency) uses that exact field name, so any future cross-task test reuses one convention.
+
+**Cross-task regression found during Task 1's review (resolved across Tasks 1/3/4):** `tests/recorder/session/recording_controller_spec.lua`'s leak-check assertions (`group_gone("ProvenanceDocWiring"/"ProvenanceTerminal"/"ProvenanceExternalChange")`) checked fixed augroup names directly; once those three modules' augroups became per-instance-suffixed (Tasks 1/3/4), a fixed-name lookup always errors regardless of whether the real (suffixed) group actually leaked, silently defeating the invariant. Each of Tasks 1/3/4 was amended to also expose its module's augroup id on `session._doc_wiring_augroup_id` / `session._external_change_augroup_id` / `session._terminal_augroup_id` (always-present fields on the composed `recording_session`, alongside the existing `is_degraded`/`_ring_snapshot` test seams) and retarget the corresponding assertion. Confirm before considering the branch done that all three assertions in that file use a real id, not a string literal.
 
 **Known pre-existing, out-of-scope issue (do not fix in this branch):** the baseline `make test` run (before any change in this plan) showed one flaky failure in `tests/recorder/e2e_seal_spec.lua`'s first test — `Vim(edit):E576: Reading ShaDa file: last entry specified that it occupies N bytes, but file ended earlier` — caused by concurrent headless `nvim` processes racing on a shared ShaDa file in the environment, not by anything in this feature. It reproduces intermittently on `main` too. Re-run `make test` if it appears; do not weaken or remove the test it hits.
