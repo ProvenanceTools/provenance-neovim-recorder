@@ -225,3 +225,179 @@ describe("recorder.setup controller lifecycle", function()
     vim.cmd("cd " .. vim.fn.fnameescape(orig_cwd))
   end)
 end)
+
+describe("recorder.setup buffer-anchored discovery (BufEnter/BufReadPost/BufNewFile)", function()
+  local recorder
+
+  before_each(function()
+    package.loaded["provenance.recorder"] = nil
+    package.loaded["provenance.recorder.init"] = nil
+    recorder = require("provenance.recorder")
+  end)
+
+  local handle
+  local bufs
+
+  --- nvim_buf_get_name performs realpath-style resolution of existing path
+  --- components (e.g. macOS's /tmp -> /private/tmp), so a directory built
+  --- from vim.fn.tempname() must be resolved the same way before comparing
+  --- it against vim.fs.dirname(nvim_buf_get_name(buf)) inside a fake
+  --- resolve() -- otherwise the comparison spuriously fails on any platform
+  --- where tempdir is itself a symlink. Mirrors doc_wiring.lua's
+  --- resolve_dir/try_realpath and this file's own "getcwd() may resolve
+  --- symlinks" comment on the workspace-change test above.
+  local function realpath(dir)
+    local real = vim.uv.fs_realpath(dir)
+    return real and vim.fs.normalize(real) or dir
+  end
+
+  after_each(function()
+    if handle then
+      handle.dispose()
+      handle = nil
+    end
+    for _, b in ipairs(bufs or {}) do
+      if vim.api.nvim_buf_is_valid(b) then
+        pcall(vim.cmd, "bwipeout! " .. b)
+      end
+    end
+    bufs = {}
+    status.detach()
+  end)
+
+  it("opening a file resolves its OWN root, independent of cwd", function()
+    bufs = {}
+    local start_recording, calls = make_start_recording_spy()
+    local far_dir = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(far_dir, "p")
+    far_dir = realpath(far_dir) -- must resolve AFTER mkdir (fs_realpath requires the path to exist)
+    local file_path = far_dir .. "/cats.py"
+    local f = assert(io.open(file_path, "w"))
+    f:write("print(1)\n")
+    f:close()
+
+    handle = recorder.setup({
+      -- Deliberately a DIFFERENT, inactive cwd anchor, proving the buffer
+      -- path (not cwd) drives this activation.
+      workspace = "/tmp/unrelated-cwd",
+      resolve = function(start_dir)
+        if start_dir == far_dir then
+          return { status = "active", root = far_dir, manifest = { assignment_id = "cats" } }
+        end
+        return { status = "inactive", reason = "no_manifest_file" }
+      end,
+      start_recording = start_recording,
+    })
+
+    assert.equals(0, #calls) -- cwd anchor is inactive; nothing started yet
+
+    vim.cmd("edit " .. vim.fn.fnameescape(file_path))
+    table.insert(bufs, vim.api.nvim_get_current_buf())
+
+    assert.equals(1, #calls)
+    assert.equals(far_dir, calls[1].args.workspace)
+
+    pcall(vim.fn.delete, far_dir, "rf")
+  end)
+
+  it("CONCURRENCY: two buffers under two different roots produce two live sessions", function()
+    bufs = {}
+    local start_recording, calls = make_start_recording_spy()
+    local dir_cats = vim.fs.normalize(vim.fn.tempname())
+    local dir_hog = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(dir_cats, "p")
+    vim.fn.mkdir(dir_hog, "p")
+    dir_cats = realpath(dir_cats) -- must resolve AFTER mkdir (fs_realpath requires the path to exist)
+    dir_hog = realpath(dir_hog)
+    local file_cats = dir_cats .. "/cats.py"
+    local file_hog = dir_hog .. "/hog.py"
+    for _, p in ipairs({ file_cats, file_hog }) do
+      local f = assert(io.open(p, "w"))
+      f:write("x = 1\n")
+      f:close()
+    end
+
+    handle = recorder.setup({
+      workspace = "/tmp/unrelated-cwd",
+      resolve = function(start_dir)
+        if start_dir == dir_cats then
+          return { status = "active", root = dir_cats, manifest = { assignment_id = "cats" } }
+        elseif start_dir == dir_hog then
+          return { status = "active", root = dir_hog, manifest = { assignment_id = "hog" } }
+        end
+        return { status = "inactive", reason = "no_manifest_file" }
+      end,
+      start_recording = start_recording,
+    })
+
+    vim.cmd("edit " .. vim.fn.fnameescape(file_cats))
+    table.insert(bufs, vim.api.nvim_get_current_buf())
+    vim.cmd("edit " .. vim.fn.fnameescape(file_hog))
+    table.insert(bufs, vim.api.nvim_get_current_buf())
+
+    assert.equals(2, #calls)
+    assert.equals(dir_cats, calls[1].args.workspace)
+    assert.equals(dir_hog, calls[2].args.workspace)
+    assert.equals(0, #calls[1].controller.stop_calls)
+    assert.equals(0, #calls[2].controller.stop_calls)
+
+    -- VimLeavePre stops BOTH sessions.
+    vim.api.nvim_exec_autocmds("VimLeavePre", { group = "Provenance" })
+    assert.equals(1, #calls[1].controller.stop_calls)
+    assert.equals(1, #calls[2].controller.stop_calls)
+
+    pcall(vim.fn.delete, dir_cats, "rf")
+    pcall(vim.fn.delete, dir_hog, "rf")
+  end)
+
+  it("re-entering the SAME buffer's root does not double-start its session", function()
+    bufs = {}
+    local start_recording, calls = make_start_recording_spy()
+    local dir = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(dir, "p")
+    dir = realpath(dir) -- must resolve AFTER mkdir (fs_realpath requires the path to exist)
+    local file_path = dir .. "/a.py"
+    local f = assert(io.open(file_path, "w"))
+    f:write("x = 1\n")
+    f:close()
+
+    handle = recorder.setup({
+      workspace = "/tmp/unrelated-cwd",
+      resolve = function(start_dir)
+        if start_dir == dir then
+          return { status = "active", root = dir, manifest = { assignment_id = "a" } }
+        end
+        return { status = "inactive", reason = "no_manifest_file" }
+      end,
+      start_recording = start_recording,
+    })
+
+    vim.cmd("edit " .. vim.fn.fnameescape(file_path))
+    table.insert(bufs, vim.api.nvim_get_current_buf())
+    assert.equals(1, #calls)
+
+    -- Re-fire BufEnter for the same buffer (e.g. switching away and back).
+    vim.api.nvim_exec_autocmds("BufEnter", { buffer = vim.api.nvim_get_current_buf() })
+    assert.equals(1, #calls)
+
+    pcall(vim.fn.delete, dir, "rf")
+  end)
+
+  it("REGRESSION: cd <assignment> && nvim (no file arg) still activates via the cwd fallback", function()
+    local start_recording, calls = make_start_recording_spy()
+
+    handle = recorder.setup({
+      workspace = "/tmp/ws-a",
+      resolve = function(start_dir)
+        if start_dir == "/tmp/ws-a" then
+          return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
+        end
+        return { status = "inactive", reason = "no_manifest_file" }
+      end,
+      start_recording = start_recording,
+    })
+
+    assert.equals(1, #calls)
+    assert.equals("/tmp/ws-a", calls[1].args.workspace)
+  end)
+end)

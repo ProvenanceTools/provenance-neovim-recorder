@@ -69,12 +69,39 @@ function M.setup(opts)
     end
   end
 
+  --- Resolve activation from a BUFFER's file path (the primary anchor per
+  --- the design: cwd may be unrelated to what's actually open). No-op for
+  --- buffers with no file path or a non-file buftype -- those have nothing
+  --- to walk upward from and are handled (if at all) by the cwd fallback.
+  --- Deliberately no debug notification here -- see resolve_cwd's docstring.
+  local function resolve_buf(buf)
+    if not vim.api.nvim_buf_is_valid(buf) then
+      return
+    end
+    if vim.api.nvim_get_option_value("buftype", { buf = buf }) ~= "" then
+      return
+    end
+    local name = vim.api.nvim_buf_get_name(buf)
+    if name == "" then
+      return
+    end
+    resolve_and_activate(vim.fs.dirname(name))
+  end
+
   local augroup = vim.api.nvim_create_augroup(AUGROUP_NAME, { clear = true })
 
   vim.api.nvim_create_autocmd({ "VimEnter", "DirChanged" }, {
     group = augroup,
     callback = resolve_cwd,
     desc = "Provenance: re-evaluate activation on cwd change (fallback anchor for buffers with no file path)",
+  })
+
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufReadPost", "BufNewFile" }, {
+    group = augroup,
+    callback = function(args)
+      resolve_buf(args.buf)
+    end,
+    desc = "Provenance: resolve + activate the buffer's own assignment root (upward discovery)",
   })
 
   vim.api.nvim_create_autocmd("VimLeavePre", {
