@@ -181,4 +181,123 @@ describe("heartbeat.start", function()
     handle = heartbeat.start({ emit = function() end })
     assert.has_no.errors(function() handle._tick() end)
   end)
+
+  describe("session.resumed suspend detection", function()
+    it("does not emit session.resumed on the first tick (no previous tick to compare)", function()
+      local events, emit = new_emit()
+      local wall = 0
+      handle = heartbeat.start({
+        emit = emit,
+        interval_ms = 30000,
+        get_now = function() return 0 end,
+        get_wall_ms = function() return wall end,
+        get_focused = function() return true end,
+        get_active_file = function() return nil end,
+      })
+
+      -- Even a huge "gap" relative to session start must not fire, since
+      -- there is no prior tick yet.
+      wall = 10 * 60 * 1000
+      handle._tick()
+
+      assert.equals(1, #events)
+      assert.equals("session.heartbeat", events[1].kind)
+    end)
+
+    it("does not emit session.resumed when the gap is close to the expected interval", function()
+      local events, emit = new_emit()
+      local wall = 0
+      handle = heartbeat.start({
+        emit = emit,
+        interval_ms = 30000,
+        get_now = function() return 0 end,
+        get_wall_ms = function() return wall end,
+        get_focused = function() return true end,
+        get_active_file = function() return nil end,
+      })
+
+      handle._tick() -- establishes last_tick_wall_ms
+      wall = wall + 31000 -- slightly over interval, well under 2x
+      handle._tick()
+
+      assert.equals(2, #events)
+      assert.equals("session.heartbeat", events[1].kind)
+      assert.equals("session.heartbeat", events[2].kind)
+    end)
+
+    it("emits session.resumed before session.heartbeat when the gap is >= 2x interval_ms", function()
+      local events, emit = new_emit()
+      local wall = 0
+      handle = heartbeat.start({
+        emit = emit,
+        interval_ms = 30000,
+        get_now = function() return 0 end,
+        get_wall_ms = function() return wall end,
+        get_focused = function() return true end,
+        get_active_file = function() return nil end,
+      })
+
+      handle._tick() -- tick #1: establishes last_tick_wall_ms, no gap check yet
+      -- Simulate a suspend: wall clock jumps 1 hour ahead before the next tick.
+      wall = wall + 60 * 60 * 1000
+      handle._tick()
+
+      assert.equals(3, #events)
+      assert.equals("session.heartbeat", events[1].kind)
+      assert.equals("session.resumed", events[2].kind)
+      assert.equals(60 * 60 * 1000, events[2].data.gap_ms)
+      assert.equals(30000, events[2].data.expected_interval_ms)
+      assert.equals("session.heartbeat", events[3].kind)
+    end)
+
+    it("fires exactly at the 2x interval_ms threshold (boundary is inclusive)", function()
+      local events, emit = new_emit()
+      local wall = 0
+      handle = heartbeat.start({
+        emit = emit,
+        interval_ms = 30000,
+        get_now = function() return 0 end,
+        get_wall_ms = function() return wall end,
+        get_focused = function() return true end,
+        get_active_file = function() return nil end,
+      })
+
+      handle._tick()
+      wall = wall + 60000 -- exactly 2x interval_ms
+      handle._tick()
+
+      assert.equals(3, #events)
+      assert.equals("session.resumed", events[2].kind)
+      assert.equals(60000, events[2].data.gap_ms)
+    end)
+
+    it("does not emit session.resumed when the wall clock moves backward (negative gap)", function()
+      local events, emit = new_emit()
+      local wall = 100000
+      handle = heartbeat.start({
+        emit = emit,
+        interval_ms = 30000,
+        get_now = function() return 0 end,
+        get_wall_ms = function() return wall end,
+        get_focused = function() return true end,
+        get_active_file = function() return nil end,
+      })
+
+      handle._tick()
+      wall = 0 -- backwards NTP correction
+      handle._tick()
+
+      assert.equals(2, #events)
+      assert.equals("session.heartbeat", events[1].kind)
+      assert.equals("session.heartbeat", events[2].kind)
+    end)
+
+    it("uses the production default_get_wall_ms (true wall clock) when omitted", function()
+      -- Only emit is required; the real vim.uv.gettimeofday()-backed default
+      -- must not error on a real headless nvim.
+      handle = heartbeat.start({ emit = function() end, interval_ms = 30000 })
+      assert.has_no.errors(function() handle._tick() end)
+      assert.has_no.errors(function() handle._tick() end)
+    end)
+  end)
 end)
