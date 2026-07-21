@@ -23,6 +23,9 @@ local selection_payloads = require("provenance.recorder.events.selection_payload
 local M = {}
 
 local AUGROUP_NAME = "ProvenanceSelection"
+-- See doc_wiring.lua's identical comment: concurrent sessions each call
+-- start() once, so the augroup name must be unique per instance.
+local instance_seq = 0
 
 --- UTF-16 column for `byte_col` bytes into `line` (clamped to line length).
 local function utf16_col(line, byte_col)
@@ -91,7 +94,8 @@ function M.start(opts)
   local doc_handle = opts.doc_wiring_handle
 
   local disposed = false
-  local augroup = vim.api.nvim_create_augroup(AUGROUP_NAME, { clear = true })
+  instance_seq = instance_seq + 1
+  local augroup = vim.api.nvim_create_augroup(AUGROUP_NAME .. ":" .. instance_seq, { clear = true })
 
   vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
     group = augroup,
@@ -131,9 +135,10 @@ function M.start(opts)
       return
     end
     disposed = true
-    pcall(vim.api.nvim_del_augroup_by_name, AUGROUP_NAME)
+    pcall(vim.api.nvim_del_augroup_by_id, augroup)
   end
 
+  handle._augroup_id = augroup
   return handle
 end
 

@@ -4,8 +4,6 @@
 local doc_wiring = require("provenance.recorder.wiring.doc_wiring")
 local sha256 = require("provenance.core.sha256")
 
-local AUGROUP_NAME = "ProvenanceDocWiring"
-
 --- Track everything created by a test so it can be torn down afterward:
 --- buffers wiped, temp dirs deleted, handle disposed (idempotent).
 local function new_scratch()
@@ -616,7 +614,9 @@ describe("doc_wiring.attach", function()
     handle.dispose()
     scratch.handle = nil -- already disposed; don't double-dispose in teardown
 
-    local ok, autocmds = pcall(vim.api.nvim_get_autocmds, { group = AUGROUP_NAME })
+    local augroup_id = handle._augroup_id
+    assert.is_number(augroup_id)
+    local ok, autocmds = pcall(vim.api.nvim_get_autocmds, { group = augroup_id })
     assert.is_true(not ok or #autocmds == 0)
 
     -- Further edits/saves must not emit anything new.
@@ -629,5 +629,37 @@ describe("doc_wiring.attach", function()
     assert.has_no.errors(function()
       handle.dispose()
     end)
+  end)
+
+  it("CONCURRENCY: two attach() calls in the same process do not clobber each other's autocmds", function()
+    local workspace_a = scratch.workspace()
+    local workspace_b = scratch.workspace()
+    local path_a = workspace_a .. "/a.txt"
+    local path_b = workspace_b .. "/b.txt"
+    scratch.write_file(path_a, "a\n")
+    scratch.write_file(path_b, "b\n")
+
+    local events_a, emit_a = new_emit()
+    local events_b, emit_b = new_emit()
+    local handle_a = doc_wiring.attach({ workspace = workspace_a, emit = emit_a })
+    local handle_b = doc_wiring.attach({ workspace = workspace_b, emit = emit_b })
+    scratch.handle = nil -- disposed manually below, not via scratch.teardown's single slot
+
+    assert.is_not.equals(handle_a._augroup_id, handle_b._augroup_id)
+
+    local buf_a = scratch.edit(path_a)
+    assert.is_not_nil(find(events_a, "doc.open"))
+    assert.is_nil(find(events_b, "doc.open"))
+
+    local buf_b = scratch.edit(path_b)
+    assert.is_not_nil(find(events_b, "doc.open"))
+
+    -- Disposing A must leave B's autocmds (and future events) intact.
+    handle_a.dispose()
+    local before_b = #events_b
+    vim.api.nvim_buf_set_lines(buf_b, 0, 1, false, { "changed" })
+    assert.is_true(#events_b > before_b)
+
+    handle_b.dispose()
   end)
 end)

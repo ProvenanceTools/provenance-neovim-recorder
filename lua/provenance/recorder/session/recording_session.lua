@@ -376,7 +376,7 @@ function M.start(opts)
   -- handle when the workspace is not a git repo; clock-skew + snapshot both
   -- run unref'd timers that never block headless exit.
   if enable_signals then
-    term = terminal_wiring.start({ emit = host.emit })
+    term = terminal_wiring.start({ emit = host.emit, workspace = workspace })
     git = git_wiring.start({ workspace = workspace, emit = host.emit, tagger = tagger })
     snap = snapshot_wiring.start({ emit = host.emit })
     -- ext.activate: polls for plugins that load AFTER start (baseline covered
@@ -406,6 +406,20 @@ function M.start(opts)
     -- Test/inspection seams onto the disk-full handler (Plan 8, Task 7).
     is_degraded = disk_full.is_degraded,
     _ring_snapshot = disk_full.ring_snapshot,
+    -- Test/inspection seam: doc_wiring's real (uniquely-suffixed) augroup id,
+    -- always present since doc_wiring runs unconditionally (unlike the
+    -- enable_signals-gated _signals table below). Lets tests target the
+    -- actual instance's augroup for leak checks instead of a fixed name that
+    -- may never have existed (see doc_wiring.lua's per-instance suffixing).
+    _doc_wiring_augroup_id = wiring._augroup_id,
+    -- Same seam for the external-change coordinator's augroup. Only non-nil
+    -- when enable_signals is true (coordinator is nil otherwise), same as
+    -- the coordinator itself in _signals below.
+    _external_change_augroup_id = coordinator and coordinator._augroup_id or nil,
+    -- Same seam for terminal_wiring's augroup. Only non-nil when
+    -- enable_signals is true (term is nil otherwise), same as the
+    -- coordinator seam above.
+    _terminal_augroup_id = term and term._augroup_id or nil,
   }
 
   -- TEST SEAM (Plan 9): expose the signal sub-handles so the integration test

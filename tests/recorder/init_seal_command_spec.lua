@@ -72,8 +72,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })
@@ -103,8 +103,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })
@@ -130,8 +130,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })
@@ -156,8 +156,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })
@@ -182,8 +182,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })
@@ -214,7 +214,7 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
+      resolve = function()
         return { status = "inactive", reason = "no_manifest_file" }
       end,
       start_recording = start_recording,
@@ -232,7 +232,19 @@ describe("recorder.setup :ProvenanceSeal live command", function()
     assert.is_not_nil(string.find(calls[1].message, "not an activated assignment workspace", 1, true))
   end)
 
-  it("round-trip active->inactive->active: :ProvenanceSeal always reflects the current workspace state (regression: stale live command must not survive deactivation)", function()
+  it("cd to an inactive directory does NOT stop or hide an already-active session: :ProvenanceSeal keeps sealing it (locked design: session lifetime is VimLeavePre/dispose, not cwd)", function()
+    -- Repurposed from a pre-registry regression test whose original premise
+    -- (a stale LIVE-vs-inert-stub command surviving deactivation) is
+    -- structurally impossible now that :ProvenanceSeal is registered ONCE,
+    -- unconditionally, and always queries the registry live (see init.lua).
+    -- The new invariant this test documents is the locked design decision
+    -- (docs/superpowers/specs/2026-07-20-nested-manifest-discovery-design.md):
+    -- a session is anchored to its assignment ROOT and lives until
+    -- VimLeavePre/dispose -- matching VS Code/JetBrains -- so a mere `:cd`
+    -- into a directory with no manifest of its own must NOT stop, hide, or
+    -- otherwise affect an already-active session elsewhere. This mirrors
+    -- init_controller_spec.lua's rewritten "workspace change" test, but
+    -- proves it specifically through the seal command's own behavior.
     local tmp_a = vim.fn.tempname()
     local tmp_b = vim.fn.tempname()
     vim.fn.mkdir(tmp_a, "p")
@@ -263,9 +275,9 @@ describe("recorder.setup :ProvenanceSeal live command", function()
       -- genuine re-resolve through the SAME resolve_and_apply path exercised
       -- by init_controller_spec.lua's workspace-change test. Active only for
       -- workspace A; every other cwd (workspace B) resolves inactive.
-      load_and_verify = function(workspace)
-        if workspace == resolved_a then
-          return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function(start_dir)
+        if start_dir == resolved_a then
+          return { status = "active", root = start_dir, manifest = { assignment_id = "hw3" } }
         end
         return { status = "inactive", reason = "no_manifest_file" }
       end,
@@ -274,7 +286,7 @@ describe("recorder.setup :ProvenanceSeal live command", function()
       end,
     })
 
-    -- Phase 1: ACTIVE (workspace A). :ProvenanceSeal is the LIVE command.
+    -- Phase 1: active workspace A. :ProvenanceSeal seals it.
     local calls, restore = capture_notify()
     restore_notify = restore
 
@@ -288,13 +300,10 @@ describe("recorder.setup :ProvenanceSeal live command", function()
     restore()
     restore_notify = nil
 
-    -- Phase 2: leave for workspace B (INACTIVE). Before the fix, the
-    -- INACTIVE branch's `vim.fn.exists(":ProvenanceSeal") == 0` guard saw
-    -- the live command left behind by phase 1 (exists() == 2) and skipped
-    -- re-registering the stub -- the stale live callback (closing over a
-    -- now-nil controller) stayed bound, so :ProvenanceSeal wrongly reported
-    -- "no active recording session to seal" instead of the inactive
-    -- guidance. Assert the inert stub message and that seal is NOT invoked.
+    -- Phase 2: cd to workspace B, which resolves INACTIVE (no manifest of
+    -- its own). A's session must stay registered and live -- :ProvenanceSeal
+    -- still seals it (still exactly one active session), NOT the "not an
+    -- activated assignment workspace" guidance, and NOT a no-op.
     vim.cmd("cd " .. vim.fn.fnameescape(tmp_b))
 
     calls, restore = capture_notify()
@@ -302,28 +311,14 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     vim.cmd("ProvenanceSeal")
 
-    assert.equals(1, seal_calls) -- unchanged: the fake controller was NOT sealed again
-    assert.equals(1, #calls)
-    assert.equals(vim.log.levels.INFO, calls[1].level)
-    assert.is_not_nil(string.find(calls[1].message, "not an activated assignment workspace", 1, true))
-    assert.is_nil(string.find(calls[1].message, "no active recording session", 1, true))
-
-    restore()
-    restore_notify = nil
-
-    -- Phase 3: back to ACTIVE (workspace A). The live command must be
-    -- restored (nvim_create_user_command overwrites the inert stub).
-    vim.cmd("cd " .. vim.fn.fnameescape(resolved_a))
-
-    calls, restore = capture_notify()
-    restore_notify = restore
-
-    vim.cmd("ProvenanceSeal")
-
-    assert.equals(2, seal_calls)
+    assert.equals(2, seal_calls) -- A was sealed AGAIN -- its session is still live
     assert.equals(1, #calls)
     assert.equals(vim.log.levels.INFO, calls[1].level)
     assert.is_not_nil(string.find(calls[1].message, "/tmp/hw3-bundle.zip", 1, true))
+    assert.is_nil(string.find(calls[1].message, "not an activated assignment workspace", 1, true))
+
+    restore()
+    restore_notify = nil
 
     vim.cmd("cd " .. vim.fn.fnameescape(orig_cwd))
   end)
@@ -338,8 +333,8 @@ describe("recorder.setup :ProvenanceSeal live command", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = make_start_recording(fake_controller),
     })
@@ -350,5 +345,184 @@ describe("recorder.setup :ProvenanceSeal live command", function()
     handle = nil
 
     assert.equals(0, vim.fn.exists(":ProvenanceSeal"))
+  end)
+end)
+
+describe("recorder.setup :ProvenanceSeal multi-session picker", function()
+  local recorder
+
+  before_each(function()
+    package.loaded["provenance.recorder"] = nil
+    package.loaded["provenance.recorder.init"] = nil
+    recorder = require("provenance.recorder")
+  end)
+
+  local handle
+  local restore_notify
+  local restore_select
+
+  after_each(function()
+    if handle then
+      handle.dispose()
+      handle = nil
+    end
+    if restore_notify then
+      restore_notify()
+      restore_notify = nil
+    end
+    if restore_select then
+      restore_select()
+      restore_select = nil
+    end
+    status.detach()
+  end)
+
+  it("exactly one active session: seals it directly, no picker shown", function()
+    local select_called = false
+    local orig_select = vim.ui.select
+    vim.ui.select = function(...)
+      select_called = true
+    end
+    restore_select = function()
+      vim.ui.select = orig_select
+    end
+
+    local seal_calls = 0
+    handle = recorder.setup({
+      workspace = "/tmp/ws-a",
+      resolve = function()
+        return { status = "active", root = "/tmp/cats", manifest = { assignment_id = "cats" } }
+      end,
+      start_recording = function()
+        return {
+          seal = function()
+            seal_calls = seal_calls + 1
+            return { kind = "ok", bundle_path = "/tmp/cats-bundle.zip", warnings = {} }
+          end,
+          stop = function() end,
+        }
+      end,
+    })
+
+    local calls, restore = capture_notify()
+    restore_notify = restore
+
+    vim.cmd("ProvenanceSeal")
+
+    assert.equals(1, seal_calls)
+    assert.is_false(select_called)
+    assert.equals(vim.log.levels.INFO, calls[1].level)
+  end)
+
+  it("two active sessions: vim.ui.select is invoked with both, choosing one seals only that one", function()
+    local seal_calls = { cats = 0, hog = 0 }
+    local controller_cats = {
+      seal = function()
+        seal_calls.cats = seal_calls.cats + 1
+        return { kind = "ok", bundle_path = "/tmp/cats-bundle.zip", warnings = {} }
+      end,
+      stop = function() end,
+    }
+    local controller_hog = {
+      seal = function()
+        seal_calls.hog = seal_calls.hog + 1
+        return { kind = "ok", bundle_path = "/tmp/hog-bundle.zip", warnings = {} }
+      end,
+      stop = function() end,
+    }
+
+    local resolve_call_count = 0
+    handle = recorder.setup({
+      workspace = "/tmp/ws-a",
+      resolve = function()
+        resolve_call_count = resolve_call_count + 1
+        if resolve_call_count == 1 then
+          return { status = "active", root = "/tmp/cats", manifest = { assignment_id = "cats" } }
+        end
+        return { status = "active", root = "/tmp/hog", manifest = { assignment_id = "hog" } }
+      end,
+      start_recording = function(args)
+        if args.workspace == "/tmp/cats" then
+          return controller_cats
+        end
+        return controller_hog
+      end,
+    })
+
+    -- Force a second resolve (a DirChanged re-fire) so the SECOND call to
+    -- resolve() above registers the "hog" root too, yielding two live
+    -- sessions in the registry (ensure_session is idempotent per-root, so
+    -- this cleanly adds hog alongside the already-registered cats).
+    vim.api.nvim_exec_autocmds("DirChanged", { group = "Provenance" })
+
+    local selected_items
+    local orig_select = vim.ui.select
+    vim.ui.select = function(items, select_opts, on_choice)
+      selected_items = items
+      -- Choose the second item ("hog").
+      on_choice(items[2].manifest.assignment_id == "hog" and items[2] or items[1])
+    end
+    restore_select = function()
+      vim.ui.select = orig_select
+    end
+
+    vim.cmd("ProvenanceSeal")
+
+    assert.is_not_nil(selected_items)
+    assert.equals(2, #selected_items)
+    assert.equals(1, seal_calls.hog)
+    assert.equals(0, seal_calls.cats)
+  end)
+
+  it(":ProvenanceSeal <assignment_id> seals the named session directly, skipping the picker", function()
+    local seal_calls = { cats = 0, hog = 0 }
+    local controller_cats = {
+      seal = function()
+        seal_calls.cats = seal_calls.cats + 1
+        return { kind = "ok", bundle_path = "/tmp/cats-bundle.zip", warnings = {} }
+      end,
+      stop = function() end,
+    }
+    local controller_hog = {
+      seal = function()
+        seal_calls.hog = seal_calls.hog + 1
+        return { kind = "ok", bundle_path = "/tmp/hog-bundle.zip", warnings = {} }
+      end,
+      stop = function() end,
+    }
+
+    local resolve_call_count = 0
+    handle = recorder.setup({
+      workspace = "/tmp/ws-a",
+      resolve = function()
+        resolve_call_count = resolve_call_count + 1
+        if resolve_call_count == 1 then
+          return { status = "active", root = "/tmp/cats", manifest = { assignment_id = "cats" } }
+        end
+        return { status = "active", root = "/tmp/hog", manifest = { assignment_id = "hog" } }
+      end,
+      start_recording = function(args)
+        if args.workspace == "/tmp/cats" then
+          return controller_cats
+        end
+        return controller_hog
+      end,
+    })
+    vim.api.nvim_exec_autocmds("DirChanged", { group = "Provenance" })
+
+    local select_called = false
+    local orig_select = vim.ui.select
+    vim.ui.select = function(...)
+      select_called = true
+    end
+    restore_select = function()
+      vim.ui.select = orig_select
+    end
+
+    vim.cmd("ProvenanceSeal hog")
+
+    assert.is_false(select_called)
+    assert.equals(1, seal_calls.hog)
+    assert.equals(0, seal_calls.cats)
   end)
 end)

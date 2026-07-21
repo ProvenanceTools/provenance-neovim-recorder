@@ -320,14 +320,16 @@ describe("external_change_coordinator", function()
       })
 
       -- Augroup exists while active.
+      local augroup_id = coordinator._augroup_id
+      assert.is_number(augroup_id)
       assert.has_no.errors(function()
-        vim.api.nvim_get_autocmds({ group = "ProvenanceExternalChange" })
+        vim.api.nvim_get_autocmds({ group = augroup_id })
       end)
 
       coordinator.dispose()
 
       assert.has_error(function()
-        vim.api.nvim_get_autocmds({ group = "ProvenanceExternalChange" })
+        vim.api.nvim_get_autocmds({ group = augroup_id })
       end)
     end)
 

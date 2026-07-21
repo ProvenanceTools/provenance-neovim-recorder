@@ -33,8 +33,11 @@ describe("recorder.setup", function()
   it("active loader: state becomes active and status segment is non-empty", function()
     handle = recorder.setup({
       workspace = "/tmp/ws",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws", manifest = { assignment_id = "hw3" } }
+      end,
+      start_recording = function()
+        return { seal = function() end, stop = function() end }
       end,
     })
 
@@ -46,8 +49,11 @@ describe("recorder.setup", function()
   it("active loader: the Provenance augroup exists with autocmds registered", function()
     handle = recorder.setup({
       workspace = "/tmp/ws",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws", manifest = { assignment_id = "hw3" } }
+      end,
+      start_recording = function()
+        return { seal = function() end, stop = function() end }
       end,
     })
 
@@ -58,7 +64,7 @@ describe("recorder.setup", function()
   it("inactive loader: status segment is empty", function()
     handle = recorder.setup({
       workspace = "/tmp/ws",
-      load_and_verify = function()
+      resolve = function()
         return { status = "inactive", reason = "no_manifest_file" }
       end,
     })
@@ -69,7 +75,7 @@ describe("recorder.setup", function()
   it("inactive loader: :ProvenanceSeal command is registered", function()
     handle = recorder.setup({
       workspace = "/tmp/ws",
-      load_and_verify = function()
+      resolve = function()
         return { status = "inactive", reason = "no_manifest_file" }
       end,
     })
@@ -80,7 +86,7 @@ describe("recorder.setup", function()
   it("inactive loader: invoking :ProvenanceSeal records nothing and does not error", function()
     handle = recorder.setup({
       workspace = "/tmp/ws",
-      load_and_verify = function()
+      resolve = function()
         return { status = "inactive", reason = "no_manifest_file" }
       end,
     })
@@ -94,8 +100,11 @@ describe("recorder.setup", function()
   it("dispose(): removes the Provenance augroup", function()
     handle = recorder.setup({
       workspace = "/tmp/ws",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws", manifest = { assignment_id = "hw3" } }
+      end,
+      start_recording = function()
+        return { seal = function() end, stop = function() end }
       end,
     })
 
@@ -162,8 +171,11 @@ describe("recorder.setup", function()
   it("dispose(): detaches status so segment() goes back to empty", function()
     handle = recorder.setup({
       workspace = "/tmp/ws",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws", manifest = { assignment_id = "hw3" } }
+      end,
+      start_recording = function()
+        return { seal = function() end, stop = function() end }
       end,
     })
     assert.is_not.equals("", status.segment())

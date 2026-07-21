@@ -41,60 +41,114 @@ local function capture_text(lines)
   return table.concat(lines, "\n")
 end
 
---- M.attach(opts) -> handle
----
---- opts:
----   on_intercept(text, at) — called ONCE per paste (see phase handling
----     below), wrapped in pcall so an error here can never break the user's
----     paste.
----   get_now() -> number — injected clock.
----
---- Returns a handle with handle.dispose() that restores the original
---- `vim.paste`. Idempotent.
-function M.attach(opts)
-  opts = opts or {}
-  local on_intercept = opts.on_intercept
-  local get_now = opts.get_now
+-------------------------------------------------------------------------
+-- Ref-counted singleton wrap (concurrency): `vim.paste` is a single global
+-- function slot, not an event-dispatch surface like an autocmd group. N
+-- concurrent sessions must NOT each independently wrap it (nested wraps
+-- unwind incorrectly on non-LIFO dispose -- see this module's docstring in
+-- the implementation plan). Instead, the FIRST attach() installs the one
+-- real wrap and captures the one true `original`; every attach()/dispose()
+-- after that only registers/unregisters a listener in `listeners`. The true
+-- original is restored only when the listener list becomes empty, so
+-- dispose() order never matters.
+-------------------------------------------------------------------------
 
-  local original = vim.paste
-  local disposed = false
+local listeners = {} -- list of { on_intercept, get_now }
+local true_original = nil -- vim.paste as it was before the FIRST attach()
+local installed = false
 
-  --- @param lines string[]
-  --- @param phase integer  -1 (whole paste) | 1 (start) | 2 (continue) | 3 (end)
-  vim.paste = function(lines, phase)
-    -- Notify on the START of a paste only (-1 = whole paste in one call, 1 =
-    -- start of a streamed paste) so a chunked paste yields exactly one
-    -- intercept, not one per phase.
-    if phase == -1 or phase == 1 then
-      local text = capture_text(lines)
-      if on_intercept then
-        pcall(on_intercept, text, get_now and get_now() or nil)
+local function broadcast(lines, phase)
+  if phase == -1 or phase == 1 then
+    local text = capture_text(lines)
+    -- Snapshot the listener list: a listener's on_intercept could (in
+    -- principle) dispose itself or another instance re-entrantly; iterate
+    -- over a copy so that never corrupts this loop.
+    local snapshot = {}
+    for i, l in ipairs(listeners) do
+      snapshot[i] = l
+    end
+    for _, l in ipairs(snapshot) do
+      if l.on_intercept then
+        local at = l.get_now and l.get_now() or nil
+        pcall(l.on_intercept, text, at)
       end
     end
+  end
+end
 
-    -- ALWAYS delegate so the paste actually applies, including every
-    -- streamed phase. Guard the unusual case of no prior vim.paste (Neovim
-    -- always sets a default, but don't hard-crash if something removed it).
-    if original then
-      return original(lines, phase)
+local function install()
+  if installed then
+    return
+  end
+  installed = true
+  true_original = vim.paste
+  vim.paste = function(lines, phase)
+    -- Capture the shared `true_original` upvalue into a call-local before
+    -- broadcasting: a listener's on_intercept can synchronously dispose()
+    -- another (or itself), and if that drops the listener count to zero
+    -- mid-broadcast, uninstall_if_empty() clears the module-level
+    -- `true_original` to nil out from under this still-executing call. Using
+    -- the local ensures the REAL underlying vim.paste is still delegated to
+    -- for THIS invocation, even though the module has already "uninstalled".
+    local original_at_this_call = true_original
+    pcall(broadcast, lines, phase)
+    if original_at_this_call then
+      return original_at_this_call(lines, phase)
     end
     return true
   end
+end
 
+local function uninstall_if_empty()
+  if installed and #listeners == 0 then
+    vim.paste = true_original
+    installed = false
+    true_original = nil
+  end
+end
+
+--- M.attach(opts) -> handle
+---
+--- opts:
+---   on_intercept(text, at) — called ONCE per paste (whole or start-of-
+---     streamed), wrapped in pcall so an error here can never break the
+---     user's paste, and can never break another concurrent listener either.
+---   get_now() -> number — injected clock.
+---
+--- Returns a handle with handle.dispose(), idempotent, safe to call in any
+--- order relative to other concurrently-attached instances' dispose().
+function M.attach(opts)
+  opts = opts or {}
+
+  install()
+
+  local entry = { on_intercept = opts.on_intercept, get_now = opts.get_now }
+  table.insert(listeners, entry)
+
+  local disposed = false
   local handle = {}
 
-  --- Restores `vim.paste` to exactly the function captured at attach()
-  --- time. Idempotent — a second call is a harmless no-op, guarded by the
-  --- `disposed` flag (mirrors doc_wiring.lua's dispose pattern).
   function handle.dispose()
     if disposed then
       return
     end
     disposed = true
-    vim.paste = original
+    for i, l in ipairs(listeners) do
+      if l == entry then
+        table.remove(listeners, i)
+        break
+      end
+    end
+    uninstall_if_empty()
   end
 
   return handle
+end
+
+--- Test-only introspection: how many live (non-disposed) registrations
+--- exist right now. Not part of the module's production API.
+function M._listener_count()
+  return #listeners
 end
 
 return M

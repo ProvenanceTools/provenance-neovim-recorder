@@ -54,8 +54,8 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = manifest }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = manifest }
       end,
       start_recording = start_recording,
     })
@@ -71,8 +71,8 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = start_recording,
     })
@@ -106,8 +106,8 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = start_recording,
     })
@@ -133,7 +133,7 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
+      resolve = function()
         return { status = "inactive", reason = "no_manifest_file" }
       end,
       start_recording = start_recording,
@@ -149,8 +149,8 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       workspace = "/tmp/ws-a",
-      load_and_verify = function()
-        return { status = "active", manifest = { assignment_id = "hw3" } }
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
       end,
       start_recording = start_recording,
     })
@@ -167,7 +167,17 @@ describe("recorder.setup controller lifecycle", function()
     assert.equals(0, #first_controller.stop_calls)
   end)
 
-  it("workspace change: stops the old controller and starts a new one for the new workspace", function()
+  it("workspace change: the OLD session keeps running (registry parity, locked design) AND a new session starts for the new cwd", function()
+    -- Locked design decision (docs/superpowers/specs/2026-07-20-nested-manifest-discovery-design.md):
+    -- a session is anchored to its assignment ROOT and lives until
+    -- VimLeavePre/dispose, matching VS Code/JetBrains (session lifetime is
+    -- the editor process, not the active folder/cwd) -- this is required so
+    -- a student who keeps editing assignment A's buffers after `:cd`-ing
+    -- elsewhere is still recorded. cwd is only ever a FALLBACK anchor
+    -- (BufEnter/BufReadPost/BufNewFile is primary); a mere `:cd` must never
+    -- stop a still-live session for a DIFFERENT root. Privacy is unaffected:
+    -- session A only ever records files under A's own root regardless of
+    -- what cwd currently is.
     local start_recording, calls = make_start_recording_spy()
 
     local tmp_a = vim.fn.tempname()
@@ -183,9 +193,9 @@ describe("recorder.setup controller lifecycle", function()
 
     handle = recorder.setup({
       -- No workspace override: resolve_and_apply falls back to
-      -- vim.fn.getcwd(), so a real :cd triggers a genuine workspace change.
-      load_and_verify = function(workspace)
-        return { status = "active", manifest = { assignment_id = "hw3", workspace = workspace } }
+      -- vim.fn.getcwd(), so a real :cd triggers a genuine cwd re-resolve.
+      resolve = function(start_dir)
+        return { status = "active", root = start_dir, manifest = { assignment_id = "hw3", workspace = start_dir } }
       end,
       start_recording = start_recording,
     })
@@ -198,10 +208,196 @@ describe("recorder.setup controller lifecycle", function()
     vim.cmd("cd " .. vim.fn.fnameescape(tmp_b))
     local resolved_b = vim.fn.getcwd()
 
+    -- A new session for B is started...
     assert.equals(2, #calls)
     assert.equals(resolved_b, calls[2].args.workspace)
+    local controller_b = calls[2].controller
+
+    -- ...and A's session is NOT stopped just because cwd moved away from it.
+    assert.equals(0, #controller_a.stop_calls)
+    assert.equals(0, #controller_b.stop_calls)
+
+    -- Both remain live until VimLeavePre/dispose stops every session.
+    vim.api.nvim_exec_autocmds("VimLeavePre", { group = "Provenance" })
     assert.equals(1, #controller_a.stop_calls)
+    assert.equals(1, #controller_b.stop_calls)
 
     vim.cmd("cd " .. vim.fn.fnameescape(orig_cwd))
+  end)
+end)
+
+describe("recorder.setup buffer-anchored discovery (BufEnter/BufReadPost/BufNewFile)", function()
+  local recorder
+
+  before_each(function()
+    package.loaded["provenance.recorder"] = nil
+    package.loaded["provenance.recorder.init"] = nil
+    recorder = require("provenance.recorder")
+  end)
+
+  local handle
+  local bufs
+
+  --- nvim_buf_get_name performs realpath-style resolution of existing path
+  --- components (e.g. macOS's /tmp -> /private/tmp), so a directory built
+  --- from vim.fn.tempname() must be resolved the same way before comparing
+  --- it against vim.fs.dirname(nvim_buf_get_name(buf)) inside a fake
+  --- resolve() -- otherwise the comparison spuriously fails on any platform
+  --- where tempdir is itself a symlink. Mirrors doc_wiring.lua's
+  --- resolve_dir/try_realpath and this file's own "getcwd() may resolve
+  --- symlinks" comment on the workspace-change test above.
+  local function realpath(dir)
+    local real = vim.uv.fs_realpath(dir)
+    return real and vim.fs.normalize(real) or dir
+  end
+
+  after_each(function()
+    if handle then
+      handle.dispose()
+      handle = nil
+    end
+    for _, b in ipairs(bufs or {}) do
+      if vim.api.nvim_buf_is_valid(b) then
+        pcall(vim.cmd, "bwipeout! " .. b)
+      end
+    end
+    bufs = {}
+    status.detach()
+  end)
+
+  it("opening a file resolves its OWN root, independent of cwd", function()
+    bufs = {}
+    local start_recording, calls = make_start_recording_spy()
+    local far_dir = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(far_dir, "p")
+    far_dir = realpath(far_dir) -- must resolve AFTER mkdir (fs_realpath requires the path to exist)
+    local file_path = far_dir .. "/cats.py"
+    local f = assert(io.open(file_path, "w"))
+    f:write("print(1)\n")
+    f:close()
+
+    handle = recorder.setup({
+      -- Deliberately a DIFFERENT, inactive cwd anchor, proving the buffer
+      -- path (not cwd) drives this activation.
+      workspace = "/tmp/unrelated-cwd",
+      resolve = function(start_dir)
+        if start_dir == far_dir then
+          return { status = "active", root = far_dir, manifest = { assignment_id = "cats" } }
+        end
+        return { status = "inactive", reason = "no_manifest_file" }
+      end,
+      start_recording = start_recording,
+    })
+
+    assert.equals(0, #calls) -- cwd anchor is inactive; nothing started yet
+
+    vim.cmd("edit " .. vim.fn.fnameescape(file_path))
+    table.insert(bufs, vim.api.nvim_get_current_buf())
+
+    assert.equals(1, #calls)
+    assert.equals(far_dir, calls[1].args.workspace)
+
+    pcall(vim.fn.delete, far_dir, "rf")
+  end)
+
+  it("CONCURRENCY: two buffers under two different roots produce two live sessions", function()
+    bufs = {}
+    local start_recording, calls = make_start_recording_spy()
+    local dir_cats = vim.fs.normalize(vim.fn.tempname())
+    local dir_hog = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(dir_cats, "p")
+    vim.fn.mkdir(dir_hog, "p")
+    dir_cats = realpath(dir_cats) -- must resolve AFTER mkdir (fs_realpath requires the path to exist)
+    dir_hog = realpath(dir_hog)
+    local file_cats = dir_cats .. "/cats.py"
+    local file_hog = dir_hog .. "/hog.py"
+    for _, p in ipairs({ file_cats, file_hog }) do
+      local f = assert(io.open(p, "w"))
+      f:write("x = 1\n")
+      f:close()
+    end
+
+    handle = recorder.setup({
+      workspace = "/tmp/unrelated-cwd",
+      resolve = function(start_dir)
+        if start_dir == dir_cats then
+          return { status = "active", root = dir_cats, manifest = { assignment_id = "cats" } }
+        elseif start_dir == dir_hog then
+          return { status = "active", root = dir_hog, manifest = { assignment_id = "hog" } }
+        end
+        return { status = "inactive", reason = "no_manifest_file" }
+      end,
+      start_recording = start_recording,
+    })
+
+    vim.cmd("edit " .. vim.fn.fnameescape(file_cats))
+    table.insert(bufs, vim.api.nvim_get_current_buf())
+    vim.cmd("edit " .. vim.fn.fnameescape(file_hog))
+    table.insert(bufs, vim.api.nvim_get_current_buf())
+
+    assert.equals(2, #calls)
+    assert.equals(dir_cats, calls[1].args.workspace)
+    assert.equals(dir_hog, calls[2].args.workspace)
+    assert.equals(0, #calls[1].controller.stop_calls)
+    assert.equals(0, #calls[2].controller.stop_calls)
+
+    -- VimLeavePre stops BOTH sessions.
+    vim.api.nvim_exec_autocmds("VimLeavePre", { group = "Provenance" })
+    assert.equals(1, #calls[1].controller.stop_calls)
+    assert.equals(1, #calls[2].controller.stop_calls)
+
+    pcall(vim.fn.delete, dir_cats, "rf")
+    pcall(vim.fn.delete, dir_hog, "rf")
+  end)
+
+  it("re-entering the SAME buffer's root does not double-start its session", function()
+    bufs = {}
+    local start_recording, calls = make_start_recording_spy()
+    local dir = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(dir, "p")
+    dir = realpath(dir) -- must resolve AFTER mkdir (fs_realpath requires the path to exist)
+    local file_path = dir .. "/a.py"
+    local f = assert(io.open(file_path, "w"))
+    f:write("x = 1\n")
+    f:close()
+
+    handle = recorder.setup({
+      workspace = "/tmp/unrelated-cwd",
+      resolve = function(start_dir)
+        if start_dir == dir then
+          return { status = "active", root = dir, manifest = { assignment_id = "a" } }
+        end
+        return { status = "inactive", reason = "no_manifest_file" }
+      end,
+      start_recording = start_recording,
+    })
+
+    vim.cmd("edit " .. vim.fn.fnameescape(file_path))
+    table.insert(bufs, vim.api.nvim_get_current_buf())
+    assert.equals(1, #calls)
+
+    -- Re-fire BufEnter for the same buffer (e.g. switching away and back).
+    vim.api.nvim_exec_autocmds("BufEnter", { buffer = vim.api.nvim_get_current_buf() })
+    assert.equals(1, #calls)
+
+    pcall(vim.fn.delete, dir, "rf")
+  end)
+
+  it("REGRESSION: cd <assignment> && nvim (no file arg) still activates via the cwd fallback", function()
+    local start_recording, calls = make_start_recording_spy()
+
+    handle = recorder.setup({
+      workspace = "/tmp/ws-a",
+      resolve = function(start_dir)
+        if start_dir == "/tmp/ws-a" then
+          return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
+        end
+        return { status = "inactive", reason = "no_manifest_file" }
+      end,
+      start_recording = start_recording,
+    })
+
+    assert.equals(1, #calls)
+    assert.equals("/tmp/ws-a", calls[1].args.workspace)
   end)
 end)
