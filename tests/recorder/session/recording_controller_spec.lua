@@ -204,7 +204,8 @@ describe("recording_controller.start (full-signals capstone)", function()
     assert.is_true(chain.ok)
 
     -- ---- Teardown: no leaked augroups from any signal ----
-    assert.is_true(group_gone("ProvenanceDocWiring"), "ProvenanceDocWiring augroup leaked")
+    assert.is_number(scratch.session._doc_wiring_augroup_id)
+    assert.is_true(group_gone(scratch.session._doc_wiring_augroup_id), "ProvenanceDocWiring augroup leaked")
     assert.is_true(group_gone("ProvenanceTerminal"), "ProvenanceTerminal augroup leaked")
     assert.is_true(group_gone("ProvenanceExternalChange"), "ProvenanceExternalChange augroup leaked")
 

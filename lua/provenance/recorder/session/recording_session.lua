@@ -406,6 +406,12 @@ function M.start(opts)
     -- Test/inspection seams onto the disk-full handler (Plan 8, Task 7).
     is_degraded = disk_full.is_degraded,
     _ring_snapshot = disk_full.ring_snapshot,
+    -- Test/inspection seam: doc_wiring's real (uniquely-suffixed) augroup id,
+    -- always present since doc_wiring runs unconditionally (unlike the
+    -- enable_signals-gated _signals table below). Lets tests target the
+    -- actual instance's augroup for leak checks instead of a fixed name that
+    -- may never have existed (see doc_wiring.lua's per-instance suffixing).
+    _doc_wiring_augroup_id = wiring._augroup_id,
   }
 
   -- TEST SEAM (Plan 9): expose the signal sub-handles so the integration test
