@@ -388,7 +388,27 @@ describe("paste_assembly.attach", function()
     local assembly_b = paste_assembly.attach({ emit = emit_b, doc_wiring_handle = doc_b })
 
     local buf_b = scratch.edit(path_b)
-    local clip = string.rep("X", 40) -- >= 30 chars: paste_likely shape
+    -- `marker` is embedded inside `clip` as an exact substring. `clip` is
+    -- >=30 chars (so B's OWN session correctly classifies its own paste as
+    -- paste_likely by shape, matching realistic behavior); `marker` alone
+    -- is well under 30 chars and single-line, so paste_classifier.
+    -- classify_change on `marker` ALONE (see paste_classifier.lua rule 1/2)
+    -- returns "typed" -- shape can never explain a `paste` verdict for A's
+    -- edit below. The ONLY way A's short edit could resolve to `paste`
+    -- is CONTENT-matching (paste_correlator.matches: equality-or-
+    -- substring, see paste_correlator.lua) a polluted `pending` that
+    -- session B's intercept has no business setting on session A's
+    -- correlator. That is exactly the bug the ownership gate in
+    -- paste_assembly.lua's on_intercept closure fixes: without it, EVERY
+    -- session's correlator receives EVERY intercepted paste (paste_
+    -- intercept.lua's `broadcast` fans out to all listeners), so B's
+    -- paste would set A's `pending = { text = clip, at = ... }` too.
+    local marker = "SESSION_B_MARKER"
+    assert.is_true(#marker < 30)
+    local clip = string.rep("Q", 10) .. marker .. string.rep("Q", 10)
+    assert.is_true(#clip >= 30)
+    assert.is_not_nil(clip:find(marker, 1, true))
+
     vim.fn.setreg("+", clip)
     vim.paste({ clip }, -1)
 
@@ -396,13 +416,28 @@ describe("paste_assembly.attach", function()
     local paste_ev_b = find(events_b, "paste")
     assert.is_not_nil(paste_ev_b)
 
-    -- Session A never sees a paste event, and its own next typed edit (in
-    -- its OWN buffer) is not misattributed as a confirmed paste just
-    -- because A's correlator saw B's clipboard capture.
+    -- Session A never sees a paste event from B's intercept.
     assert.is_nil(find(events_a, "paste"))
 
+    -- Session A's own next edit: a SHORT (well under 30 chars), single-
+    -- line, single-delta INSERTION (via nvim_buf_set_text, not
+    -- nvim_buf_set_lines -- replacing the buffer's only line with
+    -- nvim_buf_set_lines hits doc_wiring's whole-line-op branch, which
+    -- appends the buffer's trailing EOL onto the reported inserted text;
+    -- that extra "\n" would make `marker` fail its substring match against
+    -- `clip` regardless of the gate, silently un-discriminating the test
+    -- again) whose text is an exact substring of B's clip. Shape alone
+    -- (paste_classifier) calls this "typed" -- it is neither long enough
+    -- (rule 1) nor multi-delta-with-newline (rule 2). If the ownership
+    -- gate is missing, B's clip is still sitting in A's correlator's
+    -- `pending` and this substring-matching insert wrongly CONFIRMS as a
+    -- `paste` event (paste_correlator.on_doc_change's `confirmed` branch).
+    -- With the gate present, A's `pending` was never polluted, so this
+    -- resolves correctly to `doc.change`/`source = "typed"`.
     local buf_a = scratch.edit(path_a)
-    vim.api.nvim_buf_set_lines(buf_a, 0, 1, false, { "short" })
+    vim.api.nvim_buf_set_text(buf_a, 0, 0, 0, 0, { marker })
+
+    assert.is_nil(find(events_a, "paste"))
     local change_ev_a = find(events_a, "doc.change")
     assert.is_not_nil(change_ev_a)
     assert.equals("typed", change_ev_a.data.source)
