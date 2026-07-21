@@ -83,9 +83,17 @@ local function install()
   installed = true
   true_original = vim.paste
   vim.paste = function(lines, phase)
+    -- Capture the shared `true_original` upvalue into a call-local before
+    -- broadcasting: a listener's on_intercept can synchronously dispose()
+    -- another (or itself), and if that drops the listener count to zero
+    -- mid-broadcast, uninstall_if_empty() clears the module-level
+    -- `true_original` to nil out from under this still-executing call. Using
+    -- the local ensures the REAL underlying vim.paste is still delegated to
+    -- for THIS invocation, even though the module has already "uninstalled".
+    local original_at_this_call = true_original
     pcall(broadcast, lines, phase)
-    if true_original then
-      return true_original(lines, phase)
+    if original_at_this_call then
+      return original_at_this_call(lines, phase)
     end
     return true
   end

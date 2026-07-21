@@ -253,5 +253,50 @@ describe("paste_intercept.attach", function()
       handle_a.dispose()
       handle_b.dispose()
     end)
+
+    it("REGRESSION: on_intercept disposing all listeners mid-broadcast still delegates the paste to the true original", function()
+      local orig = vim.paste
+      local handle_a, handle_b
+      local calls_a, on_intercept_a = new_capture()
+
+      handle_a = paste_intercept.attach({
+        on_intercept = function(text, at)
+          on_intercept_a(text, at)
+          -- Synchronously drop the listener count to zero WHILE this
+          -- broadcast (and thus the wrapper closure's still-executing
+          -- call) is in flight. This is the mid-broadcast dispose hazard:
+          -- it triggers uninstall_if_empty(), which restores vim.paste
+          -- and clears the shared `true_original` upvalue, all before
+          -- control returns to the wrapper closure that is still running.
+          handle_b.dispose()
+          handle_a.dispose()
+        end,
+        get_now = function() return 0 end,
+      })
+      handle_b = paste_intercept.attach({
+        on_intercept = function() end,
+        get_now = function() return 0 end,
+      })
+
+      vim.fn.setreg("+", "mid broadcast dispose")
+      local buf = vim.api.nvim_create_buf(false, true)
+      table.insert(scratch.bufs, buf)
+      vim.api.nvim_set_current_buf(buf)
+
+      vim.paste({ "mid broadcast dispose" }, -1)
+
+      assert.equals(1, #calls_a)
+      assert.equals(0, paste_intercept._listener_count())
+      assert.equals(orig, vim.paste)
+
+      -- The critical assertion: even though listeners dropped to zero
+      -- mid-broadcast (uninstalling and clearing the shared true_original
+      -- upvalue out from under the still-executing wrapper), THIS
+      -- invocation's paste must still have been delegated to the real
+      -- underlying vim.paste and applied to the buffer -- not silently
+      -- dropped.
+      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      assert.equals("mid broadcast dispose", table.concat(lines, "\n"))
+    end)
   end)
 end)
