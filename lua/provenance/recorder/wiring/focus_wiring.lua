@@ -13,6 +13,9 @@ local focus_payloads = require("provenance.recorder.events.focus_payloads")
 local M = {}
 
 local AUGROUP_NAME = "ProvenanceFocus"
+-- See doc_wiring.lua's identical comment: concurrent sessions each call
+-- start() once, so the augroup name must be unique per instance.
+local instance_seq = 0
 
 --- start(opts) -> handle
 ---
@@ -32,7 +35,8 @@ function M.start(opts)
   local disposed = false
   local focused = true
 
-  local augroup = vim.api.nvim_create_augroup(AUGROUP_NAME, { clear = true })
+  instance_seq = instance_seq + 1
+  local augroup = vim.api.nvim_create_augroup(AUGROUP_NAME .. ":" .. instance_seq, { clear = true })
 
   local function set_focused(next_state)
     if disposed then
@@ -73,9 +77,10 @@ function M.start(opts)
       return
     end
     disposed = true
-    pcall(vim.api.nvim_del_augroup_by_name, AUGROUP_NAME)
+    pcall(vim.api.nvim_del_augroup_by_id, augroup)
   end
 
+  handle._augroup_id = augroup
   return handle
 end
 
