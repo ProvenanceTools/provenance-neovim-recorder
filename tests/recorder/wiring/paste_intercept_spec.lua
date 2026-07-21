@@ -162,4 +162,96 @@ describe("paste_intercept.attach", function()
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     assert.equals("still applies", table.concat(lines, "\n"))
   end)
+
+  describe("CONCURRENCY: two concurrent attach() calls", function()
+    it("both listeners fire for a single paste", function()
+      local calls_a, on_intercept_a = new_capture()
+      local calls_b, on_intercept_b = new_capture()
+
+      local handle_a = paste_intercept.attach({ on_intercept = on_intercept_a, get_now = function() return 1 end })
+      local handle_b = paste_intercept.attach({ on_intercept = on_intercept_b, get_now = function() return 2 end })
+
+      vim.fn.setreg("+", "shared paste")
+      local buf = vim.api.nvim_create_buf(false, true)
+      table.insert(scratch.bufs, buf)
+      vim.api.nvim_set_current_buf(buf)
+
+      vim.paste({ "shared paste" }, -1)
+
+      assert.equals(1, #calls_a)
+      assert.equals(1, #calls_b)
+      assert.equals("shared paste", calls_a[1].text)
+      assert.equals("shared paste", calls_b[1].text)
+
+      handle_a.dispose()
+      handle_b.dispose()
+    end)
+
+    it("disposing in ATTACH order (non-LIFO) does not silently reactivate the first instance", function()
+      local calls_a, on_intercept_a = new_capture()
+      local calls_b, on_intercept_b = new_capture()
+
+      local orig = vim.paste
+      local handle_a = paste_intercept.attach({ on_intercept = on_intercept_a, get_now = function() return 0 end })
+      local handle_b = paste_intercept.attach({ on_intercept = on_intercept_b, get_now = function() return 0 end })
+
+      -- Dispose A FIRST (attach order, the pathological non-LIFO case).
+      handle_a.dispose()
+      assert.equals(1, paste_intercept._listener_count())
+      -- vim.paste must still be wrapped (B is still registered), not yet
+      -- restored to the true original.
+      assert.is_not.equals(orig, vim.paste)
+
+      vim.fn.setreg("+", "after a disposed")
+      local buf = vim.api.nvim_create_buf(false, true)
+      table.insert(scratch.bufs, buf)
+      vim.api.nvim_set_current_buf(buf)
+      vim.paste({ "after a disposed" }, -1)
+
+      -- A must NOT have been reactivated; only B fires.
+      assert.equals(0, #calls_a)
+      assert.equals(1, #calls_b)
+
+      handle_b.dispose()
+      assert.equals(0, paste_intercept._listener_count())
+      assert.equals(orig, vim.paste)
+    end)
+
+    it("disposing in REVERSE (LIFO) order also fully restores the true original", function()
+      local calls_a, on_intercept_a = new_capture()
+      local calls_b, on_intercept_b = new_capture()
+
+      local orig = vim.paste
+      local handle_a = paste_intercept.attach({ on_intercept = on_intercept_a, get_now = function() return 0 end })
+      local handle_b = paste_intercept.attach({ on_intercept = on_intercept_b, get_now = function() return 0 end })
+
+      handle_b.dispose()
+      handle_a.dispose()
+
+      assert.equals(0, paste_intercept._listener_count())
+      assert.equals(orig, vim.paste)
+    end)
+
+    it("an error in one listener's on_intercept does not prevent the other from firing", function()
+      local calls_b, on_intercept_b = new_capture()
+      local handle_a = paste_intercept.attach({
+        on_intercept = function() error("boom") end,
+        get_now = function() return 0 end,
+      })
+      local handle_b = paste_intercept.attach({ on_intercept = on_intercept_b, get_now = function() return 0 end })
+
+      vim.fn.setreg("+", "still works")
+      local buf = vim.api.nvim_create_buf(false, true)
+      table.insert(scratch.bufs, buf)
+      vim.api.nvim_set_current_buf(buf)
+
+      assert.has_no.errors(function()
+        vim.paste({ "still works" }, -1)
+      end)
+      assert.equals(1, #calls_b)
+
+      handle_a.dispose()
+      handle_b.dispose()
+    end)
+  end)
 end)
