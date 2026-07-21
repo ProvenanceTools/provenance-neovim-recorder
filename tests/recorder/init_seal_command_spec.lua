@@ -347,3 +347,182 @@ describe("recorder.setup :ProvenanceSeal live command", function()
     assert.equals(0, vim.fn.exists(":ProvenanceSeal"))
   end)
 end)
+
+describe("recorder.setup :ProvenanceSeal multi-session picker", function()
+  local recorder
+
+  before_each(function()
+    package.loaded["provenance.recorder"] = nil
+    package.loaded["provenance.recorder.init"] = nil
+    recorder = require("provenance.recorder")
+  end)
+
+  local handle
+  local restore_notify
+  local restore_select
+
+  after_each(function()
+    if handle then
+      handle.dispose()
+      handle = nil
+    end
+    if restore_notify then
+      restore_notify()
+      restore_notify = nil
+    end
+    if restore_select then
+      restore_select()
+      restore_select = nil
+    end
+    status.detach()
+  end)
+
+  it("exactly one active session: seals it directly, no picker shown", function()
+    local select_called = false
+    local orig_select = vim.ui.select
+    vim.ui.select = function(...)
+      select_called = true
+    end
+    restore_select = function()
+      vim.ui.select = orig_select
+    end
+
+    local seal_calls = 0
+    handle = recorder.setup({
+      workspace = "/tmp/ws-a",
+      resolve = function()
+        return { status = "active", root = "/tmp/cats", manifest = { assignment_id = "cats" } }
+      end,
+      start_recording = function()
+        return {
+          seal = function()
+            seal_calls = seal_calls + 1
+            return { kind = "ok", bundle_path = "/tmp/cats-bundle.zip", warnings = {} }
+          end,
+          stop = function() end,
+        }
+      end,
+    })
+
+    local calls, restore = capture_notify()
+    restore_notify = restore
+
+    vim.cmd("ProvenanceSeal")
+
+    assert.equals(1, seal_calls)
+    assert.is_false(select_called)
+    assert.equals(vim.log.levels.INFO, calls[1].level)
+  end)
+
+  it("two active sessions: vim.ui.select is invoked with both, choosing one seals only that one", function()
+    local seal_calls = { cats = 0, hog = 0 }
+    local controller_cats = {
+      seal = function()
+        seal_calls.cats = seal_calls.cats + 1
+        return { kind = "ok", bundle_path = "/tmp/cats-bundle.zip", warnings = {} }
+      end,
+      stop = function() end,
+    }
+    local controller_hog = {
+      seal = function()
+        seal_calls.hog = seal_calls.hog + 1
+        return { kind = "ok", bundle_path = "/tmp/hog-bundle.zip", warnings = {} }
+      end,
+      stop = function() end,
+    }
+
+    local resolve_call_count = 0
+    handle = recorder.setup({
+      workspace = "/tmp/ws-a",
+      resolve = function()
+        resolve_call_count = resolve_call_count + 1
+        if resolve_call_count == 1 then
+          return { status = "active", root = "/tmp/cats", manifest = { assignment_id = "cats" } }
+        end
+        return { status = "active", root = "/tmp/hog", manifest = { assignment_id = "hog" } }
+      end,
+      start_recording = function(args)
+        if args.workspace == "/tmp/cats" then
+          return controller_cats
+        end
+        return controller_hog
+      end,
+    })
+
+    -- Force a second resolve (a DirChanged re-fire) so the SECOND call to
+    -- resolve() above registers the "hog" root too, yielding two live
+    -- sessions in the registry (ensure_session is idempotent per-root, so
+    -- this cleanly adds hog alongside the already-registered cats).
+    vim.api.nvim_exec_autocmds("DirChanged", { group = "Provenance" })
+
+    local selected_items
+    local orig_select = vim.ui.select
+    vim.ui.select = function(items, select_opts, on_choice)
+      selected_items = items
+      -- Choose the second item ("hog").
+      on_choice(items[2].manifest.assignment_id == "hog" and items[2] or items[1])
+    end
+    restore_select = function()
+      vim.ui.select = orig_select
+    end
+
+    vim.cmd("ProvenanceSeal")
+
+    assert.is_not_nil(selected_items)
+    assert.equals(2, #selected_items)
+    assert.equals(1, seal_calls.hog)
+    assert.equals(0, seal_calls.cats)
+  end)
+
+  it(":ProvenanceSeal <assignment_id> seals the named session directly, skipping the picker", function()
+    local seal_calls = { cats = 0, hog = 0 }
+    local controller_cats = {
+      seal = function()
+        seal_calls.cats = seal_calls.cats + 1
+        return { kind = "ok", bundle_path = "/tmp/cats-bundle.zip", warnings = {} }
+      end,
+      stop = function() end,
+    }
+    local controller_hog = {
+      seal = function()
+        seal_calls.hog = seal_calls.hog + 1
+        return { kind = "ok", bundle_path = "/tmp/hog-bundle.zip", warnings = {} }
+      end,
+      stop = function() end,
+    }
+
+    local resolve_call_count = 0
+    handle = recorder.setup({
+      workspace = "/tmp/ws-a",
+      resolve = function()
+        resolve_call_count = resolve_call_count + 1
+        if resolve_call_count == 1 then
+          return { status = "active", root = "/tmp/cats", manifest = { assignment_id = "cats" } }
+        end
+        return { status = "active", root = "/tmp/hog", manifest = { assignment_id = "hog" } }
+      end,
+      start_recording = function(args)
+        if args.workspace == "/tmp/cats" then
+          return controller_cats
+        end
+        return controller_hog
+      end,
+    })
+    vim.api.nvim_exec_autocmds("DirChanged", { group = "Provenance" })
+
+    local select_called = false
+    local orig_select = vim.ui.select
+    vim.ui.select = function(...)
+      select_called = true
+    end
+    restore_select = function()
+      vim.ui.select = orig_select
+    end
+
+    vim.cmd("ProvenanceSeal hog")
+
+    assert.is_false(select_called)
+    assert.equals(1, seal_calls.hog)
+    assert.equals(0, seal_calls.cats)
+  end)
+end)

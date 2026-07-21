@@ -116,18 +116,12 @@ function M.setup(opts)
   --- the registry LIVE at invocation time, so there is no more "live vs
   --- inert stub command" swap to keep in sync (that swap was the source of
   --- a real bug fixed earlier in this file's history -- see git blame on
-  --- init_seal_command_spec.lua's round-trip regression test). Phase C adds
-  --- the multi-session picker; this phase preserves single-session behavior
-  --- exactly.
-  vim.api.nvim_create_user_command(SEAL_COMMAND_NAME, function()
-    local active = registry.list()
-    if #active == 0 then
-      vim.notify("Provenance: not an activated assignment workspace; nothing to seal.", vim.log.levels.INFO)
-      return
-    end
-
-    local entry = active[1]
-    local ok, result = pcall(entry.controller.seal)
+  --- init_seal_command_spec.lua's round-trip regression test). Zero or one
+  --- active session: seals directly (or shows the inert guidance), no
+  --- prompt. More than one: vim.ui.select over the active assignments.
+  --- Accepts an optional `:ProvenanceSeal <assignment_id>` argument to seal
+  --- a named session directly, skipping the picker.
+  local function notify_seal_result(ok, result)
     if not ok then
       vim.notify("Provenance: seal failed: " .. tostring(result), vim.log.levels.ERROR)
       return
@@ -146,7 +140,55 @@ function M.setup(opts)
     else
       vim.notify("Provenance: seal failed: " .. tostring(result.message or result.kind), vim.log.levels.ERROR)
     end
-  end, { desc = "Provenance: seal the recorded submission bundle" })
+  end
+
+  local function seal_entry(entry)
+    local ok, result = pcall(entry.controller.seal)
+    notify_seal_result(ok, result)
+  end
+
+  vim.api.nvim_create_user_command(SEAL_COMMAND_NAME, function(cmd_opts)
+    local active = registry.list()
+
+    if #active == 0 then
+      vim.notify("Provenance: not an activated assignment workspace; nothing to seal.", vim.log.levels.INFO)
+      return
+    end
+
+    local requested_id = cmd_opts.args ~= "" and cmd_opts.args or nil
+    if requested_id then
+      for _, entry in ipairs(active) do
+        if entry.manifest.assignment_id == requested_id then
+          seal_entry(entry)
+          return
+        end
+      end
+      vim.notify(
+        "Provenance: no active recording session for assignment '" .. requested_id .. "'.",
+        vim.log.levels.ERROR
+      )
+      return
+    end
+
+    if #active == 1 then
+      seal_entry(active[1])
+      return
+    end
+
+    vim.ui.select(active, {
+      prompt = "Provenance: choose which assignment to seal",
+      format_item = function(entry)
+        return entry.manifest.assignment_id .. " (" .. entry.root .. ")"
+      end,
+    }, function(chosen)
+      if chosen then
+        seal_entry(chosen)
+      end
+    end)
+  end, {
+    desc = "Provenance: seal the recorded submission bundle (optionally: :ProvenanceSeal <assignment_id>)",
+    nargs = "?",
+  })
 
   -- Run once immediately so tests (and a setup() call after VimEnter has
   -- already fired) see the resolved state without waiting for the next
