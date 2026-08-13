@@ -16,7 +16,7 @@ local M = {}
 -- No package.json in a Neovim plugin; this is the single source of truth
 -- for the recorder's own version until Plan 9 (dist) sources it centrally
 -- (e.g. from a generated version file or the plugin manifest).
-local PLUGIN_VERSION = "0.1.0"
+local PLUGIN_VERSION = "0.2.0"
 
 -- Pinned producer id (design.md §6 / CLAUDE.md "Producer identity"): this is
 -- how the analyzer distinguishes hosts. Never rename or derive this.

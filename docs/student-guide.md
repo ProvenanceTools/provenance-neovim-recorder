@@ -18,24 +18,24 @@ You'll need:
 
 ### 1. Install the plugin
 
-Add the plugin **pinned to the tag your course specifies** (examples below use `v0.1.1`). Pinning the tag is required: it ships the course's public key, and its source hash is what the analyzer recognizes as an approved build.
+Add the plugin **pinned to the tag your course specifies** (examples below use `v0.2.0`). Pinning the tag is required: it ships the course's public key, and its source hash is what the analyzer recognizes as an approved build.
 
 **lazy.nvim** — add to your plugin spec:
 
 ```lua
-{ "ProvenanceTools/provenance-neovim-recorder", version = "v0.1.1", lazy = false }
+{ "ProvenanceTools/provenance-neovim-recorder", version = "v0.2.0", lazy = false }
 ```
 
 **packer.nvim:**
 
 ```lua
-use({ "ProvenanceTools/provenance-neovim-recorder", tag = "v0.1.1" })
+use({ "ProvenanceTools/provenance-neovim-recorder", tag = "v0.2.0" })
 ```
 
 **vim-plug** (in `init.vim`):
 
 ```vim
-Plug 'ProvenanceTools/provenance-neovim-recorder', { 'tag': 'v0.1.1' }
+Plug 'ProvenanceTools/provenance-neovim-recorder', { 'tag': 'v0.2.0' }
 ```
 
 Then install (`:Lazy sync`, `:PackerSync`, or `:PlugInstall` respectively) and restart Neovim. Other managers work too — see the [README install section](https://github.com/ProvenanceTools/provenance-neovim-recorder#install). You don't need an account; the plugin makes no network requests during a session.
