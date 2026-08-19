@@ -72,10 +72,57 @@ local function read_file(path)
   return "ok", data
 end
 
+--- Resolve which course public key to verify against: the caller's, or the
+--- build-embedded one. Exposed so a caller that wants to cache a verification
+--- result can key that cache on the SAME key this module would have used.
+--- @param pubkey_hex string|nil
+--- @return string
+function M.course_pubkey(pubkey_hex)
+  return pubkey_hex or require("provenance.course_public_key").COURSE_PUBLIC_KEY_HEX
+end
+
+--- Find and read the manifest file from a workspace directory, trying each
+--- candidate name in precedence order. The `vim.uv` file-loading half of the
+--- activation gate, split out from load_and_verify so a caller can obtain the
+--- manifest BYTES (cheap) without paying for the ed25519 verification
+--- (expensive) — see registry.load_and_verify. Never throws.
+--- @param workspace_dir string  assignment workspace root
+--- @return table
+---   { status = "found", text = string, path = string }
+---   | { status = "inactive", reason = "no_manifest_file" }
+---   | { status = "inactive", reason = "manifest_read_error" }
+function M.read_manifest(workspace_dir)
+  local ok, out = pcall(function()
+    for _, name in ipairs(MANIFEST_NAMES) do
+      local path = workspace_dir .. "/" .. name
+      local status, text = read_file(path)
+      if status == "ok" then
+        return { status = "found", text = text, path = path }
+      elseif status == "error" then
+        -- Present but unreadable: stop here, do not fall through to the
+        -- next candidate name.
+        return { status = "inactive", reason = "manifest_read_error" }
+      end
+      -- status == "not_found": try the next candidate.
+    end
+
+    return { status = "inactive", reason = "no_manifest_file" }
+  end)
+
+  if not ok then
+    return { status = "inactive", reason = "manifest_read_error" }
+  end
+  return out
+end
+
 --- Find and read the manifest file from a workspace directory (trying each
 --- candidate name in precedence order), then delegate to evaluate(). The
 --- vim.uv-based file-loading seam of the activation gate (design.md §4.1) —
 --- never throws.
+---
+--- NOTE: every call re-runs a ~12 ms pure-Lua ed25519 verification. Callers on
+--- a per-buffer hot path must go through registry.load_and_verify, which
+--- memoizes this on the manifest's content digest.
 --- @param workspace_dir string  assignment workspace root
 --- @param pubkey_hex string|nil  64-char hex ed25519 course public key;
 ---   defaults to provenance.course_public_key.COURSE_PUBLIC_KEY_HEX
@@ -86,22 +133,13 @@ end
 ---   | { status = "inactive", reason = "parse_error" }
 ---   | { status = "inactive", reason = "signature_invalid" }
 function M.load_and_verify(workspace_dir, pubkey_hex)
+  local read = M.read_manifest(workspace_dir)
+  if read.status ~= "found" then
+    return read
+  end
+
   local ok, out = pcall(function()
-    local key = pubkey_hex or require("provenance.course_public_key").COURSE_PUBLIC_KEY_HEX
-
-    for _, name in ipairs(MANIFEST_NAMES) do
-      local status, text = read_file(workspace_dir .. "/" .. name)
-      if status == "ok" then
-        return M.evaluate(text, key)
-      elseif status == "error" then
-        -- Present but unreadable: stop here, do not fall through to the
-        -- next candidate name.
-        return { status = "inactive", reason = "manifest_read_error" }
-      end
-      -- status == "not_found": try the next candidate.
-    end
-
-    return { status = "inactive", reason = "no_manifest_file" }
+    return M.evaluate(read.text, M.course_pubkey(pubkey_hex))
   end)
 
   if not ok then

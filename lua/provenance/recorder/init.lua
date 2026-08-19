@@ -38,11 +38,16 @@ function M.setup(opts)
   local registry = registry_mod.new({ start_recording = start_recording })
   status.attach(registry)
 
+  -- Route discovery's verification seam through the registry's verified-root
+  -- cache. resolve_buf below runs on EVERY buffer switch, and an uncached
+  -- resolve pays a ~12 ms pure-Lua ed25519 verification on the main loop.
+  local resolve_opts = { load_and_verify = registry.load_and_verify }
+
   --- Resolve a single anchor directory and, if active, ensure its session
   --- exists in the registry. Idempotent (registry.ensure_session already
   --- guards against double-starting the same root).
   local function resolve_and_activate(start_dir)
-    local result = resolve(start_dir)
+    local result = resolve(start_dir, resolve_opts)
     if result.status == "active" then
       registry.ensure_session(result.root, result.manifest, { clock = core_clock.system() })
     end
