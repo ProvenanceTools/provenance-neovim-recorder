@@ -27,6 +27,7 @@ local core_clock = require("provenance.core.clock")
 local core_checkpoint = require("provenance.core.checkpoint")
 local recorder_context = require("provenance.recorder.session.recorder_context")
 local session_host = require("provenance.recorder.session.session_host")
+local policy_gate = require("provenance.recorder.session.policy_gate")
 local session_writer = require("provenance.recorder.io.session_writer")
 local meta_writer = require("provenance.recorder.io.meta_writer")
 local checkpoint_cadence = require("provenance.recorder.session.checkpoint_cadence")
@@ -199,6 +200,14 @@ function M.start(opts)
   -- 1. Fresh per-session ed25519 keypair (recorder PRD §4.6).
   local keypair = core_session_keys.generate()
 
+  -- 1b. Effective capture policy (program spec §4), compiled into the gate
+  -- SessionHost consults on every emit. Only a 2.0 manifest may carry a
+  -- policy; a 1.x manifest resolves to DEFAULTS, which IS the v1.x capture
+  -- set, so legacy sessions are unchanged. Resolved exactly once per session:
+  -- the emit path must never re-resolve, re-parse or re-verify anything.
+  local policy = policy_gate.effective_policy(manifest)
+  local gate = policy_gate.new(policy)
+
   -- 2. Logical session context — the session.start payload. session_id
   -- here is the LOGICAL session id (chain/manifest identity), distinct
   -- from the filename uuid generated below (two-uuid rule).
@@ -291,6 +300,7 @@ function M.start(opts)
   host = session_host.new({
     session_id = context.session_id,
     clock = clock,
+    policy_gate = gate,
     on_entry = function(entry)
       if is_degraded() then
         -- Disk is failing: bypass the writer entirely; only CRITICAL kinds
@@ -394,6 +404,11 @@ function M.start(opts)
     emit = host.emit,
     get_now = clock.now,
     get_focused = focus and focus.get_focused or nil,
+    -- session.heartbeat is a FLOOR kind — a course can retune its cadence but
+    -- can never switch it off, because bundle-level Active/Idle and the
+    -- gap_in_heartbeats heuristic both depend on it. Already clamped to
+    -- [5000, 120000] by capture_policy.resolve.
+    interval_ms = policy.heartbeat_interval_ms,
   })
 
   local stopped = false
@@ -420,6 +435,13 @@ function M.start(opts)
     -- enable_signals is true (term is nil otherwise), same as the
     -- coordinator seam above.
     _terminal_augroup_id = term and term._augroup_id or nil,
+    -- Test/inspection seams for the capture policy (program spec §4). `_host`
+    -- is the emit chokepoint every wiring module already calls, so a test can
+    -- drive the policy gate exactly the way production does; `_policy` is the
+    -- resolved policy this session is running under. Always present, like
+    -- _doc_wiring_augroup_id above.
+    _host = host,
+    _policy = policy,
   }
 
   -- TEST SEAM (Plan 9): expose the signal sub-handles so the integration test

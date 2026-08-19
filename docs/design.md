@@ -198,6 +198,18 @@ paste reconciler. Do not simplify to one signal without discussion.
   in the monorepo and is explicitly deferred. This is the identical decision
   `provjet` made.
 
+  **RESOLVED at session.start 2.0** (program spec §5): the format bump happened
+  in the monorepo, and `session.start` now also carries a `host: { editor,
+  editor_version, editor_build, platform }` block. This recorder emits
+  `editor = "neovim"` and `editor_build = ""` (Neovim has no build-commit
+  concept; the spec explicitly permits `""`). The `vscode` block is **retained
+  alongside it** so 1.x readers keep working — additive, not a replacement.
+  `session.start` 2.0 also carries the FULL `manifest` (for 1.x manifests too,
+  which is what lets the analyzer apply the absence-vs-disabled rule). It
+  deliberately does **not** carry `identity`: enrollment keys are sub-project S2
+  and do not exist yet, and the field is optional precisely so this could land
+  first.
+
 ## 7. Distribution & the "prod build" analog
 
 There is no compile/sign step, so the `build:prod` flow the VS Code and JetBrains

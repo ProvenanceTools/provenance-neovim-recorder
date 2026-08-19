@@ -320,3 +320,169 @@ describe("recording_session.start", function()
     assert.is_true(core_bundle.verify_sig(manifest_json_text, sig_text, scratch.session.public_key_hex))
   end)
 end)
+
+--- The capture policy, end to end through the real composition (program spec §4).
+--- recording_session resolves the policy ONCE from the verified manifest and
+--- hands the compiled gate to SessionHost, which is the single chokepoint every
+--- wiring module's emit passes through.
+describe("recording_session capture policy", function()
+  local core_manifest = require("provenance.core.manifest")
+  local core_capture_policy = require("provenance.core.capture_policy")
+  local scratch
+
+  before_each(function()
+    scratch = new_scratch()
+  end)
+
+  after_each(function()
+    scratch.teardown()
+  end)
+
+  local function start(manifest, extra)
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    local opts = {
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = manifest,
+      clock = core_clock.fixed(0, 0),
+      env = { uuid = function() return "fixed-session-id" end },
+    }
+    for k, v in pairs(extra or {}) do
+      opts[k] = v
+    end
+    scratch.session = recording_session.start(opts)
+    return scratch.session
+  end
+
+  local function entries_of(session)
+    session.stop()
+    local parsed = core_ndjson.parse_entries(read_all(session.slog_path))
+    assert.is_true(parsed.ok)
+    return parsed.value
+  end
+
+  --- A 2.0 manifest carrying `policy`. Its signature is not verified here --
+  --- activation already did that; recording_session composes a manifest it is
+  --- given. What matters is that the POLICY is honoured and the chain stays
+  --- intact.
+  local function v2_manifest_with(capture)
+    return {
+      format_version = "2.0",
+      course_id = "berkeley-cs61b",
+      assignment_id = "hw3",
+      semester = "fa25",
+      issued_at = "2026-01-01T00:00:00Z",
+      files_under_review = { "foo.txt" },
+      collaboration = "solo",
+      submission = "bundle",
+      scope = "directory",
+      policy = { capture = capture },
+      sig = ("ab"):rep(64),
+    }
+  end
+
+  it("a 2.0 all-off policy suppresses gated kinds, and the chain still validates", function()
+    local session = start(v2_manifest_with({
+      selection_change = false,
+      focus_change = false,
+      terminal = false,
+      doc_open_close = false,
+      inline_content = false,
+    }))
+
+    -- Drive the gated kinds straight at the host's emit seam, which is exactly
+    -- what every wiring module does.
+    for _, kind in ipairs({ "doc.open", "doc.close", "selection.change", "focus.change", "terminal.open", "terminal.command" }) do
+      session._host.emit(kind, { probe = kind })
+    end
+    session._host.emit("doc.change", { probe = "doc.change" })
+
+    local entries = entries_of(session)
+    for _, entry in ipairs(entries) do
+      assert.is_nil(
+        core_capture_policy.POLICY_GATED_EVENT_KINDS[entry.kind],
+        entry.kind .. " was disabled by policy and must not appear"
+      )
+    end
+    for i, entry in ipairs(entries) do
+      assert.equals(i - 1, entry.seq, "suppressed events must consume no seq")
+    end
+    assert.is_true(core_chain_validator.validate_chain(entries).ok)
+  end)
+
+  it("a 1.x manifest with a stapled policy is IGNORED — students get no off switch", function()
+    -- Below 2.0 the policy block is not inside the signed payload, so a student
+    -- could staple this onto a genuinely signed 1.x manifest.
+    local m = dev_manifest()
+    m.policy = { capture = { selection_change = false, doc_open_close = false } }
+
+    local session = start(m)
+    session._host.emit("selection.change", { probe = 1 })
+    session._host.emit("doc.open", { probe = 2 })
+
+    local kinds = {}
+    for _, entry in ipairs(entries_of(session)) do
+      kinds[entry.kind] = true
+    end
+    assert.is_true(kinds["selection.change"], "a 1.x policy must not disable capture")
+    assert.is_true(kinds["doc.open"], "a 1.x policy must not disable capture")
+  end)
+
+  it("session.heartbeat is on the floor: it survives an all-off policy", function()
+    local session = start(v2_manifest_with({
+      selection_change = false,
+      focus_change = false,
+      terminal = false,
+      doc_open_close = false,
+      inline_content = false,
+      heartbeat_interval_ms = 120000,
+    }))
+    -- Driven at the gate, which is where the floor is enforced -- the heartbeat
+    -- module itself is not policy-aware and does not need to be.
+    session._host.emit("session.heartbeat", { focused = true })
+
+    local kinds = {}
+    for _, entry in ipairs(entries_of(session)) do
+      kinds[entry.kind] = true
+    end
+    assert.is_true(kinds["session.heartbeat"], "only the heartbeat INTERVAL is tunable, never its existence")
+  end)
+
+  it("honours the policy's clamped heartbeat_interval_ms", function()
+    -- The value below is out of range on both attempts; resolve() clamps it, and
+    -- the clamped value is what reaches the timer.
+    local session = start(v2_manifest_with({ heartbeat_interval_ms = 1000 }))
+    assert.equals(core_capture_policy.HEARTBEAT_INTERVAL_MIN_MS, session._policy.heartbeat_interval_ms)
+
+    scratch.session = nil
+    session.stop()
+
+    local session2 = start(v2_manifest_with({ heartbeat_interval_ms = 999999 }))
+    assert.equals(core_capture_policy.HEARTBEAT_INTERVAL_MAX_MS, session2._policy.heartbeat_interval_ms)
+  end)
+
+  it("a 1.x session resolves to the v1.x capture set, unchanged", function()
+    local session = start(dev_manifest())
+    assert.same(core_capture_policy.DEFAULTS, session._policy)
+  end)
+
+  it("session.start carries the manifest and host block into the log", function()
+    local v2 = core_manifest.parse(
+      table.concat(vim.fn.readfile(
+        vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h") .. "/../fixtures/dev-manifest-v2.json"
+      ), "\n")
+    ).value
+
+    local entries = entries_of(start(v2))
+    local start_entry = entries[1]
+    assert.equals("session.start", start_entry.kind)
+    assert.equals("neovim", start_entry.data.host.editor)
+    assert.equals("", start_entry.data.host.editor_build)
+    assert.equals("2.0", start_entry.data.manifest.format_version)
+    assert.equals("dev-course", start_entry.data.manifest.course_id)
+    assert.is_table(start_entry.data.manifest.course_cert)
+    assert.is_nil(start_entry.data.identity)
+  end)
+end)

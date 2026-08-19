@@ -92,6 +92,44 @@ local function compute_machine_id(hostname, username, session_id)
   return core_sha256.hex(hostname .. ":" .. username .. ":" .. session_id)
 end
 
+--- Build the `manifest` block carried by session.start 2.0 (program spec §5):
+--- the FULL manifest — payload + sig +, at 2.0, `course_cert` and `policy`.
+---
+--- Emitted for 1.x manifests too. That is the point: it is what lets the
+--- analyzer apply the ABSENCE-VS-DISABLED rule, i.e. tell "this student
+--- produced no selection.change events" from "this course disabled
+--- selection.change" — a distinction heuristics otherwise mis-fire on. A 1.x
+--- manifest simply carries no policy, which reads as the default capture set.
+---
+--- `files_under_review` is re-tagged as a json.array so it canonicalizes as
+--- `[...]` and not `{...}`: this payload is hashed into the chain, and an
+--- untagged list from a hand-built manifest would produce different bytes.
+--- Fields are copied by name rather than by table copy so an unknown key on the
+--- source manifest can never silently enter the signed chain.
+local function build_manifest_block(m)
+  local block = {
+    assignment_id = m.assignment_id,
+    semester = m.semester,
+    issued_at = m.issued_at,
+    files_under_review = core_json.array(m.files_under_review or {}),
+    sig = m.sig,
+  }
+
+  -- Absent on a hand-built 1.x manifest; core.manifest.parse always sets it.
+  block.format_version = m.format_version
+
+  -- 2.0-only. Nil assignment is a no-op in Lua, so a 1.x manifest simply omits
+  -- every one of these and its block is exactly the 1.x manifest.
+  block.course_id = m.course_id
+  block.collaboration = m.collaboration
+  block.submission = m.submission
+  block.scope = m.scope
+  block.policy = m.policy
+  block.course_cert = m.course_cert
+
+  return block
+end
+
 --- @param opts table {manifest, prev_session_id, session_pubkey_hex, env?}
 ---   manifest: table with assignment_id, semester, sig.
 ---   prev_session_id: string or nil (fresh session).
@@ -130,9 +168,27 @@ function M.build_recorder_context(opts)
     },
     manifest_sig = manifest.sig,
     machine_id = machine_id,
+    -- The FULL manifest (program spec §5). NEW in 2.0, additive: 1.x readers
+    -- ignore what they do not know.
+    manifest = build_manifest_block(manifest),
+    -- RETAINED for 1.x readers, which look here for the host triple. `host`
+    -- below is its 2.0 replacement; both are emitted during the transition.
     vscode = {
       version = nvim_version,
       commit = "",
+      platform = platform,
+    },
+    -- NEW in 2.0: the editor-neutral host block that replaces `vscode`.
+    -- `editor_build` is "" because Neovim has no build-commit concept — the
+    -- spec explicitly permits the empty string (VS Code does not expose one
+    -- either). NOTE: deliberately NO `identity` block. Enrollment keys are
+    -- sub-project S2 and do not exist yet; the field is optional precisely so
+    -- this can land first, and emitting an empty or invented one would be a
+    -- claim the recorder cannot back.
+    host = {
+      editor = "neovim",
+      editor_version = nvim_version,
+      editor_build = "",
       platform = platform,
     },
     recorder = {
