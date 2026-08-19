@@ -109,10 +109,22 @@ describe("git_wiring", function()
   -------------------------------------------------------------------------
 
   describe("repo present", function()
-    local function make_run_git(head_result)
+    -- The base mock answers `rev-parse HEAD` with the caller's result and
+    -- reports "nothing readable" for the two S5 commit-graph reads
+    -- (`rev-list --parents` and `symbolic-ref`), so the pre-S5 cases below go
+    -- on asserting exactly what they always asserted. Cases that DO want a
+    -- graph pass `graph`.
+    local function make_run_git(head_result, graph)
+      graph = graph or {}
       return function(args)
         if args[1] == "rev-parse" and args[2] == "HEAD" then
           return head_result
+        end
+        if args[1] == "rev-list" then
+          return graph.rev_list or { ok = false, out = "" }
+        end
+        if args[1] == "symbolic-ref" then
+          return graph.symbolic_ref or { ok = false, out = "" }
         end
         return { ok = true, out = ".git" }
       end
@@ -320,5 +332,309 @@ describe("git_wiring", function()
 
       assert.has_no.errors(function() handle.dispose() end)
     end)
+  end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- S5: the commit graph (sha / parents / branch).
+--
+-- Byte-level parity with provcode and provjet lives in the shared vector
+-- (tests/conformance/fixtures/git-event.json, consumed by conformance_spec).
+-- What is tested here is the WIRING: which git commands are run, how their
+-- output is turned into a payload, and — load-bearing — what it refuses.
+-- ---------------------------------------------------------------------------
+
+describe("git_wiring: commit graph (program spec S5)", function()
+  local SHA = ("a"):rep(40)
+  local P1 = ("b"):rep(40)
+  local P2 = ("c"):rep(40)
+
+  local dir
+  local handles
+
+  before_each(function()
+    dir = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(dir .. "/.git", "p")
+    handles = {}
+  end)
+
+  after_each(function()
+    for _, h in ipairs(handles) do
+      pcall(h.dispose)
+    end
+    handles = {}
+    pcall(vim.fn.delete, dir, "rf")
+  end)
+
+  --- Drive one HEAD change with a scripted git and return the emitted payload
+  --- plus the argv of every git invocation, in order.
+  --- @param script table { head, rev_list, symbolic_ref } — each a run_git result
+  local function emit_once(script)
+    local events = {}
+    local calls = {}
+    local handle = git_wiring.start({
+      workspace = dir,
+      emit = function(kind, data)
+        table.insert(events, { kind = kind, data = data })
+      end,
+      run_git = function(args)
+        table.insert(calls, table.concat(args, " "))
+        if args[1] == "rev-parse" and args[2] == "HEAD" then
+          return script.head or { ok = false, out = "" }
+        end
+        if args[1] == "rev-list" then
+          return script.rev_list or { ok = false, out = "" }
+        end
+        if args[1] == "symbolic-ref" then
+          return script.symbolic_ref or { ok = false, out = "" }
+        end
+        return { ok = true, out = ".git" }
+      end,
+    })
+    table.insert(handles, handle)
+    assert.is_true(handle.active)
+    handle._on_head_change()
+    assert.equals(1, #events)
+    assert.equals("git.event", events[1].kind)
+    return events[1].data, calls
+  end
+
+  local function key_set(t)
+    local keys = {}
+    for k in pairs(t) do
+      keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    return keys
+  end
+
+  it("an ordinary commit on a branch emits operation, commit_sha, sha, parents and branch", function()
+    local data = emit_once({
+      head = { ok = true, out = SHA },
+      rev_list = { ok = true, out = SHA .. " " .. P1 },
+      symbolic_ref = { ok = true, out = "main" },
+    })
+    assert.same({ "branch", "commit_sha", "operation", "parents", "sha" }, key_set(data))
+    assert.equals("state_change", data.operation)
+    assert.equals(SHA, data.commit_sha)
+    assert.equals(SHA, data.sha) -- same value under both keys: 1.x readers know only commit_sha
+    assert.same({ P1 }, { data.parents[1] })
+    assert.equals(1, #data.parents)
+    assert.equals("main", data.branch)
+  end)
+
+  it("a merge keeps git's parent ORDER — parents[1] is the branch merged INTO", function()
+    local data = emit_once({
+      head = { ok = true, out = SHA },
+      rev_list = { ok = true, out = SHA .. " " .. P2 .. " " .. P1 },
+      symbolic_ref = { ok = true, out = "main" },
+    })
+    assert.equals(2, #data.parents)
+    assert.equals(P2, data.parents[1])
+    assert.equals(P1, data.parents[2])
+  end)
+
+  it("a root commit yields parents = [] (an empty JSON ARRAY, not an object)", function()
+    local data = emit_once({
+      head = { ok = true, out = SHA },
+      rev_list = { ok = true, out = SHA },
+      symbolic_ref = { ok = true, out = "main" },
+    })
+    assert.is_not_nil(data.parents)
+    assert.equals(0, #data.parents)
+    assert.is_true(require("provenance.core.json").is_array(data.parents))
+    assert.is_true(require("provenance.core.json").canonicalize(data):find('"parents":[]', 1, true) ~= nil)
+  end)
+
+  it("MANDATORY: an unreadable graph OMITS parents — 'could not read' is never reported as 'root commit'", function()
+    -- `[]` is a positive claim. A failed, empty, multi-line, or mismatched
+    -- rev-list must all omit the key instead, or every transient git hiccup
+    -- would be logged as a root commit.
+    for _, rev_list in ipairs({
+      { ok = false, out = "" },
+      { ok = true, out = "" },
+      { ok = true, out = "fatal: bad object HEAD" },
+      { ok = true, out = ("d"):rep(40) .. " " .. P1 }, -- a line about a DIFFERENT commit
+      { ok = true, out = SHA .. " " .. P1 .. "\n" .. P2 .. " " .. P1 }, -- more than one commit
+      { ok = true, out = SHA .. " not-a-sha" },
+    }) do
+      local data = emit_once({
+        head = { ok = true, out = SHA },
+        rev_list = rev_list,
+        symbolic_ref = { ok = true, out = "main" },
+      })
+      assert.is_nil(data.parents, "unreadable graph must omit parents, got " .. vim.inspect(data.parents))
+      assert.equals(SHA, data.sha) -- the rest of the event is still recorded
+    end
+  end)
+
+  it("a detached HEAD OMITS branch — never invents \"HEAD\" or \"\"", function()
+    -- `symbolic-ref` exiting non-zero IS the detached-HEAD signal.
+    local data = emit_once({
+      head = { ok = true, out = SHA },
+      rev_list = { ok = true, out = SHA .. " " .. P1 },
+      symbolic_ref = { ok = false, out = "" },
+    })
+    assert.same({ "commit_sha", "operation", "parents", "sha" }, key_set(data))
+    assert.is_nil(data.branch)
+  end)
+
+  it("a branch name with slashes and dashes survives verbatim", function()
+    local data = emit_once({
+      head = { ok = true, out = SHA },
+      rev_list = { ok = true, out = SHA },
+      symbolic_ref = { ok = true, out = "feat/proj2-part1\n" },
+    })
+    assert.equals("feat/proj2-part1", data.branch)
+  end)
+
+  it("a non-ASCII branch name survives verbatim (it is a VALUE, never an object key)", function()
+    local data = emit_once({
+      head = { ok = true, out = SHA },
+      rev_list = { ok = true, out = SHA },
+      symbolic_ref = { ok = true, out = "feature/\195\188ber" },
+    })
+    assert.equals("feature/\195\188ber", data.branch)
+    -- The signed bytes still order keys the fixed ASCII way, whatever the branch.
+    local canonical = require("provenance.core.json").canonicalize(data)
+    assert.equals(1, canonical:find('{"branch":', 1, true))
+  end)
+
+  it("no sha to describe (a fresh `git init`) skips the graph read entirely but still records the branch", function()
+    local data, calls = emit_once({
+      head = { ok = false, out = "" },
+      symbolic_ref = { ok = true, out = "main" },
+    })
+    assert.same({ "branch", "operation" }, key_set(data))
+    for _, argv in ipairs(calls) do
+      assert.is_nil(argv:find("rev-list", 1, true), "must not ask for the graph of a commit that does not exist")
+    end
+  end)
+
+  it("runs the graph reads on the SAME synchronous handler — emit is called once, with no deferral", function()
+    -- provcode and provjet had to make emission async and add a serializing
+    -- queue; this port must not. `emit` is called exactly once from
+    -- straight-line code, so nothing can interleave between the session host
+    -- reading and advancing prev_hash/seq — the property that stops a
+    -- concurrent emitter from manufacturing a tamper finding.
+    local order = {}
+    local handle = git_wiring.start({
+      workspace = dir,
+      emit = function()
+        table.insert(order, "emit")
+      end,
+      tagger = { mark_git = function() table.insert(order, "mark_git") end },
+      run_git = function(args)
+        table.insert(order, "git:" .. args[1])
+        if args[1] == "rev-parse" and args[2] == "HEAD" then
+          return { ok = true, out = SHA }
+        end
+        if args[1] == "rev-list" then
+          return { ok = true, out = SHA .. " " .. P1 }
+        end
+        if args[1] == "symbolic-ref" then
+          return { ok = true, out = "main" }
+        end
+        return { ok = true, out = ".git" }
+      end,
+    })
+    table.insert(handles, handle)
+
+    handle._on_head_change()
+
+    -- Everything happened inside the call, in order, with exactly one emit.
+    assert.same({ "git:rev-parse", "git:rev-list", "git:symbolic-ref", "emit", "mark_git" }, order)
+  end)
+
+  it("git.event carries no capture-policy gate: a suppressed event would burn a seq", function()
+    -- git.event is a FLOOR kind (no key in policy.capture), so this wiring must
+    -- not grow a gate of its own. Gating happens in session/policy_gate.lua,
+    -- BEFORE an entry is chained and given a seq — a hole here would read to
+    -- validation check 4 (seq_gaps) as a deleted entry, turning a course's
+    -- privacy setting into a tamper signal against the student.
+    local capture_policy = require("provenance.core.capture_policy")
+    local all_off = capture_policy.resolve({
+      capture = { selection_change = false, focus_change = false, terminal = false },
+    })
+    assert.is_true(capture_policy.is_event_kind_captured("git.event", all_off))
+
+    -- ...and the wiring emits regardless of any policy it is never handed.
+    local data = emit_once({
+      head = { ok = true, out = SHA },
+      rev_list = { ok = true, out = SHA },
+      symbolic_ref = { ok = true, out = "main" },
+    })
+    assert.equals("state_change", data.operation)
+  end)
+
+  it("IRB (CPHS 2026-06-19796): NO git author name or email can reach a git.event payload", function()
+    -- A PROTOCOL commitment, not a style preference: the approved CPHS protocol
+    -- treats a new category of identifier as requiring a filed modification
+    -- BEFORE implementation, and git author identity is exactly that. This
+    -- recorder reads git through stdout, so the risk is concrete — the reflog
+    -- lines this module watches, and `git log`'s default format, both carry
+    -- `Name <email>`. Every value lifted out of stdout must therefore be a bare
+    -- token, and author identity never is.
+    local AUTHOR_LINE = "abc1234 Ada Lovelace <ada@berkeley.edu> 1700000000 +0000\tcommit: fix the thing"
+
+    local events = {}
+    local handle = git_wiring.start({
+      workspace = dir,
+      emit = function(kind, data)
+        table.insert(events, { kind = kind, data = data })
+      end,
+      run_git = function(args)
+        if args[1] == "rev-parse" and args[2] == "--git-dir" then
+          return { ok = true, out = ".git" }
+        end
+        -- Every read answers with an author-bearing, reflog-shaped line.
+        return { ok = true, out = AUTHOR_LINE }
+      end,
+    })
+    table.insert(handles, handle)
+
+    handle._on_head_change()
+    assert.equals(1, #events)
+
+    local data = events[1].data
+    assert.same({ "operation" }, key_set(data))
+
+    local serialized = require("provenance.core.json").canonicalize(data)
+    for _, forbidden in ipairs({ "Ada", "Lovelace", "@", "berkeley", "commit: fix", "1700000000" }) do
+      assert.is_nil(serialized:find(forbidden, 1, true),
+        "git.event must never carry " .. forbidden .. "; got " .. serialized)
+    end
+  end)
+
+  it("IRB: an author-shaped answer cannot become a branch name either", function()
+    -- Called out separately because `branch` is the one field with no format
+    -- constraint of its own, so it is the natural place for `Name <email>` to
+    -- land. Git's ref-name rules forbid whitespace, so rejecting it costs
+    -- nothing legitimate.
+    for _, hostile in ipairs({
+      "Ada Lovelace <ada@berkeley.edu>",
+      "main\nada@berkeley.edu",
+      "",
+      "   ",
+    }) do
+      local data = emit_once({
+        head = { ok = true, out = SHA },
+        rev_list = { ok = true, out = SHA },
+        symbolic_ref = { ok = true, out = hostile },
+      })
+      assert.is_nil(data.branch, "must reject branch " .. vim.inspect(hostile))
+    end
+  end)
+
+  it("IRB: an author-shaped answer cannot become a sha either", function()
+    -- This tightens the pre-existing commit_sha read, which used to take
+    -- `rev-parse`'s stdout verbatim.
+    local data = emit_once({
+      head = { ok = true, out = "abc1234 Ada Lovelace <ada@berkeley.edu>" },
+      symbolic_ref = { ok = true, out = "main" },
+    })
+    assert.is_nil(data.commit_sha)
+    assert.is_nil(data.sha)
+    assert.equals("main", data.branch)
   end)
 end)
