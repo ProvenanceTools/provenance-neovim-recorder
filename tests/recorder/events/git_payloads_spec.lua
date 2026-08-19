@@ -147,15 +147,18 @@ describe("git_payloads.build_git_event (commit graph)", function()
     -- Enforced structurally: commit_view takes exactly two positional scalars,
     -- so there is no parameter an author field could arrive through, and
     -- build_git_event reads named fields off the view rather than merging it.
-    local hostile = {
-      sha = "aaa",
-      parents = { "bbb" },
-      authorName = "Ada Lovelace",
-      authorEmail = "ada@berkeley.edu",
-      authorDate = "2026-08-19T00:00:00Z",
-      message = "fix the thing",
-      author = { name = "Ada Lovelace", email = "ada@berkeley.edu" },
-    }
+    local hostile = { sha = "aaa", parents = { "bbb" } }
+    -- Every spelling a future edit might plausibly reach for. The assertion
+    -- below is an EXACT key set, so a builder that copied any one of these
+    -- through — under any of these names — turns this test red.
+    for _, k in ipairs({
+      "author", "authorName", "author_name", "authorEmail", "author_email",
+      "authorDate", "author_date", "committer", "committerName", "committer_name",
+      "committerEmail", "committer_email", "email", "name", "message",
+      "commit_message", "summary", "subject", "body", "signature", "gpg_sig",
+    }) do
+      hostile[k] = "Ada Lovelace <ada@berkeley.edu> 2026-08-19 fix the thing"
+    end
 
     local ev = git_payloads.build_git_event("commit", "aaa", hostile, "main")
 
@@ -169,5 +172,29 @@ describe("git_payloads.build_git_event (commit graph)", function()
 
     -- And the projection itself drops them before a payload is ever built.
     assert.same({ "parents", "sha" }, key_set(git_payloads.commit_view("aaa", { "bbb" })))
+  end)
+
+  it("IRB: commit_view's ARITY is the structural enforcement — exactly (sha, parents), nothing more", function()
+    -- The whole no-author-identity argument rests on there being no parameter
+    -- an author field could arrive through, which is a claim about the function
+    -- SIGNATURE — so it is asserted as one. Widening commit_view is exactly what
+    -- a port would have to do to start capturing author identity, and that must
+    -- not be able to pass silently. (This test is the tripwire, not the
+    -- permission: adding an author field is out of protocol until a CPHS
+    -- modification is FILED, whatever the tests say.)
+    local info = debug.getinfo(git_payloads.commit_view, "u")
+    assert.equals(2, info.nparams)
+    assert.is_false(info.isvararg)
+
+    -- Behaviourally too: a third argument is ignored rather than absorbed.
+    local view = git_payloads.commit_view("aaa", { "bbb" }, {
+      name = "Ada Lovelace",
+      email = "ada@berkeley.edu",
+    })
+    assert.same({ "parents", "sha" }, key_set(view))
+
+    local ev = git_payloads.build_git_event("commit", "aaa", view, "main")
+    assert.same({ "branch", "commit_sha", "operation", "parents", "sha" }, key_set(ev.data))
+    assert.is_nil(core_json.canonicalize(ev.data):find("@", 1, true))
   end)
 end)
