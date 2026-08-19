@@ -28,13 +28,32 @@ describe("trust_keys", function()
     )
   end)
 
-  it("matches the pinned grandfathered legacy course public key", function()
+  it("matches THIS recorder's own prior embedded master key", function()
+    -- Each recorder grandfathers the key it was itself verifying against; the
+    -- three implementations embed three DIFFERENT legacy keys and only the root
+    -- key is shared. This value is provnvim's real maintainer-held master key,
+    -- which shipped in every tagged release and signed every 1.x manifest in the
+    -- field -- not a dev placeholder (provnvim has no build step). Replacing it
+    -- with another recorder's key would silently stop recording for every
+    -- existing user.
+    --
     -- SCHEDULED FOR REMOVAL: delete this assertion together with the constant
     -- once no unreissued 1.x manifest remains in the field (program spec §9).
     assert.equals(
+      "b5bca59ffa918c879d01050dab428e60c630f9d2051508af3d29c60cce985e25",
+      trust_keys.LEGACY_COURSE_PUBLIC_KEY_HEX
+    )
+  end)
+
+  it("is NOT another recorder's legacy key", function()
+    -- Guards against a future "let's align the constants" change. The VS Code
+    -- recorder grandfathers 46f91d59..., provjet grandfathers 958d262b...;
+    -- neither may ever become this repo's anchor.
+    assert.is_not.equals(
       "46f91d5902c53816110b05ddedd2b8caa95b452d51e696f5327b52bf90bf4838",
       trust_keys.LEGACY_COURSE_PUBLIC_KEY_HEX
     )
+    assert.is_nil(trust_keys.LEGACY_COURSE_PUBLIC_KEY_HEX:find("^958d262b"))
   end)
 
   it("the two anchors are distinct", function()

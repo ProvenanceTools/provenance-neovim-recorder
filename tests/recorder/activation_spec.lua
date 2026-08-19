@@ -76,6 +76,10 @@ describe("activation.evaluate trust-anchor routing", function()
   -- dev manifest all three recorders activate against, which is the point of
   -- every recorder embedding the same dev root key.
   local dev_v2_text = table.concat(vim.fn.readfile(this_file_dir() .. "/fixtures/dev-manifest-v2.json"), "\n")
+  -- A 1.x manifest signed with THIS recorder's embedded master key -- the
+  -- grandfather gate. No key travels with it, so "active" can only mean the
+  -- embedded LEGACY_COURSE_PUBLIC_KEY_HEX worked.
+  local gate_v1_text = table.concat(vim.fn.readfile(this_file_dir() .. "/fixtures/legacy-manifest-v1.json"), "\n")
   local v2_fx = read_json(fixtures .. "manifest-v2.json")
 
   -- Routing is asserted directly, by capturing which key each verifier is
@@ -141,10 +145,16 @@ describe("activation.evaluate trust-anchor routing", function()
     assert.equals("invalid_root_signature", res.detail.kind)
   end)
 
-  it("a 1.x manifest does not verify against the root key", function()
-    local res = activation.evaluate(vim.json.encode(legacy_fx.manifest), trust_keys.ROOT_PUBLIC_KEY_HEX)
-    assert.equals("inactive", res.status)
-    assert.equals("signature_invalid", res.reason)
+  it("a master-key-signed 1.x manifest activates on the legacy anchor and NOT on the root key", function()
+    -- Uses the gate fixture (signed with this recorder's own embedded master
+    -- key), so both halves are load-bearing: it really does activate by
+    -- default, and swapping in the root key really does refuse it. That pair is
+    -- the whole grandfather clause in one assertion.
+    assert.equals("active", activation.evaluate(gate_v1_text).status)
+
+    local rooted = activation.evaluate(gate_v1_text, trust_keys.ROOT_PUBLIC_KEY_HEX)
+    assert.equals("inactive", rooted.status)
+    assert.equals("signature_invalid", rooted.reason)
   end)
 
   it("an explicit override applies on whichever path the version selects", function()

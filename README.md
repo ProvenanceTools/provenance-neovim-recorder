@@ -241,8 +241,10 @@ There is one canonical, published plugin — not a fork per course. Distribution
     course's authority comes from a root-signed `course_cert` carried inline in its
     `.provenance-manifest`, so one plugin serves every course.
   - `LEGACY_COURSE_PUBLIC_KEY_HEX` — the grandfathered course key, used for **Manifest 1.x**
-    only. 1.x manifests carry no certificate, so they are verified against it directly. It is
-    **scheduled for removal** once every course has re-issued its manifests as 2.0.
+    only. 1.x manifests carry no certificate, so they are verified against it directly. This is
+    the master key that shipped in earlier tagged releases of *this* plugin; each recorder
+    grandfathers its own, so it is not shared across the three implementations the way the root
+    key is. It is **scheduled for removal** once every course has re-issued its manifests as 2.0.
 - Students install a **pinned tag** of this repo (e.g., `version = "v0.1.0"`). The recorder
   records only for a workspace whose `.provenance-manifest` verifies on the path its
   `format_version` selects.

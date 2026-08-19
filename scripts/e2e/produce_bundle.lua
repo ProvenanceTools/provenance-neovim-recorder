@@ -36,27 +36,32 @@ local ok, err = pcall(function()
 
   -- ---------------------------------------------------------------------
   -- 1. Temp workspace with a valid signed .provenance-manifest, built from
-  --    the committed dev fixture (tests/conformance/fixtures/manifest.json),
-  --    a 1.x manifest signed by the conformance vector generator's key. That
-  --    key is the fixture's own `course_pubkey_hex`, NOT the recorder's
-  --    embedded legacy anchor, so it is passed explicitly below.
+  --    the committed 1.x gate fixture
+  --    (tests/recorder/fixtures/legacy-manifest-v1.json), signed with the
+  --    recorder's own embedded master key. Activation below passes NO pubkey
+  --    override, so this exercises the REAL embedded LEGACY_COURSE_PUBLIC_KEY_HEX
+  --    -- the grandfathered 1.x path, end to end.
+  --
+  --    Deliberately NOT tests/conformance/fixtures/manifest.json: that file is a
+  --    generated conformance vector signed with the vector generator's key, and
+  --    it must stay byte-identical to provjet's copy. It used to serve both
+  --    roles, and regenerating the vector silently broke this gate.
   -- ---------------------------------------------------------------------
   -- `<sfile>` is a Vimscript-source concept and does not resolve reliably
   -- for a script loaded via `nvim -l`; use debug.getinfo on this running
   -- chunk instead (source is "@/abs/path/to/produce_bundle.lua").
   local this_file = debug.getinfo(1, "S").source:sub(2)
   local repo_root = vim.fn.fnamemodify(vim.fn.resolve(vim.fn.fnamemodify(this_file, ":p")), ":h:h:h")
-  local fixture_path = repo_root .. "/tests/conformance/fixtures/manifest.json"
-  local fixture_text = table.concat(vim.fn.readfile(fixture_path, "b"), "\n")
-  local fixture = vim.json.decode(fixture_text)
-  if type(fixture) ~= "table" or type(fixture.manifest) ~= "table" then
-    error("conformance fixture manifest.json missing inner `manifest` object")
+  local fixture_path = repo_root .. "/tests/recorder/fixtures/legacy-manifest-v1.json"
+  local manifest_text = table.concat(vim.fn.readfile(fixture_path, "b"), "\n")
+  local fixture_manifest = vim.json.decode(manifest_text)
+  if type(fixture_manifest) ~= "table" or type(fixture_manifest.sig) ~= "string" then
+    error("1.x gate fixture legacy-manifest-v1.json is not a signed manifest object")
   end
 
   local workspace = vim.fs.normalize(vim.fn.tempname())
   vim.fn.mkdir(workspace, "p")
 
-  local manifest_text = vim.json.encode(fixture.manifest)
   local manifest_file_path = workspace .. "/.provenance-manifest"
   local mf = assert(io.open(manifest_file_path, "w"))
   mf:write(manifest_text)
@@ -68,7 +73,9 @@ local ok, err = pcall(function()
   -- Verify activation the same way the real plugin's activation gate would
   -- (fail loudly here rather than silently starting an unverified session —
   -- if this ever fails it means the fixture/course key drifted).
-  local activated = activation.load_and_verify(workspace, fixture.course_pubkey_hex)
+  -- No pubkey override: this is the grandfather gate, so it must go through the
+  -- embedded LEGACY_COURSE_PUBLIC_KEY_HEX exactly as a student's editor does.
+  local activated = activation.load_and_verify(workspace)
   if activated.status ~= "active" then
     error("dev fixture manifest failed activation: " .. vim.inspect(activated))
   end

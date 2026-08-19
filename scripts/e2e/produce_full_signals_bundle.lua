@@ -48,25 +48,23 @@ local ok, err = pcall(function()
 
   -- ---------------------------------------------------------------------
   -- 1. Temp workspace with a valid signed .provenance-manifest, built from
-  --    the committed dev fixture (tests/conformance/fixtures/manifest.json)
-  --    -- same fixture produce_bundle.lua uses, so this exercises the same
-  --    activation gate. It is a 1.x manifest signed by the conformance vector
-  --    generator's key (its own `course_pubkey_hex`), not by the recorder's
-  --    embedded legacy anchor, so that key is passed explicitly below.
+  --    the committed 1.x gate fixture
+  --    (tests/recorder/fixtures/legacy-manifest-v1.json) -- same fixture
+  --    produce_bundle.lua uses, so this exercises the same activation gate
+  --    against the REAL embedded master key, with no pubkey override.
   -- ---------------------------------------------------------------------
   local this_file = debug.getinfo(1, "S").source:sub(2)
   local repo_root = vim.fn.fnamemodify(vim.fn.resolve(vim.fn.fnamemodify(this_file, ":p")), ":h:h:h")
-  local fixture_path = repo_root .. "/tests/conformance/fixtures/manifest.json"
-  local fixture_text = table.concat(vim.fn.readfile(fixture_path, "b"), "\n")
-  local fixture = vim.json.decode(fixture_text)
-  if type(fixture) ~= "table" or type(fixture.manifest) ~= "table" then
-    error("conformance fixture manifest.json missing inner `manifest` object")
+  local fixture_path = repo_root .. "/tests/recorder/fixtures/legacy-manifest-v1.json"
+  local manifest_text = table.concat(vim.fn.readfile(fixture_path, "b"), "\n")
+  local fixture_manifest = vim.json.decode(manifest_text)
+  if type(fixture_manifest) ~= "table" or type(fixture_manifest.sig) ~= "string" then
+    error("1.x gate fixture legacy-manifest-v1.json is not a signed manifest object")
   end
 
   local workspace = vim.fs.normalize(vim.fn.tempname())
   vim.fn.mkdir(workspace, "p")
 
-  local manifest_text = vim.json.encode(fixture.manifest)
   local manifest_file_path = workspace .. "/.provenance-manifest"
   local mf = assert(io.open(manifest_file_path, "w"))
   mf:write(manifest_text)
@@ -75,7 +73,9 @@ local ok, err = pcall(function()
   local provenance_dir = workspace .. "/.provenance"
   vim.fn.mkdir(provenance_dir, "p")
 
-  local activated = activation.load_and_verify(workspace, fixture.course_pubkey_hex)
+  -- No pubkey override: this is the grandfather gate, so it must go through the
+  -- embedded LEGACY_COURSE_PUBLIC_KEY_HEX exactly as a student's editor does.
+  local activated = activation.load_and_verify(workspace)
   if activated.status ~= "active" then
     error("dev fixture manifest failed activation: " .. vim.inspect(activated))
   end

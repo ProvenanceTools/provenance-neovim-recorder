@@ -168,6 +168,18 @@ paste reconciler. Do not simplify to one signal without discussion.
     removal** once every course has re-issued as 2.0 — a permanent second anchor
     is exactly what the hierarchy exists to eliminate.
 
+    **Each recorder grandfathers its own prior embedded constant**, so unlike the
+    root key this value is *not* shared across the three implementations — the
+    key that signed the 1.x manifests a recorder encounters is whatever that
+    recorder shipped with. Here it is the maintainer-held master key that went
+    out in every tagged release (this repo has no build step, so it was never a
+    dev placeholder). `tests/recorder/fixtures/legacy-manifest-v1.json` is a 1.x
+    manifest signed with it, and `scripts/e2e/produce_bundle.lua` activates
+    against it with **no pubkey override** — that is the end-to-end proof the
+    embedded constant still works. Keep that fixture separate from
+    `tests/conformance/fixtures/manifest.json`, which is a generated vector
+    signed with a different key.
+
   There is no build-time embed step (Neovim has no build step), so both ship as-is
   in every tagged release. Because they are part of the hashed source, a release's
   tree hash already covers them: rotating either is simply a new tagged release
