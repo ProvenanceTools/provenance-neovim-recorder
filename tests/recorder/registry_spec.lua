@@ -171,6 +171,8 @@ describe("registry.load_and_verify (verified-root cache)", function()
   local fx = vim.json.decode(
     table.concat(vim.fn.readfile(this_file_dir() .. "/../conformance/fixtures/manifest.json"), "\n")
   )
+  -- A real 2.0 manifest whose course_cert chains to the embedded DEV ROOT key.
+  local dev_v2_text = table.concat(vim.fn.readfile(this_file_dir() .. "/fixtures/dev-manifest-v2.json"), "\n")
 
   local real_evaluate = activation.evaluate
   local evaluate_calls
@@ -327,6 +329,69 @@ describe("registry.load_and_verify (verified-root cache)", function()
     local dir = new_workspace()
     new_reg().load_and_verify(dir, fx.course_pubkey_hex)
     new_reg().load_and_verify(dir, fx.course_pubkey_hex)
+    assert.equals(2, evaluate_calls)
+  end)
+
+  --- Since Manifest 2.0 there are TWO embedded trust anchors and the one that
+  --- applies is chosen from the manifest's own format_version. A cached verdict
+  --- must therefore never survive a manifest switching versions under the same
+  --- root -- otherwise a 2.0 read could be answered by a verdict computed under
+  --- the legacy course key, or vice versa. The content digest is what closes
+  --- this: different bytes, different version, different digest, guaranteed miss.
+  it("a manifest that switches format version between reads never hits the other anchor's verdict", function()
+    local reg = new_reg()
+    local dir = new_workspace() -- 1.x, verified under the legacy path
+
+    local first = reg.load_and_verify(dir)
+    assert.equals(1, evaluate_calls)
+
+    -- Same root, same file, now a 2.0 manifest that chains to the embedded root
+    -- key. It must be re-evaluated, and it must come back ACTIVE -- which it can
+    -- only do via the 2.0 anchor.
+    vim.fn.writefile(vim.split(dev_v2_text, "\n"), dir .. "/.provenance-manifest")
+    local second = reg.load_and_verify(dir)
+    assert.equals(2, evaluate_calls, "the 2.0 read must not be served from the 1.x verdict")
+    assert.is_not.equals(first, second)
+    assert.equals("active", second.status)
+    assert.equals("2.0", second.manifest.format_version)
+
+    -- and back again: the 1.x bytes must not be answered by the 2.0 verdict.
+    vim.fn.writefile({ vim.json.encode(fx.manifest) }, dir .. "/.provenance-manifest")
+    local third = reg.load_and_verify(dir)
+    assert.equals(3, evaluate_calls)
+    assert.is_not.equals(second, third)
+    assert.equals("inactive", third.status)
+  end)
+
+  it("each format version still caches normally once it has been seen", function()
+    local reg = new_reg()
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    table.insert(tempdirs, dir)
+    vim.fn.writefile(vim.split(dev_v2_text, "\n"), dir .. "/.provenance-manifest")
+
+    local first = reg.load_and_verify(dir)
+    assert.equals("active", first.status)
+    for _ = 1, 3 do
+      assert.equals(first, reg.load_and_verify(dir))
+    end
+    assert.equals(1, evaluate_calls, "a 2.0 chain walk is ~23 ms; it must be cached too")
+  end)
+
+  it("the cache keys on the pubkey OVERRIDE, so nil and an explicit key are distinct entries", function()
+    local reg = new_reg()
+    local dir = new_workspace()
+
+    -- nil override -> the 1.x anchor (the legacy course key), which did not sign
+    -- this fixture; explicit override -> the key that did.
+    assert.equals("inactive", reg.load_and_verify(dir).status)
+    assert.equals("active", reg.load_and_verify(dir, fx.course_pubkey_hex).status)
+    assert.equals(2, evaluate_calls)
+    -- One entry per root, last write wins: the explicit-override verdict is the
+    -- one now cached, and it is still correct on a repeat. In production there
+    -- is exactly one override (none), so this only ever costs hit rate, never
+    -- correctness -- the key comparison is what guarantees the latter.
+    assert.equals("active", reg.load_and_verify(dir, fx.course_pubkey_hex).status)
     assert.equals(2, evaluate_calls)
   end)
 

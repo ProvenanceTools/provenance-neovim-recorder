@@ -50,7 +50,9 @@ local ok, err = pcall(function()
   -- 1. Temp workspace with a valid signed .provenance-manifest, built from
   --    the committed dev fixture (tests/conformance/fixtures/manifest.json)
   --    -- same fixture produce_bundle.lua uses, so this exercises the same
-  --    activation gate against the real embedded course public key.
+  --    activation gate. It is a 1.x manifest signed by the conformance vector
+  --    generator's key (its own `course_pubkey_hex`), not by the recorder's
+  --    embedded legacy anchor, so that key is passed explicitly below.
   -- ---------------------------------------------------------------------
   local this_file = debug.getinfo(1, "S").source:sub(2)
   local repo_root = vim.fn.fnamemodify(vim.fn.resolve(vim.fn.fnamemodify(this_file, ":p")), ":h:h:h")
@@ -73,7 +75,7 @@ local ok, err = pcall(function()
   local provenance_dir = workspace .. "/.provenance"
   vim.fn.mkdir(provenance_dir, "p")
 
-  local activated = activation.load_and_verify(workspace)
+  local activated = activation.load_and_verify(workspace, fixture.course_pubkey_hex)
   if activated.status ~= "active" then
     error("dev fixture manifest failed activation: " .. vim.inspect(activated))
   end

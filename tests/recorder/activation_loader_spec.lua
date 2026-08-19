@@ -3,7 +3,7 @@
 --- activation.evaluate(). Real vim.uv against real temp-dir fixtures — no
 --- mocks, per CLAUDE.md's "real, focused" testing bar for editor-seam code.
 local activation = require("provenance.recorder.activation")
-local course_public_key = require("provenance.course_public_key")
+local trust_keys = require("provenance.trust_keys")
 
 local function this_file_dir()
   local source = debug.getinfo(1, "S").source
@@ -73,15 +73,14 @@ describe("activation.load_and_verify", function()
     assert.equals("manifest_read_error", res.reason)
   end)
 
-  it("defaults pubkey_hex to COURSE_PUBLIC_KEY_HEX when omitted", function()
-    -- Prove the default parameter *is* COURSE_PUBLIC_KEY_HEX: omitting the key
-    -- must behave identically to passing that constant explicitly. (The fixture
-    -- is signed with the master key, so both come back "active"; this assertion
-    -- holds regardless of the resulting status.)
+  it("defaults a 1.x manifest's key to LEGACY_COURSE_PUBLIC_KEY_HEX when pubkey_hex is omitted", function()
+    -- Prove the 1.x default anchor *is* the grandfathered legacy course key:
+    -- omitting the override must behave identically to passing that constant
+    -- explicitly, and must NOT behave like passing the root key.
     local dir = new_tempdir()
     vim.fn.writefile({ vim.json.encode(fx.manifest) }, dir .. "/.provenance-manifest")
     local defaulted = activation.load_and_verify(dir)
-    local explicit = activation.load_and_verify(dir, course_public_key.COURSE_PUBLIC_KEY_HEX)
+    local explicit = activation.load_and_verify(dir, trust_keys.LEGACY_COURSE_PUBLIC_KEY_HEX)
     assert.equals(explicit.status, defaulted.status)
     assert.equals(explicit.reason, defaulted.reason)
   end)
@@ -129,11 +128,7 @@ describe("activation.load_and_verify", function()
     end)
   end)
 
-  it("course_pubkey defaults to COURSE_PUBLIC_KEY_HEX and passes through an explicit key", function()
-    assert.equals(course_public_key.COURSE_PUBLIC_KEY_HEX, activation.course_pubkey())
-    assert.equals(course_public_key.COURSE_PUBLIC_KEY_HEX, activation.course_pubkey(nil))
-    assert.equals("ab", activation.course_pubkey("ab"))
-  end)
+
 
   it("never throws even for a nonexistent workspace_dir", function()
     local ok, res = pcall(activation.load_and_verify, "/no/such/workspace/dir/at/all", fx.course_pubkey_hex)

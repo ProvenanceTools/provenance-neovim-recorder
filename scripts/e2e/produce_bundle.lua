@@ -36,9 +36,10 @@ local ok, err = pcall(function()
 
   -- ---------------------------------------------------------------------
   -- 1. Temp workspace with a valid signed .provenance-manifest, built from
-  --    the committed dev fixture (tests/conformance/fixtures/manifest.json)
-  --    whose inner `manifest` object verifies against the embedded course
-  --    public key (provenance.course_public_key.COURSE_PUBLIC_KEY_HEX).
+  --    the committed dev fixture (tests/conformance/fixtures/manifest.json),
+  --    a 1.x manifest signed by the conformance vector generator's key. That
+  --    key is the fixture's own `course_pubkey_hex`, NOT the recorder's
+  --    embedded legacy anchor, so it is passed explicitly below.
   -- ---------------------------------------------------------------------
   -- `<sfile>` is a Vimscript-source concept and does not resolve reliably
   -- for a script loaded via `nvim -l`; use debug.getinfo on this running
@@ -67,7 +68,7 @@ local ok, err = pcall(function()
   -- Verify activation the same way the real plugin's activation gate would
   -- (fail loudly here rather than silently starting an unverified session —
   -- if this ever fails it means the fixture/course key drifted).
-  local activated = activation.load_and_verify(workspace)
+  local activated = activation.load_and_verify(workspace, fixture.course_pubkey_hex)
   if activated.status ~= "active" then
     error("dev fixture manifest failed activation: " .. vim.inspect(activated))
   end

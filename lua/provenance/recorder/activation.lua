@@ -1,10 +1,28 @@
 --- Pure activation decision (design.md §4.1): parse a `.provenance-manifest`
---- and verify it against the embedded course public key. This is the
+--- and verify it against the recorder's embedded trust anchor. This is the
 --- Neovim-API-free core of the activation gate; `load_and_verify` below is
 --- the `vim.uv` file-loading seam that wires it to an actual workspace
 --- directory. It has zero Neovim editor API use (only depends on
 --- core.manifest, itself pure Lua) and never throws.
+---
+--- **Two verification paths, chosen by `format_version`** (program spec §3):
+---
+---  - **2.0** — walk the full trust chain (`manifest.verify_chain`): the root
+---    key signs the `course_cert`, which authorizes the course key that signed
+---    the manifest payload. Anchored on `ROOT_PUBLIC_KEY_HEX`.
+---  - **1.x / absent** — the legacy `manifest.verify` path, byte for byte as it
+---    has always worked, against the grandfathered
+---    `LEGACY_COURSE_PUBLIC_KEY_HEX`. 1.x manifests predate the chain, have no
+---    cert, and were signed directly by a course key; verifying them against the
+---    root key would fail closed and silently stop recording for every course
+---    that has not re-issued yet.
+---
+--- The two anchors are NOT interchangeable, and the routing is what keeps the
+--- chain's step-0 downgrade gate meaningful: a 2.0 manifest never falls back to
+--- the legacy key, so a stapled cert plus an invented capture-disabling policy
+--- has no path that accepts it.
 local manifest = require("provenance.core.manifest")
+local trust_keys = require("provenance.trust_keys")
 
 local M = {}
 
@@ -13,20 +31,44 @@ local M = {}
 -- contract notes — this is wiring, not format).
 local MANIFEST_NAMES = { ".provenance-manifest", "provenance-manifest" }
 
+--- Is this manifest on the trust-chain path?
+--- Exported because more than one place asks, and the answer must never be
+--- spelled differently in two of them.
+--- @param m table  a parsed Manifest
+--- @return boolean
+function M.is_manifest_2(m)
+  return manifest.format_version(m) == manifest.FORMAT_VERSION_2
+end
+
 --- @param text string  raw manifest JSON text (e.g. read from
 ---   `.provenance-manifest` in the workspace root)
---- @param pubkey_hex string  64-char hex ed25519 course public key
+--- @param pubkey_hex string|nil  64-char hex ed25519 public key OVERRIDE. When
+---   given it applies on whichever path the manifest's version selects (2.0:
+---   used as the root key; 1.x: used as the course key) — this is the test
+---   seam. When omitted, each path takes its own embedded anchor.
 --- @return table
 ---   { status = "active", manifest = Manifest }
 ---   | { status = "inactive", reason = "parse_error" }
 ---   | { status = "inactive", reason = "signature_invalid" }
+---   | { status = "inactive", reason = "chain_invalid", detail = <chain error> }
 function M.evaluate(text, pubkey_hex)
   local parsed = manifest.parse(text)
   if not parsed.ok then
     return { status = "inactive", reason = "parse_error" }
   end
 
-  if not manifest.verify(parsed.value, pubkey_hex) then
+  if M.is_manifest_2(parsed.value) then
+    local chain = manifest.verify_chain(parsed.value, pubkey_hex or trust_keys.ROOT_PUBLIC_KEY_HEX)
+    if not chain.ok then
+      return { status = "inactive", reason = "chain_invalid", detail = chain.error }
+    end
+    -- chain.value.window is deliberately NOT consulted. An expired cert must not
+    -- stop a whole class from recording (program spec §4); the recorder records
+    -- and the analyzer decides, from the manifest carried in session.start.
+    return { status = "active", manifest = parsed.value }
+  end
+
+  if not manifest.verify(parsed.value, pubkey_hex or trust_keys.LEGACY_COURSE_PUBLIC_KEY_HEX) then
     return { status = "inactive", reason = "signature_invalid" }
   end
 
@@ -72,15 +114,6 @@ local function read_file(path)
   return "ok", data
 end
 
---- Resolve which course public key to verify against: the caller's, or the
---- build-embedded one. Exposed so a caller that wants to cache a verification
---- result can key that cache on the SAME key this module would have used.
---- @param pubkey_hex string|nil
---- @return string
-function M.course_pubkey(pubkey_hex)
-  return pubkey_hex or require("provenance.course_public_key").COURSE_PUBLIC_KEY_HEX
-end
-
 --- Find and read the manifest file from a workspace directory, trying each
 --- candidate name in precedence order. The `vim.uv` file-loading half of the
 --- activation gate, split out from load_and_verify so a caller can obtain the
@@ -124,14 +157,15 @@ end
 --- a per-buffer hot path must go through registry.load_and_verify, which
 --- memoizes this on the manifest's content digest.
 --- @param workspace_dir string  assignment workspace root
---- @param pubkey_hex string|nil  64-char hex ed25519 course public key;
----   defaults to provenance.course_public_key.COURSE_PUBLIC_KEY_HEX
+--- @param pubkey_hex string|nil  64-char hex ed25519 public key OVERRIDE; when
+---   omitted the anchor is chosen by `format_version` — see M.evaluate.
 --- @return table
 ---   { status = "active", manifest = Manifest }
 ---   | { status = "inactive", reason = "no_manifest_file" }
 ---   | { status = "inactive", reason = "manifest_read_error" }
 ---   | { status = "inactive", reason = "parse_error" }
 ---   | { status = "inactive", reason = "signature_invalid" }
+---   | { status = "inactive", reason = "chain_invalid", detail = <chain error> }
 function M.load_and_verify(workspace_dir, pubkey_hex)
   local read = M.read_manifest(workspace_dir)
   if read.status ~= "found" then
@@ -139,7 +173,7 @@ function M.load_and_verify(workspace_dir, pubkey_hex)
   end
 
   local ok, out = pcall(function()
-    return M.evaluate(read.text, M.course_pubkey(pubkey_hex))
+    return M.evaluate(read.text, pubkey_hex)
   end)
 
   if not ok then

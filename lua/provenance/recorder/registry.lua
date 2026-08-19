@@ -29,11 +29,20 @@ function M.new(opts)
   -- root -> { manifest, controller, provenance_dir }
   local sessions = {}
 
-  -- Verified-root cache: root -> { digest, pubkey, result }.
+  -- Verified-root cache: root -> { digest, pubkey_override, result }.
   --
   -- Keyed on the root directory PLUS the manifest's content digest PLUS the
-  -- public key it was verified against, so a cached verdict cannot outlive any
-  -- of the three inputs that produced it.
+  -- caller's public-key OVERRIDE, so a cached verdict cannot outlive any of the
+  -- three inputs that produced it.
+  --
+  -- The override rather than the resolved key, because since Manifest 2.0 there
+  -- is no single resolved key to name up front: activation.evaluate picks the
+  -- anchor from the manifest's own `format_version` (2.0 -> root key, 1.x ->
+  -- grandfathered legacy course key). Keying on the digest covers that
+  -- completely -- the bytes determine the version, the version determines the
+  -- anchor -- so a manifest that switches format version between reads has a
+  -- different digest and therefore cannot hit a verdict computed under the other
+  -- anchor. A `nil` override is a distinct key from any explicit one.
   --
   -- The manifest identity is a sha256 of its bytes, deliberately NOT
   -- mtime+size. This cache short-circuits a security gate, so its key has to be
@@ -67,25 +76,20 @@ function M.new(opts)
       return read
     end
 
-    local key_ok, key = pcall(activation.course_pubkey, pubkey_hex)
-    if not key_ok then
-      return { status = "inactive", reason = "manifest_read_error" }
-    end
-
     local digest_ok, digest = pcall(vim.fn.sha256, read.text)
     local hit = verified[workspace_dir]
-    if digest_ok and hit and hit.digest == digest and hit.pubkey == key then
+    if digest_ok and hit and hit.digest == digest and hit.pubkey_override == pubkey_hex then
       return hit.result
     end
 
-    local eval_ok, result = pcall(activation.evaluate, read.text, key)
+    local eval_ok, result = pcall(activation.evaluate, read.text, pubkey_hex)
     if not eval_ok then
       return { status = "inactive", reason = "manifest_read_error" }
     end
 
     -- Only cache when the digest is trustworthy; otherwise re-verify each time.
     if digest_ok then
-      verified[workspace_dir] = { digest = digest, pubkey = key, result = result }
+      verified[workspace_dir] = { digest = digest, pubkey_override = pubkey_hex, result = result }
     end
     return result
   end
