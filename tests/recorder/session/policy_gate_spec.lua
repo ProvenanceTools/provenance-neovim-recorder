@@ -76,11 +76,16 @@ describe("policy_gate.effective_policy", function()
   end)
 end)
 
---- The shared dev 2.0 manifest is a REAL signed manifest whose policy still
---- carries both retired keys. It is the strongest available inertness case,
---- because the retired keys sit INSIDE the course-signed payload: the signature
---- covers them verbatim, so the manifest must still verify byte-for-byte AND
---- still resolve as if they were not there.
+--- An ARCHIVED, REAL signed manifest whose policy still carries both retired
+--- keys — the exact bytes the shared dev manifest had before it was re-issued
+--- without them. Kept as its own fixture precisely so re-issuing the live one
+--- could not quietly delete this regression.
+---
+--- It is the strongest available inertness case, because the retired keys sit
+--- INSIDE the course-signed payload: the signature covers them verbatim, so the
+--- manifest must still verify byte-for-byte AND still resolve as if they were
+--- not there. Manifests like this exist in the field and must keep working
+--- forever; that is the whole forward-compatibility claim.
 ---
 --- This matters more in this port than in the others: validate_signed_subtree
 --- walks the policy sub-tree, so an over-strict "unknown capture key" rule here
@@ -96,15 +101,26 @@ describe("policy_gate retired keys inside a real signed policy", function()
   end
 
   local text = table.concat(
-    vim.fn.readfile(this_file_dir() .. "/../fixtures/dev-manifest-v2.json"), "\n"
+    vim.fn.readfile(this_file_dir() .. "/../fixtures/dev-manifest-v2-retired-keys.json"), "\n"
   )
 
-  it("the fixture really does carry both retired keys in its signed policy", function()
-    -- Guards the test below from silently going vacuous if the fixture is ever
-    -- re-signed without them.
+  it("the archived fixture really does carry both retired keys in its signed policy", function()
+    -- Guards the tests below from silently going vacuous. This fixture is
+    -- FROZEN: it must never be re-signed, because its whole value is being a
+    -- genuine signed artifact from before the keys were retired.
     local raw = vim.json.decode(text)
     assert.is_false(raw.policy.capture.doc_open_close == nil)
     assert.is_false(raw.policy.capture.inline_content == nil)
+  end)
+
+  it("the LIVE dev manifest has been re-issued without them", function()
+    -- The current fixture tracks the monorepo's test-workspace manifest, which
+    -- was re-signed once the keys were retired.
+    local live = vim.json.decode(table.concat(
+      vim.fn.readfile(this_file_dir() .. "/../fixtures/dev-manifest-v2.json"), "\n"
+    ))
+    assert.is_nil(live.policy.capture.doc_open_close)
+    assert.is_nil(live.policy.capture.inline_content)
   end)
 
   it("still parses and still verifies its full trust chain", function()
