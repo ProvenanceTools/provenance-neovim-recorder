@@ -13,6 +13,9 @@ local recording_controller = require("provenance.recorder.session.recording_cont
 local core_clock = require("provenance.core.clock")
 local discovery = require("provenance.recorder.discovery")
 local registry_mod = require("provenance.recorder.registry")
+local secret_store = require("provenance.recorder.identity.secret_store")
+local key_cache_mod = require("provenance.recorder.identity.key_cache")
+local enrollment_cmd = require("provenance.recorder.commands.enrollment")
 
 local M = {}
 
@@ -38,6 +41,15 @@ function M.setup(opts)
   local registry = registry_mod.new({ start_recording = start_recording })
   status.attach(registry)
 
+  -- Student identity (program spec §S2). BOTH of these have exactly one owner
+  -- (this setup call) and exactly one disposal path (handle.dispose below).
+  -- That matters for the key cache in particular: it retains derived PRIVATE
+  -- keys, which is precisely why core/student_keys.lua refuses to memoize them
+  -- itself. `opts.identity_store` / `opts.identity_key_cache` are injection
+  -- seams so tests never touch the real store under stdpath("data").
+  local identity_store = opts.identity_store or secret_store.new({ path = opts.identity_store_path })
+  local identity_key_cache = opts.identity_key_cache or key_cache_mod.new()
+
   -- Route discovery's verification seam through the registry's verified-root
   -- cache. resolve_buf below runs on EVERY buffer switch, and an uncached
   -- resolve pays a ~12 ms pure-Lua ed25519 verification on the main loop.
@@ -49,7 +61,11 @@ function M.setup(opts)
   local function resolve_and_activate(start_dir)
     local result = resolve(start_dir, resolve_opts)
     if result.status == "active" then
-      registry.ensure_session(result.root, result.manifest, { clock = core_clock.system() })
+      registry.ensure_session(result.root, result.manifest, {
+        clock = core_clock.system(),
+        identity_store = identity_store,
+        identity_key_cache = identity_key_cache,
+      })
     end
     return result
   end
@@ -200,10 +216,102 @@ function M.setup(opts)
   -- autocmd event.
   resolve_cwd()
 
+  --- Course ids of every active root whose manifest is 2.0. Used to default the
+  --- `course_id` argument on the enrollment commands.
+  local function active_course_ids()
+    local seen, out = {}, {}
+    for _, entry in ipairs(registry.list()) do
+      local course_id = entry.manifest and entry.manifest.course_id
+      if type(course_id) == "string" and course_id ~= "" and not seen[course_id] then
+        seen[course_id] = true
+        out[#out + 1] = course_id
+      end
+    end
+    table.sort(out)
+    return out
+  end
+
+  local function notify_result(res)
+    vim.notify(res.message, res.level)
+  end
+
+  --- Read a multi-line paste. `vim.fn.input()` is single-line, and an enrollment
+  --- token is a long JSON blob, so this asks for it via the prompt and tolerates
+  --- whatever the terminal delivers; the store normalizes and validates.
+  local function prompt(message)
+    local ok, value = pcall(vim.fn.input, { prompt = message, cancelreturn = "" })
+    if not ok then
+      return ""
+    end
+    return value
+  end
+
+  local IDENTITY_COMMANDS = {
+    ProvenanceEnrollmentRequest = {
+      desc = "Provenance: print your per-course public key to send to course staff",
+      nargs = "?",
+      run = function(cmd_opts)
+        return enrollment_cmd.request({
+          store = identity_store,
+          key_cache = identity_key_cache,
+          course_id = cmd_opts.args ~= "" and cmd_opts.args or nil,
+          active_course_ids = active_course_ids(),
+        })
+      end,
+    },
+    ProvenanceEnrollmentImport = {
+      desc = "Provenance: import the enrollment token JSON course staff sent back",
+      nargs = "?",
+      run = function(cmd_opts)
+        local raw = cmd_opts.args ~= "" and cmd_opts.args or prompt("Paste enrollment token JSON: ")
+        return enrollment_cmd.import_token({ store = identity_store, raw_json = raw })
+      end,
+    },
+    ProvenanceEnrollmentStatus = {
+      desc = "Provenance: show the identity store location and enrolled courses",
+      nargs = 0,
+      run = function()
+        return enrollment_cmd.status({ store = identity_store })
+      end,
+    },
+    ProvenanceIdentityExport = {
+      desc = "Provenance: print your identity secret to move to another machine",
+      nargs = 0,
+      run = function()
+        return enrollment_cmd.export_secret({ store = identity_store })
+      end,
+    },
+    ProvenanceIdentityImport = {
+      desc = "Provenance: adopt an identity secret exported from another machine",
+      nargs = "?",
+      run = function(cmd_opts)
+        local raw = cmd_opts.args ~= "" and cmd_opts.args or prompt("Paste identity secret (64 hex chars): ")
+        return enrollment_cmd.import_secret({ store = identity_store, raw = raw })
+      end,
+    },
+  }
+
+  for name, spec in pairs(IDENTITY_COMMANDS) do
+    vim.api.nvim_create_user_command(name, function(cmd_opts)
+      local ok, res = pcall(spec.run, cmd_opts)
+      if not ok then
+        vim.notify("Provenance: " .. name .. " failed: " .. tostring(res), vim.log.levels.ERROR)
+        return
+      end
+      notify_result(res)
+    end, { desc = spec.desc, nargs = spec.nargs })
+  end
+
   local handle = {}
 
   function handle.dispose()
     registry.stop_all("deactivate")
+    -- Drop every derived per-course PRIVATE key. This is the disposal path that
+    -- justifies caching them at this layer at all.
+    identity_key_cache.dispose()
+    for name in pairs(IDENTITY_COMMANDS) do
+      pcall(vim.api.nvim_del_user_command, name)
+    end
     pcall(vim.api.nvim_del_augroup_by_name, AUGROUP_NAME)
     status.detach()
     pcall(vim.api.nvim_del_user_command, SEAL_COMMAND_NAME)

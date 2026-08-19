@@ -28,6 +28,7 @@ local core_checkpoint = require("provenance.core.checkpoint")
 local recorder_context = require("provenance.recorder.session.recorder_context")
 local session_host = require("provenance.recorder.session.session_host")
 local policy_gate = require("provenance.recorder.session.policy_gate")
+local session_identity = require("provenance.recorder.identity.session_identity")
 local session_writer = require("provenance.recorder.io.session_writer")
 local meta_writer = require("provenance.recorder.io.meta_writer")
 local checkpoint_cadence = require("provenance.recorder.session.checkpoint_cadence")
@@ -208,6 +209,21 @@ function M.start(opts)
   local policy = policy_gate.effective_policy(manifest)
   local gate = policy_gate.new(policy)
 
+  -- 1c. Student identity (program spec §5/§S2). NEVER blocks recording: every
+  -- failure path — unenrolled, unreadable store, lapsed cert, a token minted
+  -- for a different master secret — returns `skipped` and the session records
+  -- with the `identity` key simply ABSENT. `opts.identity_store` is nil in
+  -- tests and in any caller that has not wired identity, which reads as "not
+  -- enrolled" and is equally non-blocking.
+  local identity_outcome = session_identity.build({
+    manifest = manifest,
+    session_pubkey_hex = keypair.public_key_hex,
+    session_started_at = clock.wall(),
+    store = opts.identity_store,
+    key_cache = opts.identity_key_cache,
+  })
+  local identity = identity_outcome.kind == "emitted" and identity_outcome.identity or nil
+
   -- 2. Logical session context — the session.start payload. session_id
   -- here is the LOGICAL session id (chain/manifest identity), distinct
   -- from the filename uuid generated below (two-uuid rule).
@@ -215,6 +231,7 @@ function M.start(opts)
     manifest = manifest,
     prev_session_id = prev_session_id,
     session_pubkey_hex = keypair.public_key_hex,
+    identity = identity,
     env = opts.env,
   })
 
@@ -442,6 +459,9 @@ function M.start(opts)
     -- _doc_wiring_augroup_id above.
     _host = host,
     _policy = policy,
+    -- Test/inspection seam: why an identity was or was not emitted. Diagnostic
+    -- only — nothing branches on it.
+    _identity_outcome = identity_outcome,
   }
 
   -- TEST SEAM (Plan 9): expose the signal sub-handles so the integration test

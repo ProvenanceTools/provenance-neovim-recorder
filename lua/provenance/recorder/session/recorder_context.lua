@@ -130,8 +130,9 @@ local function build_manifest_block(m)
   return block
 end
 
---- @param opts table {manifest, prev_session_id, session_pubkey_hex, env?}
+--- @param opts table {manifest, prev_session_id, session_pubkey_hex, identity?, env?}
 ---   manifest: table with assignment_id, semester, sig.
+---   identity: the verified session.start identity block, or nil to omit it.
 ---   prev_session_id: string or nil (fresh session).
 ---   session_pubkey_hex: string or nil.
 ---   env: optional overrides — uuid (function -> string), hostname, username,
@@ -178,13 +179,19 @@ function M.build_recorder_context(opts)
       commit = "",
       platform = platform,
     },
+    -- NEW in 2.0 (program spec §5, §S2): the student identity block, present
+    -- ONLY when a verified one could be built. `opts.identity` is nil whenever
+    -- the student is unenrolled, the secret store is unreadable, or the chain
+    -- walk failed — and a nil assignment in Lua leaves the key ABSENT, which is
+    -- exactly what the spec requires: never nil-valued, never an empty table.
+    -- An identity that cannot be verified is omitted rather than written,
+    -- because session.start is signed and hash-chained and a broken claim in
+    -- there is permanent. See identity/session_identity.lua.
+    identity = opts.identity,
     -- NEW in 2.0: the editor-neutral host block that replaces `vscode`.
     -- `editor_build` is "" because Neovim has no build-commit concept — the
     -- spec explicitly permits the empty string (VS Code does not expose one
-    -- either). NOTE: deliberately NO `identity` block. Enrollment keys are
-    -- sub-project S2 and do not exist yet; the field is optional precisely so
-    -- this can land first, and emitting an empty or invented one would be a
-    -- claim the recorder cannot back.
+    -- either).
     host = {
       editor = "neovim",
       editor_version = nvim_version,
