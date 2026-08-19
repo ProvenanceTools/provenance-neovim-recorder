@@ -20,7 +20,7 @@
 --- **A suppressed event must consume NO sequence number.** The policy check
 --- therefore runs before the envelope is built and before the chain advances.
 --- Dropping an event after chaining would leave a hole in the seq run, which
---- validation check 3 reads as a DELETED ENTRY — turning a course's privacy
+--- validation check 4 (seq_gaps) reads as a DELETED ENTRY — turning a course's privacy
 --- setting into a tamper signal against the student. This ordering is the
 --- whole safety property; do not move the check below `chain_entry`.
 ---
@@ -63,7 +63,7 @@ function M.new(opts)
   --- CRITICAL ORDERING 1 — policy BEFORE the chain. A kind the capture policy
   --- disables is dropped here, before the envelope exists and before seq or
   --- prev_hash move, so a suppressed event consumes NO sequence number and
-  --- leaves NO hole for validation check 3 to read as a deleted entry.
+  --- leaves NO hole for validation check 4 (seq_gaps) to read as a deleted entry.
   --- Returns nil in that case; every caller is fire-and-forget.
   ---
   --- CRITICAL ORDERING 2 — chain state (seq/prev_hash) advances BEFORE

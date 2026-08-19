@@ -138,7 +138,7 @@ end)
 ---
 --- The safety property under test: a suppressed event must consume NO sequence
 --- number. Dropping an event AFTER chaining would leave a hole in the seq run,
---- and validation check 3 reads a hole as a DELETED ENTRY -- which would turn a
+--- and validation check 4 (seq_gaps) reads a hole as a DELETED ENTRY -- which would turn a
 --- course's privacy setting into a tamper signal against the student. These
 --- tests assert the seq run stays contiguous and the chain stays valid across
 --- heavy suppression.
@@ -218,7 +218,7 @@ describe("session_host.emit capture-policy gate", function()
 
   it("the resulting chain VALIDATES -- check 3 sees no deleted entry", function()
     -- The end-to-end statement of the invariant: run the real chain validator,
-    -- the same one that backs validation check 3, over a heavily suppressed run.
+    -- the same one that backs validation check 4 (seq_gaps), over a heavily suppressed run.
     local host, entries = host_with(ALL_OFF)
 
     host.emit("session.start", {})
