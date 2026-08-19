@@ -242,16 +242,54 @@ describe("conformance: course-cert.json (chain step 1 + the validity window)", f
     end)
   end
 
-  it("a date-only bound is UTC midnight that day, both bounds inclusive", function()
-    -- Pins the two rules the three implementations are most likely to disagree
-    -- on: date-only means midnight (not end of day), and both bounds are
-    -- inclusive.
+  it("a date-only bound resolves ASYMMETRICALLY: valid_from day-start, valid_until end-of-day", function()
+    -- The rule the three implementations are most likely to disagree on.
+    -- parse_iso_instant_ms itself is unchanged and still reads a date as its
+    -- FIRST instant; only valid_until's caller-side reading extends.
     assert.equals(
       course_cert.parse_iso_instant_ms("2027-01-15"),
       course_cert.parse_iso_instant_ms("2027-01-15T00:00:00Z")
     )
+
+    -- valid_from: inclusive from the first instant of its day.
     assert.is_true(course_cert.check_window(fx.valid_cert, "2026-08-20T00:00:00Z").in_window)
+
+    -- valid_until: inclusive through the LAST instant of its day...
     assert.is_true(course_cert.check_window(fx.valid_cert, "2027-01-15T00:00:00Z").in_window)
+    assert.is_true(course_cert.check_window(fx.valid_cert, "2027-01-15T12:00:00Z").in_window)
+    assert.is_true(course_cert.check_window(fx.valid_cert, "2027-01-15T23:59:59.999Z").in_window)
+    -- ...and out at the first instant of the next day.
+    assert.equals(
+      "after_valid_until",
+      course_cert.check_window(fx.valid_cert, "2027-01-16T00:00:00Z").reason
+    )
+  end)
+
+  it("the exclusive upper bound is next-midnight for a date, +1ms for a timestamp", function()
+    -- The framing matters as much as the result: an exclusive next-midnight
+    -- bound cannot be undercut by a 23:59:59.999 precision trap. A full
+    -- timestamp keeps its exact-instant meaning and is NOT extended to
+    -- end-of-day.
+    local day = 24 * 60 * 60 * 1000
+    assert.equals(
+      course_cert.parse_iso_instant_ms("2027-01-16T00:00:00Z"),
+      course_cert.resolve_valid_until_exclusive_ms("2027-01-15")
+    )
+    assert.equals(
+      course_cert.parse_iso_instant_ms("2027-01-15") + day,
+      course_cert.resolve_valid_until_exclusive_ms("2027-01-15")
+    )
+    assert.equals(
+      course_cert.parse_iso_instant_ms("2027-01-15T09:30:00Z") + 1,
+      course_cert.resolve_valid_until_exclusive_ms("2027-01-15T09:30:00Z")
+    )
+    assert.is_nil(course_cert.resolve_valid_until_exclusive_ms("not a date"))
+
+    -- A full-timestamp valid_until expires the millisecond after, with no
+    -- end-of-day extension.
+    local cert = { valid_from = "2026-08-20", valid_until = "2027-01-15T09:30:00Z" }
+    assert.is_true(course_cert.check_window(cert, "2027-01-15T09:30:00.000Z").in_window)
+    assert.equals("after_valid_until", course_cert.check_window(cert, "2027-01-15T09:30:00.001Z").reason)
   end)
 
   it("leap seconds and 24:00:00 are rejected, non-existent calendar dates are not rolled forward", function()
@@ -549,8 +587,6 @@ describe("conformance: capture-policy.json (program spec §4)", function()
         selection_change = false,
         focus_change = false,
         terminal = false,
-        doc_open_close = false,
-        inline_content = false,
       },
     })
     for _, kind in ipairs(capture_policy.FLOOR_EVENT_KINDS) do

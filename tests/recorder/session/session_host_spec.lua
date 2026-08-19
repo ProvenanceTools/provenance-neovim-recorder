@@ -147,13 +147,14 @@ describe("session_host.emit capture-policy gate", function()
   local policy_gate = require("provenance.recorder.session.policy_gate")
   local chain_validator = require("provenance.core.chain_validator")
 
+  -- Every knob that still exists, all off. Note doc.open/doc.close are NOT here
+  -- any more: they became floor kinds (doc.open carries the reconstruction
+  -- seed), so the gated set is exactly selection/focus/terminal.
   local ALL_OFF = {
     capture = {
       selection_change = false,
       focus_change = false,
       terminal = false,
-      doc_open_close = false,
-      inline_content = false,
     },
   }
 
@@ -178,7 +179,7 @@ describe("session_host.emit capture-policy gate", function()
 
     assert.is_nil(host.emit("selection.change", { line = 1 }))
     assert.is_nil(host.emit("focus.change", { focused = false }))
-    assert.is_nil(host.emit("doc.open", { path = "a.lua" }))
+    assert.is_nil(host.emit("terminal.open", { id = 1 }))
     assert.is_nil(host.emit("terminal.command", { cmd = "ls" }))
 
     -- Nothing moved.
@@ -198,6 +199,7 @@ describe("session_host.emit capture-policy gate", function()
     host.emit("session.start", {})
     for i = 1, 20 do
       -- Alternate allowed and suppressed kinds so any hole would show up.
+      -- doc.open is deliberately in the ALLOWED column now: it is a floor kind.
       host.emit("selection.change", { i = i })
       host.emit("doc.change", { i = i })
       host.emit("doc.open", { i = i })
@@ -207,8 +209,8 @@ describe("session_host.emit capture-policy gate", function()
     end
     host.emit("session.end", { reason = "deactivate" })
 
-    -- 1 start + 20*(doc.change + doc.save) + 1 end
-    assert.equals(42, #entries)
+    -- 1 start + 20*(doc.change + doc.open + doc.save) + 1 end
+    assert.equals(62, #entries)
     for i, entry in ipairs(entries) do
       assert.equals(i - 1, entry.seq, "seq must be contiguous from 0; hole before index " .. i)
     end
@@ -240,19 +242,22 @@ describe("session_host.emit capture-policy gate", function()
     assert.is_true(chain_validator.validate_chain(entries).ok)
   end)
 
-  it("inline content is withheld BEFORE hashing, and length/sha256/size survive", function()
+  --- REPLACES the deleted inline-content redaction test. `inline_content` was
+  --- retired, so `paste` and `fs.external_change` now reach the chain with their
+  --- content intact under EVERY policy -- which is the property internal_move
+  --- depends on to downgrade a large_paste flag.
+  it("paste and external-change content reaches the chain intact under an all-off policy", function()
     local host, entries = host_with(ALL_OFF)
 
-    local paste = host.emit("paste", { length = 12, sha256 = string.rep("c", 64), content = "secret" })
-    assert.is_nil(paste.data.content)
-    assert.equals(12, paste.data.length)
+    local paste = host.emit("paste", { length = 6, sha256 = string.rep("c", 64), content = "secret" })
+    assert.equals("secret", paste.data.content, "no policy may strip paste content any more")
+    assert.equals(6, paste.data.length)
     assert.equals(string.rep("c", 64), paste.data.sha256)
 
     local ext = host.emit("fs.external_change", { new_content_size = 9, new_content = "rewritten" })
-    assert.is_nil(ext.data.new_content)
+    assert.equals("rewritten", ext.data.new_content)
     assert.equals(9, ext.data.new_content_size)
 
-    -- Both are FLOOR kinds: the events themselves still fire.
     assert.equals(2, #entries)
     assert.is_true(chain_validator.validate_chain(entries).ok)
   end)
@@ -273,9 +278,12 @@ describe("session_host.emit capture-policy gate", function()
 
   it("the default policy suppresses nothing", function()
     local host, entries = host_with(nil)
+    local gated_count = 0
     for kind in pairs(capture_policy.POLICY_GATED_EVENT_KINDS) do
       assert.is_not_nil(host.emit(kind, {}), kind .. " must be recorded under the default policy")
+      gated_count = gated_count + 1
     end
-    assert.equals(6, #entries)
+    assert.equals(4, gated_count, "the gated set is selection/focus/terminal.open/terminal.command")
+    assert.equals(gated_count, #entries)
   end)
 end)

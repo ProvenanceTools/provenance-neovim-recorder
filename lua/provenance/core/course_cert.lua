@@ -86,9 +86,11 @@ end
 ---   YYYY-MM-DD [ THH:MM:SS [ .fraction(1-9 digits) ] [ Z | +HH:MM | -HH:MM ] ]
 ---
 --- Deliberate rules, all pinned by `timestamp_parse_cases`:
----  - A **date-only** string is UTC midnight that day. `valid_until
----    "2027-01-15"` therefore expires at 2027-01-15T00:00:00Z, not at the end
----    of that day. Harmless, because out-of-window is non-fatal.
+---  - A **date-only** string is UTC midnight that day, i.e. its FIRST instant.
+---    That is the right reading for `valid_from`, and this function keeps it
+---    for every caller. `valid_until` is the one exception and it is applied by
+---    the CALLER, not here: see M.resolve_valid_until_exclusive_ms, which
+---    extends a date-only upper bound through the end of that day.
 ---  - A timestamp with **no offset** is UTC.
 ---  - Fractional seconds are padded/truncated to exactly 3 digits (ms).
 ---  - `second > 59` rejects leap seconds and `hour > 23` rejects the
@@ -163,6 +165,47 @@ function M.parse_iso_instant_ms(value)
 
   local days = days_from_civil(y, mo, d)
   return days * 86400000 + hour * 3600000 + minute * 60000 + second * 1000 + millis + offset_ms
+end
+
+local ONE_DAY_MS = 24 * 60 * 60 * 1000
+
+--- Matches ONLY a bare `YYYY-MM-DD` -- no time component at all.
+local function is_date_only(value)
+  return type(value) == "string" and value:match("^%d%d%d%d%-%d%d%-%d%d$") ~= nil
+end
+
+--- Resolve a `valid_until` value to an EXCLUSIVE upper-bound instant, in epoch
+--- milliseconds: the certificate is out of window once `issued >= result`.
+---
+--- `valid_until` is an inclusive upper bound, but a date-only value
+--- (`YYYY-MM-DD`) is inclusive **through the end of that day**, not merely its
+--- first instant -- "valid until Jan 15" should cover Jan 15. Note the
+--- deliberate ASYMMETRY with `valid_from`, which stays inclusive from its day's
+--- first instant.
+---
+--- Expressed as an exclusive bound at the START OF THE NEXT DAY rather than an
+--- inclusive `<day-start> + 23:59:59.999`, on purpose: an exclusive
+--- next-midnight bound cannot be undercut by a precision trap (a stray
+--- leap-second adjustment, a sub-millisecond source, an off-by-one in a port's
+--- "last millisecond of the day" arithmetic) the way a literal 23:59:59.999
+--- constant could be. Every instant this is compared against is itself parsed
+--- to millisecond resolution, so the two framings denote the identical set of
+--- in-window instants -- exclusive is chosen for robustness, not behaviour.
+---
+--- A full timestamp keeps its exact-instant meaning: valid AT that instant,
+--- expired the millisecond after, so the exclusive bound is `<parsed ms> + 1`.
+---
+--- @param value string
+--- @return number|nil  epoch milliseconds, exclusive; nil if unparseable
+function M.resolve_valid_until_exclusive_ms(value)
+  local ms = M.parse_iso_instant_ms(value)
+  if ms == nil then
+    return nil
+  end
+  if is_date_only(value) then
+    return ms + ONE_DAY_MS
+  end
+  return ms + 1
 end
 
 -- ---------------------------------------------------------------------------
@@ -281,7 +324,12 @@ function M.verify(cert, root_pubkey_hex)
 end
 
 --- Step 4 of the Manifest 2.0 verification order: is `issued_at` inside
---- `[valid_from, valid_until]`? **Both bounds inclusive.**
+--- `[valid_from, valid_until]`? **Both bounds inclusive** -- but "inclusive"
+--- means different arithmetic at each end for a DATE-ONLY bound: `valid_from`
+--- is inclusive from that day's first instant, while `valid_until` is inclusive
+--- through that day's last instant (see M.resolve_valid_until_exclusive_ms). A
+--- full-timestamp bound at either end means exactly that instant, at
+--- millisecond resolution.
 ---
 --- Evaluated against the manifest's `issued_at`, NEVER against wall-clock now:
 --- a Fall 2026 bundle must still verify in 2028 for an adjudication case. The
@@ -297,16 +345,16 @@ end
 ---   | { in_window = false, reason = "before_valid_from" | "after_valid_until" | "unparseable_timestamp" }
 function M.check_window(cert, issued_at)
   local from = M.parse_iso_instant_ms(cert.valid_from)
-  local until_ = M.parse_iso_instant_ms(cert.valid_until)
+  local until_exclusive = M.resolve_valid_until_exclusive_ms(cert.valid_until)
   local issued = M.parse_iso_instant_ms(issued_at)
 
-  if from == nil or until_ == nil or issued == nil then
+  if from == nil or until_exclusive == nil or issued == nil then
     return { in_window = false, reason = "unparseable_timestamp" }
   end
   if issued < from then
     return { in_window = false, reason = "before_valid_from" }
   end
-  if issued > until_ then
+  if issued >= until_exclusive then
     return { in_window = false, reason = "after_valid_until" }
   end
   return { in_window = true }

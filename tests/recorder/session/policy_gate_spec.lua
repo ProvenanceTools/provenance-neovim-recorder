@@ -8,9 +8,18 @@ local ALL_OFF = {
     selection_change = false,
     focus_change = false,
     terminal = false,
+    heartbeat_interval_ms = 120000,
+  },
+}
+
+--- A policy still carrying the two RETIRED keys. `doc_open_close` and
+--- `inline_content` were removed because doc.open carries the reconstruction
+--- seed and paste content is what lets internal_move DOWNGRADE large_paste.
+--- A manifest in the wild may still carry them; they must be inert.
+local WITH_RETIRED_KEYS = {
+  capture = {
     doc_open_close = false,
     inline_content = false,
-    heartbeat_interval_ms = 120000,
   },
 }
 
@@ -18,8 +27,32 @@ describe("policy_gate.effective_policy", function()
   it("a 2.0 manifest's policy is honoured", function()
     local policy = policy_gate.effective_policy({ format_version = "2.0", policy = ALL_OFF })
     assert.is_false(policy.selection_change)
-    assert.is_false(policy.inline_content)
+    assert.is_false(policy.focus_change)
+    assert.is_false(policy.terminal)
     assert.equals(120000, policy.heartbeat_interval_ms)
+  end)
+
+  it("the resolved policy has exactly the four surviving keys", function()
+    local policy = policy_gate.effective_policy({ format_version = "2.0", policy = ALL_OFF })
+    local keys = {}
+    for k in pairs(policy) do
+      keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    assert.same({ "focus_change", "heartbeat_interval_ms", "selection_change", "terminal" }, keys)
+  end)
+
+  it("a RETIRED key is inert — ignored, never an error, and it suppresses nothing", function()
+    local policy = policy_gate.effective_policy({ format_version = "2.0", policy = WITH_RETIRED_KEYS })
+    assert.same(capture_policy.DEFAULTS, policy)
+    assert.is_nil(policy.doc_open_close)
+    assert.is_nil(policy.inline_content)
+
+    local gate = policy_gate.new(policy)
+    assert.is_true(gate.allows("doc.open"), "doc.open is floor; a retired key must not reach it")
+    assert.is_true(gate.allows("doc.close"))
+    assert.is_true(gate.allows("paste"))
+    assert.is_true(gate.allows("fs.external_change"))
   end)
 
   it("a 1.x manifest resolves to DEFAULTS even when it carries a policy block", function()
@@ -40,6 +73,56 @@ describe("policy_gate.effective_policy", function()
     assert.same(capture_policy.DEFAULTS, policy_gate.effective_policy(nil))
     assert.same(capture_policy.DEFAULTS, policy_gate.effective_policy("nope"))
     assert.same(capture_policy.DEFAULTS, policy_gate.effective_policy({ format_version = "2.0" }))
+  end)
+end)
+
+--- The shared dev 2.0 manifest is a REAL signed manifest whose policy still
+--- carries both retired keys. It is the strongest available inertness case,
+--- because the retired keys sit INSIDE the course-signed payload: the signature
+--- covers them verbatim, so the manifest must still verify byte-for-byte AND
+--- still resolve as if they were not there.
+---
+--- This matters more in this port than in the others: validate_signed_subtree
+--- walks the policy sub-tree, so an over-strict "unknown capture key" rule here
+--- would reject a manifest the other two recorders accept.
+describe("policy_gate retired keys inside a real signed policy", function()
+  local core_manifest = require("provenance.core.manifest")
+  local trust_keys = require("provenance.trust_keys")
+
+  local function this_file_dir()
+    local source = debug.getinfo(1, "S").source
+    local path = source:match("^@(.*)$") or source
+    return vim.fn.fnamemodify(path, ":h")
+  end
+
+  local text = table.concat(
+    vim.fn.readfile(this_file_dir() .. "/../fixtures/dev-manifest-v2.json"), "\n"
+  )
+
+  it("the fixture really does carry both retired keys in its signed policy", function()
+    -- Guards the test below from silently going vacuous if the fixture is ever
+    -- re-signed without them.
+    local raw = vim.json.decode(text)
+    assert.is_false(raw.policy.capture.doc_open_close == nil)
+    assert.is_false(raw.policy.capture.inline_content == nil)
+  end)
+
+  it("still parses and still verifies its full trust chain", function()
+    local parsed = core_manifest.parse(text)
+    assert.is_true(parsed.ok, "a retired key must never make a manifest unparseable")
+    local chain = core_manifest.verify_chain(parsed.value, trust_keys.ROOT_PUBLIC_KEY_HEX)
+    assert.is_true(chain.ok, "retired keys are signed-over; the signature must still verify")
+  end)
+
+  it("resolves as if the retired keys were absent, and suppresses nothing", function()
+    local parsed = core_manifest.parse(text)
+    local policy = policy_gate.effective_policy(parsed.value)
+    assert.same(capture_policy.DEFAULTS, policy)
+
+    local gate = policy_gate.new(policy)
+    for _, kind in ipairs({ "doc.open", "doc.close", "paste", "fs.external_change" }) do
+      assert.is_true(gate.allows(kind), kind .. " is floor and must survive a retired key")
+    end
   end)
 end)
 
@@ -77,7 +160,7 @@ describe("policy_gate.new", function()
     assert.is_false(gate.allows("terminal.open"))
     assert.is_false(gate.allows("terminal.command"))
     assert.is_true(gate.allows("selection.change"))
-    assert.is_true(gate.allows("doc.open"))
+    assert.is_true(gate.allows("doc.open"), "doc.open is now a FLOOR kind")
   end)
 
   it("nil policy means capture everything", function()
@@ -85,73 +168,5 @@ describe("policy_gate.new", function()
     for kind in pairs(capture_policy.POLICY_GATED_EVENT_KINDS) do
       assert.is_true(gate.allows(kind))
     end
-  end)
-end)
-
-describe("policy_gate redact (inline_content)", function()
-  local function off_gate()
-    return policy_gate.new(capture_policy.resolve(ALL_OFF))
-  end
-
-  it("withholds paste content but KEEPS length and sha256", function()
-    local data = { length = 4096, sha256 = string.rep("a", 64), content = "secret solution" }
-    local out = off_gate().redact("paste", data)
-    assert.is_nil(out.content)
-    assert.equals(4096, out.length)
-    assert.equals(string.rep("a", 64), out.sha256)
-  end)
-
-  it("withholds the truncated head/tail preview too", function()
-    local data = {
-      length = 999999,
-      sha256 = string.rep("b", 64),
-      content_head = "head",
-      content_tail = "tail",
-    }
-    local out = off_gate().redact("paste", data)
-    assert.is_nil(out.content_head)
-    assert.is_nil(out.content_tail)
-    assert.equals(999999, out.length)
-    assert.equals(string.rep("b", 64), out.sha256)
-  end)
-
-  it("withholds fs.external_change content but KEEPS new_content_size", function()
-    local data = { new_content_size = 128, new_content = "rewritten by a script" }
-    local out = off_gate().redact("fs.external_change", data)
-    assert.is_nil(out.new_content)
-    assert.equals(128, out.new_content_size)
-
-    local big = { new_content_size = 99999, new_content_head = "h", new_content_tail = "t" }
-    local out2 = off_gate().redact("fs.external_change", big)
-    assert.is_nil(out2.new_content_head)
-    assert.is_nil(out2.new_content_tail)
-    assert.equals(99999, out2.new_content_size)
-  end)
-
-  it("never mutates the caller's table", function()
-    -- Payload builders and their tests hand the same table to more than one
-    -- consumer; redaction must be a copy, not an edit in place.
-    local data = { length = 3, sha256 = "x", content = "abc" }
-    off_gate().redact("paste", data)
-    assert.equals("abc", data.content)
-  end)
-
-  it("leaves every other kind's payload alone, by identity", function()
-    local gate = off_gate()
-    local data = { path = "a.lua", text = "keep me" }
-    assert.equals(data, gate.redact("doc.change", data))
-    assert.equals(data, gate.redact("session.heartbeat", data))
-  end)
-
-  it("with inline_content ON, paste payloads pass through by identity", function()
-    local gate = policy_gate.new(capture_policy.DEFAULTS)
-    local data = { length = 3, sha256 = "x", content = "abc" }
-    assert.equals(data, gate.redact("paste", data))
-  end)
-
-  it("tolerates a nil or non-table payload", function()
-    local gate = off_gate()
-    assert.is_nil(gate.redact("paste", nil))
-    assert.equals("weird", gate.redact("paste", "weird"))
   end)
 end)

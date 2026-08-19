@@ -4,16 +4,24 @@
 --- The professor-facing control: a course can turn capture DOWN, a student
 --- cannot turn it OFF. Two kinds of control, both handled here:
 ---
----  - **Event kinds.** `selection.change`, `focus.change`, `terminal.*`,
----    `doc.open`/`doc.close` each have a `policy.capture` key. Everything else
----    is on the HARD FLOOR and has no key at all — the schema is the
----    enforcement mechanism, so this module never re-implements the floor as a
----    list of exceptions. It asks `capture_policy.is_event_kind_captured`,
----    which returns true for any kind with no key.
----  - **Inline content.** `paste` and `fs.external_change` are floor kinds and
----    always fire; `inline_content = false` withholds only the inlined bytes.
----    Length, sha256 and size always survive, so the paste heuristics and
----    `mass_external_replacement` still have something to work with.
+--- Exactly one kind of control remains: **event kinds**. `selection.change`,
+--- `focus.change` and `terminal.*` each have a `policy.capture` key. Everything
+--- else is on the HARD FLOOR and has no key at all — the schema is the
+--- enforcement mechanism, so this module never re-implements the floor as a
+--- list of exceptions. It asks `capture_policy.is_event_kind_captured`, which
+--- returns true for any kind with no key.
+---
+--- There is deliberately NO payload redaction here any more. An earlier
+--- `inline_content` knob stripped the content fields from `paste` and
+--- `fs.external_change`; it was retired because `internal_move` needs that
+--- content to DOWNGRADE a `large_paste` flag, so stripping it made the system
+--- more accusatory, not more private. `doc_open_close` went the same way —
+--- `doc.open` carries the reconstruction seed. See capture_policy.lua for the
+--- general rule those two removals establish.
+---
+--- NOTE: the 64 KB inline size cap lives in the payload builders
+--- (events/paste_payload.lua, events/external_change_content.lua) and is an
+--- entirely separate mechanism. It was never a policy knob and is untouched.
 ---
 --- ## Why the gate is an object handed to SessionHost, not logic inside it
 ---
@@ -26,23 +34,13 @@
 ---
 --- ## Compiled, because emit is the firehose
 ---
---- `doc.change` fires per keystroke and must stay well under 1 ms. Both
---- decisions are therefore precomputed in `new()` into two tables that are
---- EMPTY in the common case (everything enabled): `allows` and `redact` become
---- a single failed hash lookup each. Never a policy re-resolve, never a
---- manifest re-parse, and never any crypto.
+--- `doc.change` fires per keystroke and must stay well under 1 ms. The decision
+--- is therefore precomputed in `new()` into a table that is EMPTY in the common
+--- case (everything enabled), so `allows` is a single failed hash lookup. Never
+--- a policy re-resolve, never a manifest re-parse, and never any crypto.
 local capture_policy = require("provenance.core.capture_policy")
 
 local M = {}
-
---- Inline-content fields to strip per kind when `inline_content` is disabled.
---- The retained fields (`length`, `sha256`, `new_content_size`) are deliberately
---- NOT listed: withholding content must never cost the analyzer the ability to
---- size or fingerprint what happened.
-local INLINE_CONTENT_FIELDS = {
-  ["paste"] = { "content", "content_head", "content_tail" },
-  ["fs.external_change"] = { "new_content", "new_content_head", "new_content_tail" },
-}
 
 --- The effective capture policy for an ALREADY-VERIFIED manifest.
 ---
@@ -67,7 +65,7 @@ end
 
 --- Compile a resolved policy into a gate.
 --- @param policy table|nil  a resolved CapturePolicy (see capture_policy.resolve)
---- @return table gate { policy, allows(kind), redact(kind, data) }
+--- @return table gate { policy, allows(kind) }
 function M.new(policy)
   policy = policy or capture_policy.resolve(nil)
 
@@ -81,14 +79,6 @@ function M.new(policy)
     end
   end
 
-  -- Precomputed: kind -> fields to strip. Empty unless inline_content is off.
-  local strip = {}
-  if policy.inline_content == false then
-    for kind, fields in pairs(INLINE_CONTENT_FIELDS) do
-      strip[kind] = fields
-    end
-  end
-
   local gate = { policy = policy }
 
   --- May this event kind be recorded at all?
@@ -97,37 +87,6 @@ function M.new(policy)
   --- @return boolean
   function gate.allows(kind)
     return not blocked[kind]
-  end
-
-  --- Strip withheld inline content from a payload the policy still allows.
-  ---
-  --- Returns `data` UNCHANGED (same table, no allocation) whenever nothing is
-  --- withheld, which is every event on the hot path and every event at all
-  --- under the default policy. When something is withheld it returns a shallow
-  --- COPY — never mutating the caller's table, because payload builders and
-  --- their tests hand the same table to more than one consumer.
-  --- @param kind string
-  --- @param data table|nil
-  --- @return table|nil
-  function gate.redact(kind, data)
-    local fields = strip[kind]
-    if fields == nil or type(data) ~= "table" then
-      return data
-    end
-
-    local copy = nil
-    for _, field in ipairs(fields) do
-      if data[field] ~= nil then
-        if copy == nil then
-          copy = {}
-          for k, v in pairs(data) do
-            copy[k] = v
-          end
-        end
-        copy[field] = nil
-      end
-    end
-    return copy or data
   end
 
   return gate

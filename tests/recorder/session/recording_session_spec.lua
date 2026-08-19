@@ -388,16 +388,16 @@ describe("recording_session capture policy", function()
       selection_change = false,
       focus_change = false,
       terminal = false,
-      doc_open_close = false,
-      inline_content = false,
     }))
 
     -- Drive the gated kinds straight at the host's emit seam, which is exactly
     -- what every wiring module does.
-    for _, kind in ipairs({ "doc.open", "doc.close", "selection.change", "focus.change", "terminal.open", "terminal.command" }) do
+    for _, kind in ipairs({ "selection.change", "focus.change", "terminal.open", "terminal.command" }) do
       session._host.emit(kind, { probe = kind })
     end
+    -- Floor kinds, which no policy can reach.
     session._host.emit("doc.change", { probe = "doc.change" })
+    session._host.emit("doc.open", { probe = "doc.open" })
 
     local entries = entries_of(session)
     for _, entry in ipairs(entries) do
@@ -416,18 +416,18 @@ describe("recording_session capture policy", function()
     -- Below 2.0 the policy block is not inside the signed payload, so a student
     -- could staple this onto a genuinely signed 1.x manifest.
     local m = dev_manifest()
-    m.policy = { capture = { selection_change = false, doc_open_close = false } }
+    m.policy = { capture = { selection_change = false, terminal = false } }
 
     local session = start(m)
     session._host.emit("selection.change", { probe = 1 })
-    session._host.emit("doc.open", { probe = 2 })
+    session._host.emit("terminal.open", { probe = 2 })
 
     local kinds = {}
     for _, entry in ipairs(entries_of(session)) do
       kinds[entry.kind] = true
     end
     assert.is_true(kinds["selection.change"], "a 1.x policy must not disable capture")
-    assert.is_true(kinds["doc.open"], "a 1.x policy must not disable capture")
+    assert.is_true(kinds["terminal.open"], "a 1.x policy must not disable capture")
   end)
 
   it("session.heartbeat is on the floor: it survives an all-off policy", function()
@@ -435,8 +435,6 @@ describe("recording_session capture policy", function()
       selection_change = false,
       focus_change = false,
       terminal = false,
-      doc_open_close = false,
-      inline_content = false,
       heartbeat_interval_ms = 120000,
     }))
     -- Driven at the gate, which is where the floor is enforced -- the heartbeat
@@ -461,6 +459,24 @@ describe("recording_session capture policy", function()
 
     local session2 = start(v2_manifest_with({ heartbeat_interval_ms = 999999 }))
     assert.equals(core_capture_policy.HEARTBEAT_INTERVAL_MAX_MS, session2._policy.heartbeat_interval_ms)
+  end)
+
+  it("a RETIRED capture key in a live 2.0 manifest is inert", function()
+    -- doc_open_close and inline_content were removed. A manifest still carrying
+    -- them must behave as if it carried unknown keys: doc.open still recorded,
+    -- paste content still intact.
+    local session = start(v2_manifest_with({ doc_open_close = false, inline_content = false }))
+    assert.same(core_capture_policy.DEFAULTS, session._policy)
+
+    session._host.emit("doc.open", { probe = "doc.open" })
+    session._host.emit("paste", { length = 6, sha256 = ("d"):rep(64), content = "secret" })
+
+    local by_kind = {}
+    for _, entry in ipairs(entries_of(session)) do
+      by_kind[entry.kind] = entry
+    end
+    assert.is_not_nil(by_kind["doc.open"], "doc.open is floor; a retired key must not suppress it")
+    assert.equals("secret", by_kind["paste"].data.content, "no policy may strip paste content")
   end)
 
   it("a 1.x session resolves to the v1.x capture set, unchanged", function()

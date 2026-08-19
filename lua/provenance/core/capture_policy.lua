@@ -11,20 +11,45 @@
 ---       "selection_change":      true,
 ---       "focus_change":          true,
 ---       "terminal":              true,
----       "doc_open_close":        true,
----       "inline_content":        true,   -- paste + fs.external_change snippets
 ---       "heartbeat_interval_ms": 30000   -- clamped to [5000, 120000]
 ---     }
 ---   }
 ---
---- ## The hard floor
+--- ## The hard floor, and the rule for every future knob
 ---
---- Most event kinds cannot be disabled at all, because validation checks 3-8
---- and the integrity story depend on them. The floor is enforced **by the
+--- Most event kinds cannot be disabled at all. The floor is enforced **by the
 --- schema itself**: a floor event simply has no key in `policy.capture`, so
 --- there is no way to express "off" for it. `FLOOR_EVENT_KINDS` is that set
 --- written out so an implementation can assert it; `POLICY_GATED_EVENT_KINDS`
 --- is its complement — the only kinds a policy can reach.
+---
+--- **THE RULE: the floor is defined by what reconstruction and validation
+--- depend on, not by privacy sensitivity.** Sensitivity is an argument FOR a
+--- knob; being load-bearing is a VETO on one. A signal whose absence degrades
+--- CORRECTNESS — rather than merely detail — must never become a knob, because
+--- a course could then silently break analysis for a whole cohort, or make the
+--- system more likely to falsely accuse its own students. Apply this test to
+--- every knob proposed from here on.
+---
+--- Two knobs were removed under exactly that rule, and both are cautionary:
+---
+---  - `doc_open_close` — `doc.open`'s payload carries the reconstruction SEED.
+---    Disabling it breaks reconstruction, replay and the Source tab for the
+---    whole cohort, with nothing warning the course. (`doc.close` is `{path}`
+---    only, but moves with its pair.)
+---  - `inline_content` — it stripped the content fields from `paste` and
+---    `fs.external_change` without removing the events. But `internal_move`
+---    reads a paste's content to match it against the student's own earlier
+---    typed code, and a match DOWNGRADES `large_paste`. Strip the content and
+---    that exculpatory check cannot run, so a genuine self-relocation keeps
+---    full severity on a flag used in academic-integrity proceedings.
+---
+--- A manifest still carrying either retired key is inert: it is an unknown
+--- capture key, ignored rather than an error (conformance-pinned).
+---
+--- NOTE the 64 KB inline size cap in the payload builders is a SEPARATE,
+--- unaffected mechanism. It bounds payload size and truncates to head/tail; it
+--- was never a policy knob and nothing here touches it.
 ---
 --- `session.heartbeat` is on the floor because bundle-level Active/Idle and the
 --- `gap_in_heartbeats` heuristic depend on it; only its *interval* is tunable.
@@ -60,8 +85,6 @@ M.DEFAULTS = {
   selection_change = true,
   focus_change = true,
   terminal = true,
-  doc_open_close = true,
-  inline_content = true,
   heartbeat_interval_ms = 30000,
 }
 
@@ -80,6 +103,9 @@ M.FLOOR_EVENT_KINDS = {
   "session.end",
   "session.resumed",
   "session.heartbeat",
+  -- doc.open carries the reconstruction seed; doc.close is its pair.
+  "doc.open",
+  "doc.close",
   "doc.change",
   "doc.save",
   "paste",
@@ -97,8 +123,6 @@ M.FLOOR_EVENT_KINDS = {
 --- The complement of FLOOR_EVENT_KINDS: every event kind a policy can switch
 --- off, mapped to the boolean key that switches it.
 M.POLICY_GATED_EVENT_KINDS = {
-  ["doc.open"] = "doc_open_close",
-  ["doc.close"] = "doc_open_close",
   ["selection.change"] = "selection_change",
   ["focus.change"] = "focus_change",
   ["terminal.open"] = "terminal",
@@ -149,8 +173,8 @@ end
 --- whose course specified nothing) resolves to M.DEFAULTS. Unknown capture keys
 --- are ignored, for forward compatibility.
 --- @param block table|nil  the manifest's `policy` value, or nil
---- @return table  { selection_change, focus_change, terminal, doc_open_close,
----   inline_content, heartbeat_interval_ms }
+--- @return table  { selection_change, focus_change, terminal,
+---   heartbeat_interval_ms }
 function M.resolve(block)
   local defaults = M.DEFAULTS
   if not is_plain_object(block) then
@@ -166,8 +190,10 @@ function M.resolve(block)
     selection_change = resolve_bool(capture.selection_change, defaults.selection_change),
     focus_change = resolve_bool(capture.focus_change, defaults.focus_change),
     terminal = resolve_bool(capture.terminal, defaults.terminal),
-    doc_open_close = resolve_bool(capture.doc_open_close, defaults.doc_open_close),
-    inline_content = resolve_bool(capture.inline_content, defaults.inline_content),
+    -- `doc_open_close` and `inline_content` are RETIRED. They are deliberately
+    -- not read here: a manifest still carrying one is treated as any other
+    -- unknown capture key — ignored, never an error, and never able to
+    -- suppress anything.
     heartbeat_interval_ms = resolve_heartbeat_interval(capture.heartbeat_interval_ms),
   }
 end

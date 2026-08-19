@@ -6,10 +6,16 @@
 --- It is also where the CAPTURE POLICY is enforced (program spec §4), for the
 --- same reason it owns the chain: it is the one place every event must pass
 --- through, so no wiring module — present or future — can emit a disabled kind
---- by forgetting a check. `doc_wiring` makes this concrete: it emits the
---- policy-gated `doc.open`/`doc.close` and is deliberately wired OUTSIDE
---- recording_session's `enable_signals` switch, so gating at that switch would
---- have silently left those two kinds ungated.
+--- by forgetting a check.
+---
+--- That "future" is not hypothetical, and the history proves the seam. The
+--- alternative was gating per-signal at recording_session's `enable_signals`
+--- switch. `doc.open`/`doc.close` were policy-gated when this landed, and
+--- `doc_wiring` is deliberately wired OUTSIDE that switch — so the per-signal
+--- approach would have shipped them ungated. They have since become FLOOR
+--- kinds, which means the specific hazard moved but the structural one did not:
+--- the gated set changes over time, and only a chokepoint is correct for every
+--- version of it.
 ---
 --- **A suppressed event must consume NO sequence number.** The policy check
 --- therefore runs before the envelope is built and before the chain advances.
@@ -29,9 +35,9 @@ local M = {}
 ---   clock: injectable {now(), wall()} (see core.clock).
 ---   on_entry: optional function(hashed_envelope) called AFTER chain state
 ---     has advanced. May be reassigned on the returned host at any time.
----   policy_gate: optional {allows(kind), redact(kind, data)} (see
----     session/policy_gate.lua). Absent means capture everything, i.e. the
----     pre-policy behaviour, byte for byte.
+---   policy_gate: optional {allows(kind)} (see session/policy_gate.lua).
+---     Absent means capture everything, i.e. the pre-policy behaviour, byte for
+---     byte.
 --- @return table host
 function M.new(opts)
   local session_id = opts.session_id
@@ -65,11 +71,8 @@ function M.new(opts)
   --- already consistent and the next emit still chains correctly. State is
   --- never rolled back on throw.
   function host.emit(kind, data)
-    if gate then
-      if not gate.allows(kind) then
-        return nil
-      end
-      data = gate.redact(kind, data)
+    if gate and not gate.allows(kind) then
+      return nil
     end
 
     local t = math.max(0, math.floor((clock.now() - t_start_ms) + 0.5))
