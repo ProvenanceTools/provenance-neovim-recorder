@@ -10,6 +10,11 @@
 --- `.slog.meta` / `manifest.json` / `manifest.sig`, which are rewritten
 --- wholesale and must never be left half-written).
 ---
+--- `open()` creates the `.slog` immediately (empty), matching the reference and
+--- pairing it with the `.slog.meta` that `meta_writer.create()` writes at the
+--- same moment — see open() for the bundle-level defect that lazy creation
+--- caused.
+---
 --- On a write failure the buffer is DROPPED, not restored or retried —
 --- durability/replay is a later plan's job. `on_error` is called
 --- best-effort and the writer never raises out of `flush()`, so a
@@ -46,7 +51,8 @@ function M.open(opts)
   local writer = {}
 
   --- Write all currently buffered lines to disk in order. Never flushes an
-  --- empty buffer (no file is created/touched by a no-op flush). Never
+  --- empty buffer — but the `.slog` already exists by then, created by open()
+  --- below, so "nothing buffered" no longer means "no file on disk". Never
   --- raises: any failure is reported via `on_error` and drops the buffer.
   function writer.flush()
     if #buf == 0 then
@@ -117,6 +123,40 @@ function M.open(opts)
     }) then
       writer.flush()
     end
+  end
+
+  --- Create the `.slog` NOW, empty, rather than lazily on the first flush.
+  ---
+  --- This mirrors the reference (`SessionWriter.open` in the monorepo does
+  --- `mkdir -p` then `fsPromises.open(slogPath, 'a')` before returning), and it
+  --- closes a real defect. `meta_writer.create()` writes `.slog.meta` eagerly at
+  --- session start; when this half was lazy, ANY session that started but never
+  --- flushed left a `.slog.meta` with no `.slog` beside it. `seal` then packed
+  --- that orphan and the analyzer rejected THE ENTIRE BUNDLE with
+  --- `orphaned_meta` — so a student lost every session, including the ones that
+  --- recorded perfectly. Creating both halves of the pair at t0 removes the
+  --- window in which they can disagree.
+  ---
+  --- Failure is routed through `on_error` rather than raised, deliberately
+  --- diverging from the reference (which throws): `flush()` already has exactly
+  --- this contract, and the disk-full handler turns a write error into degraded
+  --- mode — in-memory, critical-events-only recording. Raising here would mean a
+  --- student whose disk is full gets NO recording at all instead of a degraded
+  --- one, which is the wrong trade for an evidence tool. If it does fail, seal's
+  --- orphan guard is the backstop that keeps the bundle openable.
+  local create_ok, create_err = pcall(function()
+    ensure_parent_dir(slog_path)
+    local fd, open_err = uv.fs_open(slog_path, "a", 420) -- 420 = 0o644
+    if not fd then
+      error(open_err or "session_writer: fs_open failed")
+    end
+    local closed, close_err = uv.fs_close(fd)
+    if not closed then
+      error(close_err or "session_writer: fs_close failed")
+    end
+  end)
+  if not create_ok and on_error then
+    pcall(on_error, create_err or "session_writer: could not create .slog")
   end
 
   local timer = uv.new_timer()

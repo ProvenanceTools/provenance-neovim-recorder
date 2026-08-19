@@ -237,10 +237,17 @@ describe("recording_session degraded-mode wiring", function()
     vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "edited" })
 
     -- With is_degraded forced true from the very first entry (session.start
-    -- itself), the writer never receives a single append, so it never
-    -- flushes and the .slog is never created — the strongest possible
-    -- confirmation that nothing is routed to the writer while forced
-    -- degraded.
-    assert.is_nil(vim.uv.fs_stat(scratch.session.slog_path))
+    -- itself), the writer never receives a single append, so it never flushes
+    -- and the .slog stays EMPTY — the strongest possible confirmation that
+    -- nothing is routed to the writer while forced degraded.
+    --
+    -- The file itself now exists from session start (session_writer.open
+    -- creates it, pairing it with the .slog.meta so seal can never pack an
+    -- orphan), so the assertion is size 0 rather than file-absent. That is
+    -- strictly stronger: it distinguishes created-but-unwritten from
+    -- never-created, where file-absence conflated the two.
+    local st = vim.uv.fs_stat(scratch.session.slog_path)
+    assert.is_not_nil(st, ".slog is created empty at session start")
+    assert.equals(0, st.size, "no entry may reach the writer while degraded")
   end)
 end)

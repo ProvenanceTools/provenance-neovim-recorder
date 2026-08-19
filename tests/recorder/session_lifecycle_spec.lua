@@ -39,7 +39,7 @@ end
 --- read-only to force a real write error), temp dirs deleted. Mirrors
 --- recording_session_spec.lua's new_scratch(), plus permission tracking.
 local function new_scratch()
-  local scratch = { bufs = {}, dirs = {}, readonly_dirs = {}, session = nil }
+  local scratch = { bufs = {}, dirs = {}, readonly_dirs = {}, readonly_files = {}, session = nil }
 
   function scratch.workspace()
     local dir = vim.fs.normalize(vim.fn.tempname())
@@ -66,9 +66,25 @@ local function new_scratch()
   --- file attempt inside it fails with EACCES — used to force a REAL
   --- session_writer flush failure instead of the `_simulate_write_error`
   --- test hook (scenario 4/5).
+  ---
+  --- NOTE: locking the directory alone is NOT enough any more. session_writer
+  --- creates the `.slog` at session start, and appending to an ALREADY-EXISTING
+  --- file needs no write permission on its directory — directory permission
+  --- gates creating and unlinking entries, not writing through an existing one.
+  --- Callers forcing a write failure must also lock_file() the `.slog` itself.
+  --- Before the eager create, this helper worked only because the file did not
+  --- exist yet, so the failure it produced was really "cannot CREATE" rather
+  --- than "cannot WRITE" — a weaker proxy for a full disk than it looked.
   function scratch.lock_dir(dir)
     vim.uv.fs_chmod(dir, tonumber("555", 8))
     table.insert(scratch.readonly_dirs, dir)
+  end
+
+  --- Strip write permission from a FILE so `fs_open(path, "a")` fails with
+  --- EACCES — the accurate analogue of a disk that will not accept writes.
+  function scratch.lock_file(path)
+    vim.uv.fs_chmod(path, tonumber("444", 8))
+    table.insert(scratch.readonly_files, path)
   end
 
   --- Restore write permission on every directory scratch.lock_dir() touched.
@@ -80,6 +96,10 @@ local function new_scratch()
       pcall(vim.uv.fs_chmod, dir, tonumber("755", 8))
     end
     scratch.readonly_dirs = {}
+    for _, path in ipairs(scratch.readonly_files) do
+      pcall(vim.uv.fs_chmod, path, tonumber("644", 8))
+    end
+    scratch.readonly_files = {}
   end
 
   function scratch.teardown()
@@ -324,13 +344,16 @@ describe("recording_session lifecycle integration (Plan 8 gate)", function()
       -- Nothing has flushed yet (fixed clock never satisfies the
       -- time-based autoflush, and the buffered bytes are tiny) -- the .slog
       -- file does not exist on disk at all yet.
-      assert.is_nil(vim.uv.fs_stat(scratch.session.slog_path))
+      local st = vim.uv.fs_stat(scratch.session.slog_path)
+      assert.is_not_nil(st, ".slog is created empty at session start")
+      assert.equals(0, st.size, "nothing has been flushed yet")
       assert.is_false(scratch.session.is_degraded())
 
       -- Strip write permission from .provenance so the NEXT flush attempt's
       -- fs_open(slog_path, "a") genuinely fails with EACCES -- a real
       -- writer.on_error -> disk_full.handle_write_error, not the test hook.
       scratch.lock_dir(provenance_dir)
+      scratch.lock_file(scratch.session.slog_path)
 
       -- Force a flush: seal() drains the checkpoint scheduler then calls
       -- writer.flush() directly. The flush fails (EACCES creating the new
@@ -371,17 +394,22 @@ describe("recording_session lifecycle integration (Plan 8 gate)", function()
   it("scenario 5: no-retry invariant -- dropped buffered lines are never later written to the .slog", function()
     local _, provenance_dir, _ = start_activated_session(fx, scratch)
 
-    assert.is_nil(vim.uv.fs_stat(scratch.session.slog_path))
+    local st = vim.uv.fs_stat(scratch.session.slog_path)
+      assert.is_not_nil(st, ".slog is created empty at session start")
+      assert.equals(0, st.size, "nothing has been flushed yet")
 
     -- Force the same real write error as scenario 4: session.start (and any
     -- catch-up doc.open) are sitting in the writer's buffer, unflushed.
     scratch.lock_dir(provenance_dir)
+    scratch.lock_file(scratch.session.slog_path)
     scratch.session.seal({ now = function() return "2026-07-17T00:00:00.000Z" end })
 
     assert.is_true(scratch.session.is_degraded())
     -- The failed flush's fail() path drops the buffer instead of preserving
     -- it for retry -- the .slog was never created.
-    assert.is_nil(vim.uv.fs_stat(scratch.session.slog_path))
+    local st = vim.uv.fs_stat(scratch.session.slog_path)
+      assert.is_not_nil(st, ".slog is created empty at session start")
+      assert.equals(0, st.size, "nothing has been flushed yet")
 
     -- Restore write permission -- as if disk space were freed. If there
     -- were any retry/resume logic, this is where the previously-dropped
@@ -398,6 +426,8 @@ describe("recording_session lifecycle integration (Plan 8 gate)", function()
     -- session.start (and any pre-degrade entries) are gone for good, and no
     -- later write ever recreates the file -- once degraded, all routing
     -- bypasses the writer permanently for this session.
-    assert.is_nil(vim.uv.fs_stat(scratch.session.slog_path))
+    local st = vim.uv.fs_stat(scratch.session.slog_path)
+      assert.is_not_nil(st, ".slog is created empty at session start")
+      assert.equals(0, st.size, "nothing has been flushed yet")
   end)
 end)

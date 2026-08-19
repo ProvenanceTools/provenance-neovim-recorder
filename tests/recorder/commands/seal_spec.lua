@@ -297,3 +297,159 @@ describe("seal.seal_bundle", function()
     assert.is_true(vim.uv.fs_stat(result.bundle_path) ~= nil)
   end)
 end)
+
+--- ORPHAN / CONTENTLESS SESSION GUARD.
+---
+--- `analysis-core`'s loader pairs `session-<uuid>.slog` with its `.slog.meta` by
+--- filename and rejects THE WHOLE BUNDLE if either half is missing, before a
+--- single validation check runs. So one unpaired file used to cost a student
+--- every session they recorded. Seal must drop the unusable file, warn, and
+--- still produce something submittable — never abort.
+describe("seal.seal_bundle orphan guard", function()
+  local tempdirs = {}
+
+  after_each(function()
+    for _, dir in ipairs(tempdirs) do
+      vim.fn.delete(dir, "rf")
+    end
+    tempdirs = {}
+  end)
+
+  local function new_tempdir()
+    local dir = make_tempdir()
+    table.insert(tempdirs, dir)
+    return dir
+  end
+
+  local function seal_in(provenance_dir, workspace, fixture)
+    return seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      files_under_review = {},
+      session_privkey = fixture.kp.private_key,
+      session_pubkey_hex = fixture.kp.public_key_hex,
+      compute_extension_hash = function() return ("cd"):rep(32) end,
+      now = function() return "2026-05-19T14:30:00.000Z" end,
+    })
+  end
+
+  local function setup()
+    local root = new_tempdir()
+    local workspace = root .. "/workspace"
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    return workspace, provenance_dir, build_session_fixture(provenance_dir)
+  end
+
+  local function zip_names(bundle_path)
+    local names = {}
+    for _, line in ipairs(vim.fn.systemlist({ "unzip", "-Z1", bundle_path })) do
+      names[#names + 1] = line
+    end
+    return names
+  end
+
+  local function contains(list, want)
+    for _, v in ipairs(list) do
+      if v == want then return true end
+    end
+    return false
+  end
+
+  it("drops an orphaned .slog.meta and reports it, keeping the good session", function()
+    local workspace, provenance_dir, fx = setup()
+    -- A second session that left only a meta behind — exactly what
+    -- chain_recovery's quarantine produces when it renames the .slog away.
+    local orphan_meta = provenance_dir .. "/session-orphan-1111.slog.meta"
+    write_raw_file(orphan_meta, '{"format_version":"1.0","session_id":"orphan-1111"}')
+
+    local result = seal_in(provenance_dir, workspace, fx)
+
+    assert.equals("ok", result.kind)
+    assert.is_true(result.warnings.orphaned_meta, "the drop must be reported, never silent")
+
+    if unzip_available() then
+      local names = zip_names(result.bundle_path)
+      assert.is_false(contains(names, "session-orphan-1111.slog.meta"), "orphan must not be packed")
+      assert.is_true(contains(names, fx.slog_name), "the good session must survive")
+      assert.is_true(contains(names, fx.meta_name))
+    end
+  end)
+
+  it("drops a CONTENTLESS session (started, never flushed) and reports it", function()
+    -- session_writer.open() now creates the .slog eagerly, so a session that
+    -- starts and never flushes leaves a well-PAIRED but empty pair. The loader
+    -- rejects that too (first_event_not_session_start, actualKind "none"), so
+    -- the guard has to cover it as well as the orphan case.
+    local workspace, provenance_dir, fx = setup()
+    write_raw_file(provenance_dir .. "/session-empty-2222.slog", "")
+    write_raw_file(provenance_dir .. "/session-empty-2222.slog.meta", '{"session_id":"empty-2222"}')
+
+    local result = seal_in(provenance_dir, workspace, fx)
+
+    assert.equals("ok", result.kind)
+    assert.is_true(result.warnings.empty_session)
+
+    if unzip_available() then
+      local names = zip_names(result.bundle_path)
+      assert.is_false(contains(names, "session-empty-2222.slog"))
+      assert.is_false(contains(names, "session-empty-2222.slog.meta"))
+      assert.is_true(contains(names, fx.slog_name))
+    end
+  end)
+
+  it("drops an orphaned .slog from the MANIFEST as well as the zip", function()
+    -- The two must agree: a manifest naming a session whose file is absent is
+    -- just another way to make the bundle unopenable.
+    local workspace, provenance_dir, fx = setup()
+    write_raw_file(provenance_dir .. "/session-lonely-3333.slog", '{"seq":0}\n')
+
+    local result = seal_in(provenance_dir, workspace, fx)
+
+    assert.equals("ok", result.kind)
+    assert.is_true(result.warnings.orphaned_slog)
+
+    local manifest = vim.json.decode(read_all(provenance_dir .. "/manifest.json"))
+    for _, s in ipairs(manifest.sessions) do
+      assert.is_not.equals("session-lonely-3333.slog", s.slog_filename or s.filename)
+    end
+    assert.equals(1, #manifest.sessions, "only the paired, non-empty session is in the manifest")
+
+    if unzip_available() then
+      assert.is_false(contains(zip_names(result.bundle_path), "session-lonely-3333.slog"))
+    end
+  end)
+
+  it("a clean provenance dir sets no orphan warnings", function()
+    local workspace, provenance_dir, fx = setup()
+    local result = seal_in(provenance_dir, workspace, fx)
+    assert.equals("ok", result.kind)
+    assert.is_false(result.warnings.orphaned_meta)
+    assert.is_false(result.warnings.orphaned_slog)
+    assert.is_false(result.warnings.empty_session)
+  end)
+
+  it("NEVER aborts: an orphan alone still seals, reporting no_sessions only when nothing is usable", function()
+    local root = new_tempdir()
+    local workspace = root .. "/workspace"
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    write_raw_file(provenance_dir .. "/session-orphan-9999.slog.meta", "{}")
+
+    local result = seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      files_under_review = {},
+      session_privkey = ("\0"):rep(32),
+      session_pubkey_hex = ("00"):rep(32),
+      now = function() return "2026-05-19T14:30:00.000Z" end,
+    })
+
+    -- Not an error, not a crash: the existing "nothing to seal" result.
+    assert.equals("no_sessions", result.kind)
+  end)
+end)

@@ -65,6 +65,18 @@ local function read_file_bytes(path)
   return data
 end
 
+--- Byte size of a file via vim.uv.fs_stat, or nil if it cannot be stat'd.
+--- @param path string
+--- @return number|nil
+local function file_size(path)
+  local uv = vim.uv or vim.loop
+  local st = uv.fs_stat(path)
+  if not st then
+    return nil
+  end
+  return st.size
+end
+
 --- List entry names of a directory via vim.uv.fs_scandir. Never throws.
 --- @param path string
 --- @return table|nil  list of names, or nil if the directory can't be scanned
@@ -107,7 +119,9 @@ end
 ---   output_dir?,
 --- }
 --- @return table
----   { kind = "ok", bundle_path, manifest_sha256, warnings = {chain_broken, unreadable_session} }
+---   { kind = "ok", bundle_path, manifest_sha256,
+---     warnings = {chain_broken, unreadable_session, orphaned_meta, orphaned_slog,
+---                 empty_session} }
 ---   | { kind = "no_sessions" }
 ---   | { kind = "write_error", message = string }
 function M.seal_bundle(opts)
@@ -123,25 +137,89 @@ function M.seal_bundle(opts)
   local output_dir = opts.output_dir or workspace
 
   -- Step 1: list .slog files (excludes .slog.meta — that pattern doesn't
-  -- match the anchored %.slog$ suffix).
+  -- match the anchored %.slog$ suffix) and PAIR them with their .slog.meta.
   local names = list_dir_names(provenance_dir)
   if not names then
     return { kind = "no_sessions" }
   end
 
+  local warnings = {
+    chain_broken = false,
+    unreadable_session = false,
+    orphaned_meta = false,
+    orphaned_slog = false,
+    empty_session = false,
+  }
+
+  -- ORPHAN GUARD. `analysis-core`'s loader pairs `session-<uuid>.slog` with
+  -- `session-<uuid>.slog.meta` by filename and rejects THE WHOLE BUNDLE if
+  -- either half is missing (`orphaned_meta` / `orphaned_slog`) — before a single
+  -- validation check runs. So one unpaired file costs a student every session
+  -- they recorded, not just that one.
+  --
+  -- Unpaired files are real and expected, not hypothetical:
+  --   * chain_recovery quarantines a damaged `.slog` to `.corrupt-<ts>`, which
+  --     the zip step excludes, and leaves the `.slog.meta` under its original
+  --     name — so the salvage path itself produced an unopenable bundle.
+  --   * a session that starts and never flushes (fixed at source in
+  --     session_writer.open, but this stays as the backstop for any way the
+  --     pair can still desynchronise — e.g. the eager create failing on a full
+  --     disk).
+  --
+  -- The rule: an unpaired file is DROPPED from the bundle and reported in
+  -- `warnings`. Never an abort — seal must always produce something submittable
+  -- (a student cannot fix this at 11pm, and the analyzer detects problems from
+  -- the evidence that IS there). Never silent either: the warning surfaces at
+  -- the :ProvenanceSeal call site exactly like `chain_broken`, so a student can
+  -- tell staff that a session was dropped rather than discovering it in an
+  -- integrity meeting.
+  --
+  -- An orphaned `.slog` is dropped from the MANIFEST as well as the zip. Those
+  -- two must agree: a manifest naming a session whose file is absent is just a
+  -- different way to make the bundle unopenable.
+  local present = {}
+  for _, name in ipairs(names) do
+    present[name] = true
+  end
+
+  -- A CONTENTLESS `.slog` is dropped too, with its meta. Since
+  -- session_writer.open() creates the file eagerly, a session that starts and
+  -- never flushes now leaves a well-paired but EMPTY `.slog` — and the loader
+  -- rejects the whole bundle for that as surely as for an orphan
+  -- (`first_event_not_session_start`, actualKind "none"). Zero bytes means the
+  -- session recorded literally nothing, so dropping it discards no evidence;
+  -- keeping it would discard all of it.
   local slog_names = {}
   for _, name in ipairs(names) do
     if name:match("%.slog$") then
-      slog_names[#slog_names + 1] = name
+      if not present[name .. ".meta"] then
+        warnings.orphaned_slog = true
+      elseif (file_size(provenance_dir .. "/" .. name) or 0) == 0 then
+        warnings.empty_session = true
+      else
+        slog_names[#slog_names + 1] = name
+      end
     end
   end
+
+  -- A `.slog.meta` whose `.slog` is absent (or was quarantined away).
+  local packable = {}
+  for _, name in ipairs(slog_names) do
+    packable[name] = true
+    packable[name .. ".meta"] = true
+  end
+  for _, name in ipairs(names) do
+    if name:match("%.slog%.meta$") and not packable[name] then
+      warnings.orphaned_meta = true
+    end
+  end
+
   if #slog_names == 0 then
     return { kind = "no_sessions" }
   end
   table.sort(slog_names)
 
   -- Step 2: parse + validate each .slog. Warnings accumulate; never abort.
-  local warnings = { chain_broken = false, unreadable_session = false }
   local session_entries = {}
 
   for _, filename in ipairs(slog_names) do
@@ -265,7 +343,16 @@ function M.seal_bundle(opts)
 
   local zip_entries = {}
   for _, filename in ipairs(dir_names) do
-    if not filename:find(".corrupt-", 1, true) and not filename:match("%.tmp$") then
+    local is_session_file = filename:match("%.slog$") ~= nil or filename:match("%.slog%.meta$") ~= nil
+    -- Session files must be PAIRED to be packed (see the orphan guard in step
+    -- 1). Everything else that is not quarantine (.corrupt-) or a temp (.tmp)
+    -- file is packed as before: manifest.json, manifest.sig, and anything a
+    -- future step drops in here.
+    local packable_here = (not is_session_file) or packable[filename]
+    if packable_here
+      and not filename:find(".corrupt-", 1, true)
+      and not filename:match("%.tmp$")
+    then
       local bytes = read_file_bytes(provenance_dir .. "/" .. filename)
       if bytes ~= nil then
         zip_entries[#zip_entries + 1] = { name = filename, data = bytes }

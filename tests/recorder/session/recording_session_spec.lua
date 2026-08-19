@@ -502,3 +502,80 @@ describe("recording_session capture policy", function()
     assert.is_nil(start_entry.data.identity)
   end)
 end)
+
+--- THE BUNDLE-OPENABILITY REGRESSION.
+---
+--- Two real sessions in one `.provenance` dir, the second started and never
+--- flushed — the exact shape `scripts/e2e/run_e2e.sh` hit, where the plugin's
+--- BufEnter activation starts a second session for the same root moments before
+--- seal. Before the fix that left a `.slog.meta` with no `.slog`, seal packed
+--- the orphan, and analysis-core rejected THE WHOLE BUNDLE with `orphaned_meta`
+--- — losing the session that had recorded perfectly.
+---
+--- The invariant asserted here is exactly what the loader enforces: every
+--- `.slog` in the bundle has its `.slog.meta` and vice versa, and every packed
+--- `.slog` is non-empty.
+describe("recording_session bundle openability with an unflushed second session", function()
+  local scratch
+
+  before_each(function()
+    scratch = new_scratch()
+  end)
+
+  after_each(function()
+    scratch.teardown()
+  end)
+
+  local function zip_names(bundle_path)
+    return vim.fn.systemlist({ "unzip", "-Z1", bundle_path })
+  end
+
+  it("a session that starts and never flushes still yields an openable bundle", function()
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+
+    local common = {
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = dev_manifest(),
+      clock = core_clock.fixed(0, 0),
+    }
+
+    local primary = recording_session.start(vim.tbl_extend("force", common, {
+      env = { uuid = function() return "primary-session" end },
+    }))
+    scratch.session = primary
+
+    -- A SECOND session in the same dir that emits its session.start and is then
+    -- never flushed and never sealed — the unflushed-orphan producer.
+    local secondary = recording_session.start(vim.tbl_extend("force", common, {
+      env = { uuid = function() return "secondary-session" end },
+    }))
+
+    local result = primary.seal({ now = function() return "2026-05-19T14:30:00.000Z" end })
+    assert.equals("ok", result.kind)
+
+    if vim.fn.executable("unzip") == 1 then
+      local slogs, metas = {}, {}
+      for _, name in ipairs(zip_names(result.bundle_path)) do
+        if name:match("%.slog%.meta$") then
+          metas[name:gsub("%.meta$", "")] = true
+        elseif name:match("%.slog$") then
+          slogs[name] = true
+        end
+      end
+
+      assert.is_true(next(slogs) ~= nil, "the bundle must carry at least one session")
+      for name in pairs(slogs) do
+        assert.is_true(metas[name], "orphaned .slog in bundle: " .. name)
+      end
+      for name in pairs(metas) do
+        assert.is_true(slogs[name], "orphaned .slog.meta in bundle: " .. name)
+      end
+    end
+
+    -- Teardown: the secondary was never registered on scratch.
+    secondary.stop("test-teardown")
+  end)
+end)
