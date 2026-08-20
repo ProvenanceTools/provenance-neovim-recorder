@@ -49,6 +49,8 @@ local ext_activation_wiring = require("provenance.recorder.wiring.ext_activation
 local clock_skew_watcher = require("provenance.recorder.events.clock_skew_watcher")
 local explanation_tags = require("provenance.recorder.events.explanation_tags")
 local seal_cmd = require("provenance.recorder.commands.seal")
+local rolling_seal_writer = require("provenance.recorder.io.rolling_seal_writer")
+local extension_hash_cmd = require("provenance.recorder.commands.extension_hash")
 local chain_recovery = require("provenance.recorder.startup.chain_recovery")
 local uv_recovery_deps = require("provenance.recorder.startup.uv_recovery_deps")
 local disk_full_handler = require("provenance.recorder.failure.disk_full_handler")
@@ -279,6 +281,84 @@ function M.start(opts)
     encrypted_privkey = encrypted_privkey,
   })
 
+  -- 6a. THE ROLLING SEAL (program spec §8, S3). A git-submitted assignment has
+  -- no seal step: the student pushes, the grader clones, nothing ever runs
+  -- `:ProvenanceSeal`. So this session maintains a seal of its OWN log at
+  -- `.provenance/manifest-<session_id>.json` + `.sig`, rewritten at three
+  -- points, so whatever is committed to git is always a valid seal of the state
+  -- at that moment. See core/rolling_manifest.lua for the design and
+  -- io/rolling_seal_writer.lua for the write side.
+  --
+  -- SUPPRESSED only when the course has SIGNED a statement that it submits
+  -- bundles. A 1.x manifest has no `submission` field at all, so it rolls: not
+  -- rolling where it IS needed costs an `unsealed_session` defect on every
+  -- session, which fails check 1 — a false accusation against a student whose
+  -- course simply has not migrated to a 2.0 manifest yet. Between "a couple of
+  -- redundant files in a bundle" and "an integrity finding against innocent
+  -- work", only one is acceptable.
+  local rolling_seal_enabled = manifest.submission ~= "bundle"
+
+  -- `extension_hash` is resolved LAZILY and exactly once. compute_installed
+  -- walks the whole `lua/` tree, so doing it per checkpoint would be the
+  -- pathological version of this feature. Injectable for tests, mirroring
+  -- seal.lua's own `compute_extension_hash` seam.
+  local compute_extension_hash = opts.compute_extension_hash or extension_hash_cmd.compute_installed
+  local extension_hash_once = nil
+  local function get_extension_hash_once()
+    if extension_hash_once == nil then
+      extension_hash_once = compute_extension_hash()
+    end
+    return extension_hash_once
+  end
+
+  --- Rewrite the rolling seal to cover this session as it stands right now.
+  ---
+  --- NEVER raises and never stops recording: a seal failure must not abort the
+  --- checkpoint that carries it. Recording is more important than sealing, so
+  --- every failure is reported through the existing debug-log path and the
+  --- session records on. Deliberately NOT routed into the disk-full handler —
+  --- that switches the session to a critical-events-only ring buffer, and
+  --- throwing away the student's event stream because a seal could not be
+  --- rewritten would trade the recording for the receipt.
+  ---
+  --- Unlike the VS Code reference this needs no serialization chain: every roll
+  --- here runs synchronously to completion on the main loop, so two rolls can
+  --- never interleave their renames in the first place.
+  ---
+  --- @param is_final boolean|nil  see the ONE call site that passes true
+  local function roll_rolling_seal(is_final)
+    if not rolling_seal_enabled then
+      return
+    end
+    local ok, res = pcall(function()
+      return rolling_seal_writer.write_rolling_seal({
+        provenance_dir = provenance_dir,
+        -- The LOGICAL session id from session.start — never the `.slog`
+        -- filename uuid (two-uuid rule). The analyzer keys sessions by
+        -- session.start.data.session_id, and that is the id it matches seals
+        -- against.
+        session_id = context.session_id,
+        prev_session_id = prev_session_id,
+        slog_path = slog_path,
+        workspace = workspace,
+        assignment_id = manifest.assignment_id,
+        semester = manifest.semester,
+        files_under_review = manifest.files_under_review,
+        session_privkey = keypair.private_key,
+        extension_hash = get_extension_hash_once(),
+        -- Strictly true or absent. `final = false` is never passed down, and
+        -- the writer would omit the key anyway.
+        final = is_final == true or nil,
+      })
+    end)
+    if (not ok or res.kind == "error") and vim.g.provenance_debug then
+      vim.notify(
+        "Provenance: rolling seal error: " .. tostring(ok and res.message or res),
+        vim.log.levels.DEBUG
+      )
+    end
+  end
+
   -- 6b. Checkpoint cadence + async scheduler (Plan 8). Every
   -- `checkpoint_interval`-th appended entry, a signed seq->hash checkpoint
   -- is scheduled: signing/persisting is deferred off the on_lines hot path
@@ -290,7 +370,16 @@ function M.start(opts)
       return core_checkpoint.sign(seq, hash, keypair.private_key)
     end,
     persist = function(cp)
-      mw.append_checkpoint(cp)
+      -- WRITE POINT 2 of 3: after each checkpoint LANDS in the `.meta`, so the
+      -- seal's `meta_sha256` covers it.
+      local ok, err = pcall(mw.append_checkpoint, cp)
+      -- Rolled even when the checkpoint itself failed, so a session whose
+      -- `.meta` append broke still gets the best seal available. The scheduler's
+      -- on_error still sees the failure: it is re-raised below.
+      roll_rolling_seal()
+      if not ok then
+        error(err)
+      end
     end,
     on_error = function(err)
       -- Checkpoint failures must never crash recording; debug-log only.
@@ -346,6 +435,19 @@ function M.start(opts)
   if recovery.kind == "previous_session_corrupt" then
     host.emit("recorder.recovered_from_corruption", { quarantined_path = recovery.quarantined_path })
   end
+
+  -- 8d. WRITE POINT 1 of 3: seal immediately, before the first checkpoint is
+  -- anywhere near due.
+  --
+  -- Checkpoints land every 100 entries, so a session that records only
+  -- session.start would never reach one — and in a git-submitted repo that
+  -- session's `.slog` would be committed with no seal covering it at all
+  -- (`unsealed_session`). Sealing here means a session is sealed from its first
+  -- instant and every later rewrite is an update, never the first write.
+  --
+  -- NOT final: the log is about to grow. The digests here commit to a prefix,
+  -- which is exactly right.
+  roll_rolling_seal()
 
   -- 8c. External-change coordinator (Plan 9): MUST be created AFTER host
   -- exists (it needs host.emit) and AFTER session.start is emitted, but
@@ -553,6 +655,28 @@ function M.start(opts)
     hb.dispose()
     wiring.dispose()
     writer.dispose()
+
+    -- WRITE POINT 3 of 3: the FINAL roll, last of the three file-touching steps
+    -- so it covers the fully flushed `.slog` (session.end included) and the
+    -- drained `.meta`.
+    --
+    -- `final = true` is claimable HERE AND ONLY HERE, and only because of the
+    -- three steps above: session.end has been emitted, the last checkpoint has
+    -- landed in the `.meta`, and writer.dispose() has performed the final flush
+    -- and closed the file. Nothing can append to either file after this point,
+    -- so the digests about to be signed are WHOLE-FILE commitments rather than
+    -- prefixes, and a reader is entitled to fail an append against them.
+    --
+    -- The claim is made only on a path that actually reached here. Every way a
+    -- session can die without a clean stop() — a crash, a power cut, a full
+    -- disk, a read-only checkout, `.provenance/` removed by a `git checkout` —
+    -- simply leaves the last non-final seal in place, which a reader treats as
+    -- a prefix commitment with a REPORTED unattested tail. That is a blameless
+    -- coverage gap, not a tamper finding, and it is precisely why finality is
+    -- claimed explicitly by the writer here rather than inferred by a reader
+    -- from a trailing `session.end` entry: `session.end` lives in the log, and
+    -- the log's completeness is the very thing in question.
+    roll_rolling_seal(true)
   end
 
   return session
