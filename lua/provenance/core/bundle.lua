@@ -32,9 +32,22 @@ local function is_hex64(v)
   return type(v) == "string" and #v == 64 and v:match("^[0-9a-f]+$") ~= nil
 end
 
+--- Versions that carry `submission_files`. 1.0 omits the field entirely.
+--- 1.2 is the ROLLING SEAL (see core/rolling_manifest.lua) and reuses the 1.1
+--- field set verbatim, which is why it shares this table rather than getting a
+--- builder of its own.
+local SUBMISSION_FILE_VERSIONS = { ["1.1"] = true, ["1.2"] = true }
+
 --- Build the json value-model BundleManifest from a plain snake_case
 --- description. `submission_files` is only read (and only emitted) when
---- format_version is "1.1"; it is omitted entirely for "1.0".
+--- format_version is "1.1" or "1.2"; it is omitted entirely for "1.0".
+---
+--- `final` (1.2 rolling seals) is emitted ONLY when `input.final` is exactly
+--- `true`. It is never written as `false`: the canonical bytes ARE the signed
+--- message, and a non-final rolling manifest must stay byte-identical to what
+--- 1.2 emitted before the field existed — three implementations pin those
+--- bytes. See core/rolling_manifest.lua for why absence, rather than `false`,
+--- is how a seal says "not final".
 --- @param input table
 --- @return table  manifest_value, ready for to_canonical()/sign()
 function M.build(input)
@@ -57,7 +70,7 @@ function M.build(input)
     }
   end
 
-  if input.format_version == "1.1" then
+  if SUBMISSION_FILE_VERSIONS[input.format_version] then
     m.submission_files = json.array({})
     local files = input.submission_files or {}
     for i = 1, #files do
@@ -68,6 +81,12 @@ function M.build(input)
         sha256 = (f.status == "missing" or is_null(f.sha256)) and json.NULL or f.sha256,
       }
     end
+  end
+
+  -- Strictly `== true`. Anything else — nil, false, json.NULL, a truthy string,
+  -- 0 — leaves the key OFF. Never `final = false`.
+  if input.final == true then
+    m.final = true
   end
 
   return m
@@ -92,7 +111,7 @@ function M.validate_shape(value)
     end
 
     local version = value.format_version
-    if version ~= "1.0" and version ~= "1.1" then
+    if version ~= "1.0" and version ~= "1.1" and version ~= "1.2" then
       return result.err({ kind = "wrong_version", field = "format_version" })
     end
 
@@ -135,7 +154,7 @@ function M.validate_shape(value)
       end
     end
 
-    if version == "1.1" then
+    if SUBMISSION_FILE_VERSIONS[version] then
       local files = value.submission_files
       if is_null(files) or type(files) ~= "table" then
         return result.err({ kind = "missing_field", field = "submission_files" })
@@ -164,6 +183,18 @@ function M.validate_shape(value)
           end
         end
       end
+    end
+
+    -- `final` (1.2 rolling seals). Optional everywhere, but when present it
+    -- must be a real boolean: a reader that decides whole-file vs. prefix
+    -- semantics off this field must never be steered by a truthy string.
+    --
+    -- Deliberately NOT rejected on 1.0 / 1.1. It is meaningless there (a
+    -- classic seal is taken once over a finished log and is already whole-file),
+    -- and a shape error would fail check 1 — an accusation — over a field that
+    -- grants nothing. Readers ignore it outside 1.2.
+    if not is_null(value.final) and type(value.final) ~= "boolean" then
+      return result.err({ kind = "invalid_field", field = "final" })
     end
 
     return result.ok(value)

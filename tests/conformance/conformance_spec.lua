@@ -1143,3 +1143,196 @@ describe("conformance: git-event.json (program spec S5 — the commit graph)", f
     assert.is_nil(all_off.capture and all_off.capture.git_event)
   end)
 end)
+
+-- ===========================================================================
+-- S3 ROLLING SEAL — rolling-manifest.json
+-- ===========================================================================
+--
+-- Every case below is built THROUGH the recorder's own builder
+-- (`core/rolling_manifest.build`, which the write side in
+-- `recorder/io/rolling_seal_writer.lua` also calls) and only then compared to
+-- the vector. Reading the fixture's decoded payload back and re-signing it
+-- would pin the JSON round-trip rather than the construction the recorder
+-- actually performs — the bug class these vectors exist to catch.
+describe("conformance: rolling-manifest.json (S3 rolling seal, format_version 1.2)", function()
+  local fx = load_fixture("rolling-manifest.json")
+  local rolling = require("provenance.core.rolling_manifest")
+
+  -- The session key the monorepo's exporter signs these vectors with:
+  -- `seed(6)`, i.e. 32 bytes of 0x06. Reproducing the SIGNATURE (not merely
+  -- verifying it) is what proves this port signs the same message with the
+  -- same key derivation, so the private key has to be reconstructed here.
+  local SESSION_PRIV = string.rep("\6", 32)
+
+  -- Turn the fixture's decoded manifest into builder input. Deliberately field
+  -- by field: the builder's job is to assemble exactly these keys, so handing
+  -- it the decoded object wholesale would let a missing key pass unnoticed.
+  local function builder_input(m, final)
+    local s = m.sessions[1]
+    local files = {}
+    for i, f in ipairs(m.submission_files) do
+      files[i] = { path = f.path, status = f.status, sha256 = f.sha256 }
+    end
+    return {
+      assignment_id = m.assignment_id,
+      semester = m.semester,
+      extension_hash = m.extension_hash,
+      session_id = s.session_id,
+      prev_session_id = s.prev_session_id,
+      slog_sha256 = s.slog_sha256,
+      meta_sha256 = s.meta_sha256,
+      submission_files = files,
+      final = final,
+    }
+  end
+
+  it("the vector set is complete (a truncated fixture cannot pass vacuously)", function()
+    assert.equals("1.2", fx.format_version)
+    assert.equals("1.2", rolling.FORMAT_VERSION)
+    assert.equals(5, #fx.not_rolling_filenames)
+    assert.equals(4, #fx.rejects)
+    assert.equals(5, #fx.final_marker.not_final_values)
+    assert.is_table(fx.final_marker.non_final)
+    assert.is_table(fx.final_marker["final"])
+    assert.is_table(fx.final_marker.downgrade_rejects)
+    assert.equals(1, #fx.manifest.sessions)
+    assert.equals(2, #fx.manifest.submission_files)
+  end)
+
+  it("filenames() reproduces the vector's per-session names", function()
+    local names = rolling.filenames(fx.session_id)
+    assert.equals(fx.filenames.json, names.json)
+    assert.equals(fx.filenames.sig, names.sig)
+  end)
+
+  it("parse_filename() round-trips its own output", function()
+    for _, part in ipairs({ "json", "sig" }) do
+      local parsed = rolling.parse_filename(fx.filenames[part])
+      assert.is_table(parsed)
+      assert.equals(fx.session_id, parsed.session_id)
+      assert.equals(part, parsed.part)
+    end
+  end)
+
+  it("parse_filename() refuses every name that is NOT a rolling seal", function()
+    -- manifest.json / manifest.sig are the CLASSIC seal. A rolling reader that
+    -- accepted them would apply single-session rules to a multi-session file;
+    -- a rolling WRITER that could spell them would overwrite a signed classic
+    -- bundle. Both directions are closed by the same pattern.
+    for _, name in ipairs(fx.not_rolling_filenames) do
+      assert.is_nil(rolling.parse_filename(name), name .. " must not parse as a rolling seal")
+    end
+  end)
+
+  it("build() + to_canonical() reproduces the vector's canonical_json byte for byte", function()
+    local built = rolling.build(builder_input(fx.manifest, nil))
+    assert.equals(fx.canonical_json, bundle.to_canonical(built))
+  end)
+
+  it("build() + sign() reproduces the vector's signature with the session key", function()
+    local built = rolling.build(builder_input(fx.manifest, nil))
+    local signed = bundle.sign(built, SESSION_PRIV)
+    assert.equals(fx.canonical_json, signed.canonical_json)
+    assert.equals(fx.signature_hex, signed.signature_hex)
+    assert.is_true(bundle.verify_sig(signed.canonical_json, signed.signature_hex, fx.session_pubkey_hex))
+  end)
+
+  it("the session key we sign with is the one session.start would publish", function()
+    assert.equals(fx.session_pubkey_hex, ed25519.to_hex(ed25519.public_key_of(SESSION_PRIV)))
+  end)
+
+  it("validate_shape accepts a 1.2 rolling manifest", function()
+    local shape = bundle.validate_shape(fx.manifest)
+    assert.is_true(shape.ok, vim.inspect(shape.error))
+  end)
+
+  it("validate_session_manifest accepts the vector for its own session id", function()
+    local ok = rolling.validate_session_manifest(fx.manifest, fx.session_id)
+    assert.is_true(ok.ok)
+  end)
+
+  it("validate_session_manifest rejects each vector with its documented kind", function()
+    for _, case in ipairs(fx.rejects) do
+      local res = rolling.validate_session_manifest(case.manifest, case.expected_session_id or fx.session_id)
+      assert.is_false(res.ok, case.note)
+      assert.equals(case.error_kind, res.error.kind, case.note)
+      assert.is_string(rolling.describe_error(res.error))
+    end
+  end)
+
+  -- --- the `final` marker ---------------------------------------------------
+
+  it("a NON-final roll omits the key entirely — never final = false", function()
+    local case = fx.final_marker.non_final
+    local built = rolling.build(builder_input(case.manifest, nil))
+
+    -- The key is absent from the built value, not present-and-false. This is
+    -- the whole compatibility contract: the non-final canonical bytes must stay
+    -- byte-identical to what 1.2 emitted before `final` existed, because three
+    -- implementations pin them.
+    assert.is_nil(built["final"])
+    assert.is_nil(string.find(case.canonical_json, "final", 1, true))
+
+    local signed = bundle.sign(built, SESSION_PRIV)
+    assert.equals(case.canonical_json, signed.canonical_json)
+    assert.equals(case.signature_hex, signed.signature_hex)
+    assert.is_false(rolling.is_final(built))
+    assert.is_false(case.is_final)
+  end)
+
+  it("`final = false` is NOT how a non-final roll is spelled", function()
+    -- Passing false explicitly must produce the identical non-final bytes.
+    -- Writing `"final":false` instead would change the signed message and break
+    -- every other implementation's byte comparison.
+    local built = rolling.build(builder_input(fx.manifest, false))
+    assert.is_nil(built["final"])
+    assert.equals(fx.final_marker.non_final.canonical_json, bundle.to_canonical(built))
+  end)
+
+  it("the FINAL roll carries final = true inside the SIGNED payload", function()
+    local case = fx.final_marker["final"]
+    local built = rolling.build(builder_input(case.manifest, true))
+    assert.is_true(built["final"])
+
+    local signed = bundle.sign(built, SESSION_PRIV)
+    assert.equals(case.canonical_json, signed.canonical_json)
+    assert.equals(case.signature_hex, signed.signature_hex)
+    assert.is_true(bundle.verify_sig(signed.canonical_json, signed.signature_hex, fx.session_pubkey_hex))
+    assert.is_true(rolling.is_final(built))
+    assert.is_true(case.is_final)
+  end)
+
+  it("final and non-final are DIFFERENT signed messages", function()
+    -- If they were not, `final` would grant whole-file semantics for free.
+    assert.are_not.equal(fx.final_marker["final"].canonical_json, fx.final_marker.non_final.canonical_json)
+    assert.are_not.equal(fx.final_marker["final"].signature_hex, fx.final_marker.non_final.signature_hex)
+    -- Cross-verification must fail in both directions.
+    assert.is_false(bundle.verify_sig(
+      fx.final_marker.non_final.canonical_json,
+      fx.final_marker["final"].signature_hex,
+      fx.session_pubkey_hex
+    ))
+    assert.is_false(bundle.verify_sig(
+      fx.final_marker["final"].canonical_json,
+      fx.final_marker.non_final.signature_hex,
+      fx.session_pubkey_hex
+    ))
+  end)
+
+  it("stripping `final` while keeping the final signature does not verify", function()
+    -- The downgrade a student would try by hand: delete the key, keep the sig.
+    local case = fx.final_marker.downgrade_rejects
+    assert.is_false(case.verifies)
+    assert.is_false(bundle.verify_sig(case.canonical_json, case.signature_hex, fx.session_pubkey_hex))
+  end)
+
+  it("is_final() is strictly `== true` — no truthy value promotes a seal", function()
+    -- Lua makes this trap sharper than JS: 0 and "" are both truthy here, so a
+    -- bare `if m.final then` would let a forged value buy whole-file semantics.
+    for _, v in ipairs(fx.final_marker.not_final_values) do
+      assert.is_false(rolling.is_final({ final = v }), "value " .. vim.inspect(v) .. " must not read as final")
+    end
+    assert.is_false(rolling.is_final({}))
+    assert.is_true(rolling.is_final({ final = true }))
+  end)
+end)
