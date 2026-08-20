@@ -1229,6 +1229,64 @@ describe("conformance: identity.json (the 2.1 institution identity chain)", func
     assert.equals("2.0", res.error.credential_version)
   end)
 
+  it("MANDATORY routes on the SIGNED version even when field PRESENCE disagrees", function()
+    -- The decisive discriminator test, and the only one where the two candidate
+    -- routing rules give different answers: every honest 2.1 artifact carries
+    -- institution_pubkey and every honest 2.0 one does not, so on well-formed
+    -- material "which fields exist" and "what the signed version says" agree,
+    -- and a port that routes on presence looks perfectly correct.
+    --
+    -- Here they are made to DISAGREE. Presence is attacker-controlled; a signed
+    -- version is not. This project already shipped the presence bug once —
+    -- bundle-manifest.ts read the mere presence of an embedded manifest as a 2.0
+    -- claim and made the whole legacy path unreachable.
+
+    -- (a) INSTITUTION-shaped fields, but the cert slot SIGNS "2.0".
+    -- Correct routing sends this to the COURSE walk, which refuses it on shape
+    -- (no course_id, no enrollment_pubkey, no course_sig). A presence-router
+    -- sends it to the INSTITUTION walk, which gets past shape and refuses it a
+    -- step later, on the signature — a different, weaker answer.
+    local as_2_0 = vim.json.decode(vim.json.encode(fx.chain_cases[1].input.identity))
+    as_2_0.enrollment_cert.format_version = enrollment.FORMAT_VERSION
+    as_2_0.enrollment.format_version = enrollment.FORMAT_VERSION
+    assert.is_not_nil(as_2_0.enrollment_cert.institution_pubkey)
+
+    local res = enrollment.verify_identity_chain({
+      identity = as_2_0,
+      session_pubkey = fx.chain_cases[1].input.session_pubkey,
+      course_cert = { course_id = "berkeley", course_pubkey = fx.institution_pubkey_hex },
+      institution_cert = fx.valid_institution_cert,
+      session_started_at = fx.chain_cases[1].input.session_started_at,
+    })
+    assert.is_false(res.ok)
+    assert.equals(
+      "invalid_cert_shape",
+      res.error.kind,
+      "a cert SIGNING 2.0 must be walked as 2.0 however institution-shaped it looks"
+    )
+
+    -- (b) The mirror image: COURSE-shaped fields, but the cert slot SIGNS "2.1".
+    local legacy = fx.legacy_2_0_cases[1].input
+    local as_2_1 = vim.json.decode(vim.json.encode(legacy.identity))
+    as_2_1.enrollment_cert.format_version = institution.FORMAT_VERSION
+    as_2_1.enrollment.format_version = institution.FORMAT_VERSION
+    assert.is_nil(as_2_1.enrollment_cert.institution_pubkey)
+
+    local res2 = enrollment.verify_identity_chain({
+      identity = as_2_1,
+      session_pubkey = legacy.session_pubkey,
+      course_cert = legacy.course_cert,
+      institution_cert = fx.valid_institution_cert,
+      session_started_at = legacy.session_started_at,
+    })
+    assert.is_false(res2.ok)
+    assert.equals(
+      "invalid_cert_shape",
+      res2.error.kind,
+      "a cert SIGNING 2.1 must be walked as 2.1 however course-shaped it looks"
+    )
+  end)
+
   it("a 2.1 chain with no institution anchor is refused, not walked", function()
     -- Which anchor is needed is only known after reading the bundle, so this is
     -- reported as a value rather than raised.
