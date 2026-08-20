@@ -52,8 +52,15 @@ end
 --- json.canonicalize'd HashedEnvelope per line) and `session-<id>.slog.meta`
 --- (via meta_writer, with the session privkey encrypted under a stand-in
 --- manifest signature — the same convention meta_writer_spec.lua uses).
+---
+--- `opts.logical_id` overrides the injected logical session id (the one that
+--- lands in session.start.data.session_id and that a rolling seal is named
+--- after); `opts.file_uuid` overrides the `.slog` FILENAME uuid independently,
+--- so a test can hold the two-uuid rule apart instead of letting the default
+--- collapse them onto one string.
 --- @return table { kp, session_id, slog_path, meta_path, slog_name, meta_name, entries }
-local function build_session_fixture(provenance_dir)
+local function build_session_fixture(provenance_dir, opts)
+  opts = opts or {}
   local kp = session_keys.generate()
   local manifest_sig_hex = ("ab"):rep(64)
   local clock = core_clock.fixed(0, 0)
@@ -70,14 +77,14 @@ local function build_session_fixture(provenance_dir)
   local start_data = recorder_context.build_recorder_context({
     manifest = { assignment_id = "hw3", semester = "fa25", sig = manifest_sig_hex },
     session_pubkey_hex = kp.public_key_hex,
-    env = { uuid = function() return "sess-fixture-1" end },
+    env = { uuid = function() return opts.logical_id or "sess-fixture-1" end },
   })
 
   host.emit("session.start", start_data)
   host.emit("doc.open", { path = "src/main.py" })
 
   local session_id = start_data.session_id
-  local slog_name = "session-" .. session_id .. ".slog"
+  local slog_name = "session-" .. (opts.file_uuid or session_id) .. ".slog"
   local meta_name = slog_name .. ".meta"
   local slog_path = provenance_dir .. "/" .. slog_name
   local meta_path = provenance_dir .. "/" .. meta_name
@@ -451,5 +458,175 @@ describe("seal.seal_bundle orphan guard", function()
 
     -- Not an error, not a crash: the existing "nothing to seal" result.
     assert.equals("no_sessions", result.kind)
+  end)
+end)
+
+--- ROLLING-SEAL ORPHAN GUARD.
+---
+--- The rolling seal (`manifest-<session_id>.json` + `.sig`) is a THIRD
+--- per-session artifact beside the `.slog` and `.slog.meta`, written eagerly at
+--- session start — before the `.slog` has been flushed even once — and rewritten
+--- at every checkpoint and at teardown. It therefore survives every reason the
+--- guard above has for dropping a session, and used to be packed regardless.
+---
+--- `analysis-core`'s `reconcileRollingSealsWithSessions` reports `no_session_log`
+--- for a seal whose session is not in the bundle: the seal names a recording
+--- that is not here, so its signature can never be checked (the verifying pubkey
+--- lives in that session's own session.start). That defect fails check 1
+--- (`manifest_sig`) for THE WHOLE BUNDLE — the same blast radius as
+--- `orphaned_meta`, and the same rule applies: drop it from the zip, warn, never
+--- abort, and never touch what is on disk.
+describe("seal.seal_bundle rolling-seal orphan guard", function()
+  local rolling_seal_writer = require("provenance.recorder.io.rolling_seal_writer")
+
+  -- Hex ids on purpose. `rolling_manifest.parse_filename` only accepts
+  -- `[0-9a-f-]`, so an id like "sess-fixture-1" would never be recognised as a
+  -- rolling manifest and every assertion below would pass vacuously.
+  local PACKED_ID = "aaaaaaaa-1111-4111-8111-111111111111"
+  local PACKED_FILE_UUID = "cccccccc-3333-4333-8333-333333333333"
+  local DROPPED_ID = "bbbbbbbb-2222-4222-8222-222222222222"
+
+  local tempdirs = {}
+
+  after_each(function()
+    for _, dir in ipairs(tempdirs) do
+      vim.fn.delete(dir, "rf")
+    end
+    tempdirs = {}
+  end)
+
+  local function setup()
+    local root = make_tempdir()
+    table.insert(tempdirs, root)
+    local workspace = root .. "/workspace"
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    -- Logical id and filename uuid deliberately DIFFERENT (two-uuid rule): a
+    -- guard that keyed off the `.slog` filename would drop every rolling seal a
+    -- real recorder writes, and a fixture that collapsed the two would hide it.
+    local fx = build_session_fixture(provenance_dir, {
+      logical_id = PACKED_ID,
+      file_uuid = PACKED_FILE_UUID,
+    })
+    return workspace, provenance_dir, fx
+  end
+
+  --- Write a real rolling seal through the production writer, so the filenames
+  --- under test are the ones the recorder actually emits rather than hand-spelled.
+  local function roll(provenance_dir, workspace, fx, session_id, slog_path)
+    local res = rolling_seal_writer.write_rolling_seal({
+      provenance_dir = provenance_dir,
+      session_id = session_id,
+      prev_session_id = nil,
+      slog_path = slog_path,
+      workspace = workspace,
+      assignment_id = "hw3",
+      semester = "fa25",
+      files_under_review = {},
+      session_privkey = fx.kp.private_key,
+      extension_hash = ("cd"):rep(32),
+    })
+    assert.equals("written", res.kind)
+  end
+
+  local function seal_in(provenance_dir, workspace, fixture)
+    return seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      files_under_review = {},
+      session_privkey = fixture.kp.private_key,
+      session_pubkey_hex = fixture.kp.public_key_hex,
+      compute_extension_hash = function() return ("cd"):rep(32) end,
+      now = function() return "2026-05-19T14:30:00.000Z" end,
+    })
+  end
+
+  local function packed_names(bundle_path)
+    local names = {}
+    for _, line in ipairs(vim.fn.systemlist({ "unzip", "-Z1", bundle_path })) do
+      names[line] = true
+    end
+    return names
+  end
+
+  it("drops a rolling seal whose session's log is not in the bundle", function()
+    local workspace, provenance_dir, fx = setup()
+
+    -- A second session that started, took its session-start roll, and was torn
+    -- down before it ever flushed: a well-paired but ZERO-BYTE `.slog` that the
+    -- guard above drops as `empty_session`, and a rolling seal that outlives it.
+    -- This is exactly what `scripts/e2e/run_e2e.sh` produces.
+    local dropped_slog = provenance_dir .. "/session-" .. DROPPED_ID .. ".slog"
+    write_raw_file(dropped_slog, "")
+    write_raw_file(dropped_slog .. ".meta", '{"session_id":"' .. DROPPED_ID .. '"}')
+    roll(provenance_dir, workspace, fx, DROPPED_ID, dropped_slog)
+
+    local result = seal_in(provenance_dir, workspace, fx)
+
+    assert.equals("ok", result.kind)
+    assert.is_true(result.warnings.empty_session)
+    assert.is_true(result.warnings.orphaned_rolling_seal, "the drop must be reported, never silent")
+
+    if unzip_available() then
+      local names = packed_names(result.bundle_path)
+      assert.is_nil(names["manifest-" .. DROPPED_ID .. ".json"])
+      assert.is_nil(names["manifest-" .. DROPPED_ID .. ".sig"], "the .sig goes with its .json")
+    end
+
+    -- Dropped from the ZIP only. The on-disk seal is what a git-submitted
+    -- `.provenance/` is read from, and in a shared repo it may be a partner's —
+    -- never destroy or rename someone's evidence to make a bundle load.
+    assert.is_true(vim.uv.fs_stat(provenance_dir .. "/manifest-" .. DROPPED_ID .. ".json") ~= nil)
+    assert.is_true(vim.uv.fs_stat(provenance_dir .. "/manifest-" .. DROPPED_ID .. ".sig") ~= nil)
+  end)
+
+  it("keeps the rolling seal of a session that IS packed, matching on the LOGICAL id", function()
+    local workspace, provenance_dir, fx = setup()
+    roll(provenance_dir, workspace, fx, PACKED_ID, fx.slog_path)
+    -- A seal named after the `.slog` FILENAME uuid is an orphan, not a match:
+    -- no session.start anywhere claims that id.
+    roll(provenance_dir, workspace, fx, PACKED_FILE_UUID, fx.slog_path)
+
+    local result = seal_in(provenance_dir, workspace, fx)
+    assert.equals("ok", result.kind)
+
+    if unzip_available() then
+      local names = packed_names(result.bundle_path)
+      assert.is_true(names["manifest-" .. PACKED_ID .. ".json"] == true, "a live session must keep its seal")
+      assert.is_true(names["manifest-" .. PACKED_ID .. ".sig"] == true)
+      assert.is_nil(names["manifest-" .. PACKED_FILE_UUID .. ".json"], "two-uuid rule: the filename uuid is not a session id")
+      -- The CLASSIC seal is not a rolling seal and is never subject to this guard.
+      assert.is_true(names["manifest.json"] == true)
+      assert.is_true(names["manifest.sig"] == true)
+      assert.is_true(names[fx.slog_name] == true)
+      assert.is_true(names[fx.meta_name] == true)
+    end
+  end)
+
+  it("a dir whose only rolling seal matches its session sets no rolling warning", function()
+    local workspace, provenance_dir, fx = setup()
+    roll(provenance_dir, workspace, fx, PACKED_ID, fx.slog_path)
+
+    local result = seal_in(provenance_dir, workspace, fx)
+    assert.equals("ok", result.kind)
+    assert.is_false(result.warnings.orphaned_rolling_seal)
+    assert.is_false(result.warnings.empty_session)
+    assert.is_false(result.warnings.orphaned_meta)
+    assert.is_false(result.warnings.orphaned_slog)
+  end)
+
+  it("NEVER aborts: a dir of nothing but orphaned rolling seals still seals the good session", function()
+    local workspace, provenance_dir, fx = setup()
+    for i = 1, 3 do
+      local ghost = string.format("dddddddd-444%d-444%d-844%d-44444444444%d", i, i, i, i)
+      roll(provenance_dir, workspace, fx, ghost, provenance_dir .. "/nonexistent.slog")
+    end
+
+    local result = seal_in(provenance_dir, workspace, fx)
+    assert.equals("ok", result.kind)
+    assert.is_true(result.warnings.orphaned_rolling_seal)
+    assert.is_true(vim.uv.fs_stat(result.bundle_path) ~= nil)
   end)
 end)

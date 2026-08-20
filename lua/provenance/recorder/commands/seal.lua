@@ -29,6 +29,7 @@ local core_chain_validator = require("provenance.core.chain_validator")
 local core_sha256 = require("provenance.core.sha256")
 local core_bundle = require("provenance.core.bundle")
 local core_json = require("provenance.core.json")
+local rolling_manifest = require("provenance.core.rolling_manifest")
 local atomic_write = require("provenance.recorder.io.atomic_write")
 local zip_writer = require("provenance.recorder.io.zip_writer")
 
@@ -121,7 +122,7 @@ end
 --- @return table
 ---   { kind = "ok", bundle_path, manifest_sha256,
 ---     warnings = {chain_broken, unreadable_session, orphaned_meta, orphaned_slog,
----                 empty_session} }
+---                 empty_session, orphaned_rolling_seal} }
 ---   | { kind = "no_sessions" }
 ---   | { kind = "write_error", message = string }
 function M.seal_bundle(opts)
@@ -149,6 +150,7 @@ function M.seal_bundle(opts)
     orphaned_meta = false,
     orphaned_slog = false,
     empty_session = false,
+    orphaned_rolling_seal = false,
   }
 
   -- ORPHAN GUARD. `analysis-core`'s loader pairs `session-<uuid>.slog` with
@@ -222,6 +224,14 @@ function M.seal_bundle(opts)
   -- Step 2: parse + validate each .slog. Warnings accumulate; never abort.
   local session_entries = {}
 
+  -- LOGICAL session ids of the sessions this bundle will actually carry, keyed
+  -- for the rolling-seal guard in step 9. TWO-UUID RULE: this is
+  -- `session.start.data.session_id`, NOT the `.slog` filename uuid — a rolling
+  -- manifest is named `manifest-<LOGICAL id>.json` and the analyzer reconciles
+  -- it against the ids it parses out of session.start, so the filename uuid is
+  -- the wrong key and would drop every rolling seal.
+  local packed_session_ids = {}
+
   for _, filename in ipairs(slog_names) do
     local slog_path = provenance_dir .. "/" .. filename
     local meta_path = slog_path .. ".meta"
@@ -264,6 +274,10 @@ function M.seal_bundle(opts)
         end
       else
         warnings.unreadable_session = true
+      end
+
+      if type(session_id) == "string" then
+        packed_session_ids[session_id] = true
       end
 
       session_entries[#session_entries + 1] = {
@@ -341,6 +355,51 @@ function M.seal_bundle(opts)
     return { kind = "write_error", message = "Failed to read provenance dir: " .. provenance_dir }
   end
 
+  -- ROLLING-SEAL HALF OF THE ORPHAN GUARD.
+  --
+  -- The rolling seal (`manifest-<session_id>.json` + `.sig`) is a THIRD
+  -- per-session artifact, written eagerly at session start — before the `.slog`
+  -- has been flushed even once — and rewritten at every checkpoint and at
+  -- teardown. It therefore outlives any reason step 1 has for dropping a
+  -- session, and the guard above knows nothing about it.
+  --
+  -- `analysis-core`'s `reconcileRollingSealsWithSessions` reports
+  -- `no_session_log` for a seal whose session is not in the bundle — the seal
+  -- names a recording that is not here, and its signature can never be checked,
+  -- because the verifying pubkey lives in that session's own session.start. That
+  -- defect fails check 1 (`manifest_sig`) for THE WHOLE BUNDLE, so one stale
+  -- manifest costs a student every session they recorded — exactly the blast
+  -- radius the `.slog`/`.slog.meta` guard exists to prevent.
+  --
+  -- This is not hypothetical; it is what `scripts/e2e/run_e2e.sh` hits. Two
+  -- sessions start against one root (the plugin's BufEnter activation opens a
+  -- second one). The second emits `session.start` into its buffer, takes its
+  -- session-start roll, and is torn down before it ever flushes, leaving a
+  -- zero-byte `.slog` that step 1 correctly drops as `empty_session` — and a
+  -- `manifest-<its id>.json` that used to be packed anyway.
+  --
+  -- The rule matches step 1's: DROP from the zip, report in `warnings`, never
+  -- abort. And drop only from the ZIP — the files stay on disk untouched, so a
+  -- git-submitted `.provenance/` keeps the seal that write point 1 exists to
+  -- provide, and a shared repo keeps a partner's evidence. (A partner's session
+  -- is packed WITH its seal: their `.slog`, `.slog.meta` and
+  -- `manifest-<id>.json` all pair up, so nothing of theirs is dropped.)
+  --
+  -- Dropping a rolling seal cannot itself create a finding: `unsealed_session`
+  -- is only reported for a bundle with NO classic seal, and every bundle this
+  -- function produces carries `manifest.json` — which covers every session it
+  -- packs. So inside a classic bundle a rolling seal is redundant, and a stale
+  -- one is pure liability.
+  local function rolling_seal_is_orphaned(filename)
+    local parsed = rolling_manifest.parse_filename(filename)
+    -- nil for `manifest.json` / `manifest.sig` (the CLASSIC seal, always packed)
+    -- and for `.tmp` staging names.
+    if parsed == nil then
+      return false
+    end
+    return not packed_session_ids[parsed.session_id]
+  end
+
   local zip_entries = {}
   for _, filename in ipairs(dir_names) do
     local is_session_file = filename:match("%.slog$") ~= nil or filename:match("%.slog%.meta$") ~= nil
@@ -349,6 +408,14 @@ function M.seal_bundle(opts)
     -- file is packed as before: manifest.json, manifest.sig, and anything a
     -- future step drops in here.
     local packable_here = (not is_session_file) or packable[filename]
+    if packable_here and rolling_seal_is_orphaned(filename) then
+      -- Both halves go together: a `.sig` without its `.json` vouches for
+      -- nothing, and a `.json` without its `.sig` is an unsigned claim
+      -- (`missing_sig`). `parse_filename` matches each half independently, so
+      -- each is dropped on its own pass and the pair stays consistent.
+      warnings.orphaned_rolling_seal = true
+      packable_here = false
+    end
     if packable_here
       and not filename:find(".corrupt-", 1, true)
       and not filename:match("%.tmp$")
