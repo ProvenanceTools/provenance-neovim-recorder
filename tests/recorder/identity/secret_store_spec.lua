@@ -129,7 +129,16 @@ describe("secret_store", function()
       old_store.load_or_create_master_secret()
       local exported = old_store.export_master_secret()
       assert.is_true(exported.ok)
-      assert.equals(64, #exported.value)
+      -- The exported value is SELF-IDENTIFYING: marker + 64 hex characters.
+      -- A bare 64-hex string is indistinguishable from a student PUBLIC key, and
+      -- a student who pasted it into the enrollment page would ship their signing
+      -- identity to a web server with every check on both ends passing. The
+      -- marker converts that silent catastrophe into a named refusal.
+      local marker = secret_store.MASTER_SECRET_EXPORT_PREFIX
+      assert.equals(marker, exported.value:sub(1, #marker))
+      local payload = exported.value:sub(#marker + 1)
+      assert.equals(64, #payload)
+      assert.is_not_nil(payload:match("^[0-9a-f]+$"))
 
       local new_store_obj = new_store()
       assert.is_true(new_store_obj.import_master_secret(exported.value).ok)
@@ -137,6 +146,23 @@ describe("secret_store", function()
       local a = student_keys.derive_course_keypair(old_store.load_master_secret().value, COURSE_ID)
       local b = student_keys.derive_course_keypair(new_store_obj.load_master_secret().value, COURSE_ID)
       assert.equals(a.public_key_hex, b.public_key_hex)
+    end)
+
+    it("import accepts the exported value with OR without the marker", function()
+      -- Nothing exported by an older build of this plugin may be stranded.
+      local store = new_store()
+      store.load_or_create_master_secret()
+      local marked = store.export_master_secret().value
+      local marker = secret_store.MASTER_SECRET_EXPORT_PREFIX
+      local bare = marked:sub(#marker + 1)
+
+      local fresh = new_store()
+      assert.is_true(fresh.import_master_secret(bare).ok)
+      assert.equals(marked, fresh.export_master_secret().value)
+
+      local fresh2 = new_store()
+      assert.is_true(fresh2.import_master_secret(marked).ok)
+      assert.equals(marked, fresh2.export_master_secret().value)
     end)
 
     it("import tolerates whitespace and uppercase, but rejects garbage without clobbering", function()

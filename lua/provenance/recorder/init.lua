@@ -248,19 +248,28 @@ function M.setup(opts)
 
   local IDENTITY_COMMANDS = {
     ProvenanceEnrollmentRequest = {
-      desc = "Provenance: print your per-course public key to send to course staff",
+      -- Identity is INSTITUTION-scoped: one key, one credential, every course.
+      -- An argument selects the LEGACY per-course request, for a student who
+      -- must re-derive a key an existing 2.0 token names.
+      desc = "Provenance: print your student public key for the enrolment page",
       nargs = "?",
       run = function(cmd_opts)
+        if cmd_opts.args ~= "" then
+          return enrollment_cmd.request_course({
+            store = identity_store,
+            key_cache = identity_key_cache,
+            course_id = cmd_opts.args,
+            active_course_ids = active_course_ids(),
+          })
+        end
         return enrollment_cmd.request({
           store = identity_store,
           key_cache = identity_key_cache,
-          course_id = cmd_opts.args ~= "" and cmd_opts.args or nil,
-          active_course_ids = active_course_ids(),
         })
       end,
     },
     ProvenanceEnrollmentImport = {
-      desc = "Provenance: import the enrollment token JSON course staff sent back",
+      desc = "Provenance: import the identity JSON (credential 2.1 or token 2.0)",
       nargs = "?",
       run = function(cmd_opts)
         local raw = cmd_opts.args ~= "" and cmd_opts.args or prompt("Paste enrollment token JSON: ")
@@ -268,7 +277,7 @@ function M.setup(opts)
       end,
     },
     ProvenanceEnrollmentStatus = {
-      desc = "Provenance: show the identity store location and enrolled courses",
+      desc = "Provenance: show the identity store location, credential and enrollments",
       nargs = 0,
       run = function()
         return enrollment_cmd.status({ store = identity_store })
@@ -306,8 +315,8 @@ function M.setup(opts)
 
   function handle.dispose()
     registry.stop_all("deactivate")
-    -- Drop every derived per-course PRIVATE key. This is the disposal path that
-    -- justifies caching them at this layer at all.
+    -- Drop every derived PRIVATE key — the global one and every per-course one.
+    -- This is the disposal path that justifies caching them at this layer at all.
     identity_key_cache.dispose()
     for name in pairs(IDENTITY_COMMANDS) do
       pcall(vim.api.nvim_del_user_command, name)

@@ -42,6 +42,21 @@
 --- keys then re-derive byte-identically through HKDF, so every enrollment token
 --- the student already holds keeps working and nothing is re-minted.
 ---
+--- ## TWO identity families live here, and both stay
+---
+---  - **2.1, INSTITUTION-scoped (current).** ONE credential at the singular
+---    `credential` key, with no course component — a 2.1 credential names no
+---    course and serves every course forever (`core/institution.lua`).
+---  - **2.0, COURSE-scoped (legacy).** One enrollment per course under
+---    `enrollments`. Minting is retired server-side, but a token a student
+---    already holds must keep working, and archived bundles that carry one must
+---    keep verifying — that is the entire justification for this system.
+---
+--- `store.save_identity_artifact` is the single import entry point and routes on
+--- the SIGNED `format_version`, so a student never has to know which kind they
+--- hold. A recorder holding BOTH prefers 2.1 — decided in `session_identity.lua`,
+--- see the precedence note there.
+---
 --- ## Why enrollment tokens live here too
 ---
 --- A token is a signed PUBLIC statement, not a secret — it is written verbatim
@@ -59,6 +74,7 @@
 --- `core/course_cert.lua`) is about canonicalization key ORDERING and does not
 --- reach here.
 local core_enrollment = require("provenance.core.enrollment")
+local core_institution = require("provenance.core.institution")
 local student_keys = require("provenance.core.student_keys")
 local result = require("provenance.core.result")
 local atomic_write = require("provenance.recorder.io.atomic_write")
@@ -67,6 +83,26 @@ local M = {}
 
 --- Storage format version for this file itself (unrelated to any log format).
 M.FORMAT_VERSION = "1.0"
+
+--- Marker prefixed to the master secret when it is exported as a backup.
+---
+--- ## Why the exported secret is not a bare hex string
+---
+--- A student master secret and a student PUBLIC key are both 64 lowercase hex
+--- characters, and the enrollment page cannot tell them apart by inspection. A
+--- student who exports their identity secret and pastes the result into that
+--- page's key field has handed their signing identity to a web server —
+--- silently, because every check on both ends passes.
+---
+--- Prefixing the exported value makes it SELF-IDENTIFYING, which converts that
+--- silent catastrophe into a named refusal: the analyzer looks for this exact
+--- marker and hard-refuses the paste. `store.import_master_secret` accepts the
+--- value WITH OR WITHOUT the marker, so a secret exported by an older build of
+--- this plugin still imports and nothing is stranded.
+---
+--- The literal must stay identical to the monorepo's
+--- `MASTER_SECRET_EXPORT_PREFIX` / the analyzer's `MASTER_SECRET_MARKER`.
+M.MASTER_SECRET_EXPORT_PREFIX = "provenance-secret-v1:"
 
 local MASTER_HEX_LEN = student_keys.MASTER_SECRET_BYTES * 2
 
@@ -93,12 +129,19 @@ local function is_master_hex(v)
 end
 
 --- Students copy the secret out of a message, so a stray newline, surrounding
---- whitespace, or an uppercase rendering must not read as corruption.
+--- whitespace, or an uppercase rendering must not read as corruption. The
+--- self-identifying export marker is stripped if present, so a secret exported
+--- by any build of this plugin imports.
 local function normalize_hex(raw)
   if type(raw) ~= "string" then
     return ""
   end
-  return (raw:gsub("%s+", "")):lower()
+  local collapsed = (raw:gsub("%s+", "")):lower()
+  local marker = M.MASTER_SECRET_EXPORT_PREFIX
+  if collapsed:sub(1, #marker) == marker then
+    return collapsed:sub(#marker + 1)
+  end
+  return collapsed
 end
 
 --- Create a store bound to a file path.
@@ -224,12 +267,14 @@ function M.new(opts)
 
   --- Hex-encode the stored master secret for transfer to a new machine.
   --- @return table { ok = true, value = <64-char hex> } | err
+  --- The returned value carries M.MASTER_SECRET_EXPORT_PREFIX, so it can never
+  --- be mistaken for a student PUBLIC key on the enrollment page.
   function store.export_master_secret()
     local loaded = store.load_master_secret()
     if not loaded.ok then
       return loaded
     end
-    return result.ok(to_hex(loaded.value))
+    return result.ok(M.MASTER_SECRET_EXPORT_PREFIX .. to_hex(loaded.value))
   end
 
   --- Adopt a master secret pasted from another machine.
@@ -361,6 +406,194 @@ function M.new(opts)
     end
     state.enrollments[course_id] = nil
     pcall(write_state, state)
+  end
+
+  -- -------------------------------------------------------------------------
+  -- Student credential (identity 2.1, INSTITUTION-scoped) — the CURRENT family
+  -- -------------------------------------------------------------------------
+
+  --- Validate a pasted 2.1 `{ enrollment, enrollment_cert }` blob and persist it.
+  ---
+  --- Step for step the twin of store.save_enrollment, in the same order and for
+  --- the same reasons, with the 2.1 artifacts and the 2.1 cross-field check:
+  ---
+  ---  1. JSON, and a JSON *object*.
+  ---  2. Version gate on BOTH slots, cert first — before any shape work, so a
+  ---     future 3.0 artifact is refused as a version problem and never read
+  ---     under 2.1 rules. Mirrors verify_identity_chain step 0.
+  ---  3. Shape, cert first.
+  ---  4. `institution_id` agreement between the credential and the cert
+  ---     travelling with it — the 2.1 analogue of the 2.0 `course_id` check.
+  ---
+  --- SIGNATURES ARE NOT CHECKED HERE, exactly as at 2.0. The 2.1 trust anchor is
+  --- the recorder's embedded ROOT public key, and the real walk happens at
+  --- session start in `session_identity.lua`. Validating here only rejects an
+  --- obvious paste error while the student is standing there to fix it.
+  ---
+  --- Note what step 4 does NOT do: it cannot detect the cross-institution
+  --- forgery verify_identity_chain guards against, because that check needs the
+  --- root-verified anchor and this function has no anchor. It catches a student
+  --- who mixed two pastes, nothing more.
+  --- @param raw_json string
+  --- @return table { ok = true, value = { institution_id, student_ref, student_pubkey } }
+  ---   | { ok = false, error = { kind, ... } }
+  function store.save_student_credential(raw_json)
+    local decode_ok, parsed = pcall(vim.json.decode, raw_json)
+    if not decode_ok or type(parsed) ~= "table" or vim.islist(parsed) then
+      return result.err({ kind = "invalid_json", message = "expected a JSON object" })
+    end
+
+    for _, pair in ipairs({ { "enrollment_cert", "cert" }, { "enrollment", "credential" } }) do
+      local field, artifact = pair[1], pair[2]
+      local declared = type(parsed[field]) == "table" and parsed[field].format_version or nil
+      if declared ~= core_institution.FORMAT_VERSION then
+        return result.err({
+          kind = "unsupported_format_version",
+          artifact = artifact,
+          format_version = type(declared) == "string" and declared or "",
+        })
+      end
+    end
+
+    local cert = core_institution.parse_institution_cert(parsed.enrollment_cert)
+    if not cert.ok then
+      return result.err({ kind = "invalid_cert_shape", reason = cert.error.reason })
+    end
+    local credential = core_institution.parse_student_credential(parsed.enrollment)
+    if not credential.ok then
+      return result.err({ kind = "invalid_credential_shape", reason = credential.error.reason })
+    end
+
+    if credential.value.institution_id ~= cert.value.institution_id then
+      return result.err({
+        kind = "institution_id_mismatch",
+        credential_institution_id = credential.value.institution_id,
+        cert_institution_id = cert.value.institution_id,
+      })
+    end
+
+    local state, err = load_or_empty()
+    if err ~= nil then
+      return result.err({ kind = "store_unavailable", reason = err })
+    end
+    -- SINGULAR, no course component: a 2.1 credential names no course, so there
+    -- is nothing to key by. That is the whole point of the 2.0 -> 2.1 change,
+    -- and the storage shape is where it becomes visible.
+    state.credential = {
+      enrollment = credential.value,
+      enrollment_cert = cert.value,
+    }
+    local write_ok, write_err = pcall(write_state, state)
+    if not write_ok then
+      return result.err({ kind = "store_unavailable", reason = tostring(write_err) })
+    end
+    return result.ok({
+      institution_id = credential.value.institution_id,
+      student_ref = credential.value.student_ref,
+      student_pubkey = credential.value.student_pubkey,
+    })
+  end
+
+  --- Read the stored 2.1 credential.
+  ---
+  --- Returns nil for EVERY failure — absent, unreadable file, corrupt blob. This
+  --- is on the session-start path, where the only correct response to "cannot
+  --- produce an identity" is to record without one.
+  --- @return table|nil { enrollment, enrollment_cert }
+  function store.load_student_credential()
+    local state, err = read_state()
+    if err ~= nil or state == nil or type(state.credential) ~= "table" then
+      return nil
+    end
+    local cert = core_institution.parse_institution_cert(state.credential.enrollment_cert)
+    local credential = core_institution.parse_student_credential(state.credential.enrollment)
+    if not cert.ok or not credential.ok then
+      return nil
+    end
+    return { enrollment = credential.value, enrollment_cert = cert.value }
+  end
+
+  --- Forget the 2.1 credential. Never touches the master secret.
+  function store.clear_student_credential()
+    local state, err = read_state()
+    if err ~= nil or state == nil then
+      return
+    end
+    state.credential = nil
+    pcall(write_state, state)
+  end
+
+  -- -------------------------------------------------------------------------
+  -- The ONE importer — routes on the SIGNED version
+  -- -------------------------------------------------------------------------
+
+  --- Import whatever identity artifact a student pasted, 2.0 or 2.1.
+  ---
+  --- ## Routing on the signed version, never on which fields exist
+  ---
+  --- Both versions use the same two wire slots, so "which keys are present" says
+  --- nothing about which version this is. The discriminator is the
+  --- `format_version` INSIDE `enrollment_cert` — signed in both families, at the
+  --- same wire key in both — which is exactly what verify_identity_chain step 0
+  --- reads, and for exactly the reason spelled out there: the monorepo's
+  --- `bundle-manifest.ts` once routed on the mere presence of a field and made a
+  --- whole code path unreachable. Presence is attacker-controlled and ambiguous;
+  --- a signed version is neither.
+  ---
+  --- Reading the declared version off an unvalidated object is safe precisely
+  --- because nothing has been trusted yet — the routed-to function re-reads and
+  --- re-validates it before anything is stored.
+  ---
+  --- ## Both versions remain importable, forever
+  ---
+  --- A student who still holds a 2.0 token can still import it, and a recorder
+  --- that already stored one keeps using it. 2.0 MINTING is retired; 2.0
+  --- handling is not, and archived material is the entire justification for the
+  --- system.
+  --- @param raw_json string
+  --- @return table
+  ---   { ok = true, value = { identity_version = "2.0", course_id } }
+  ---   | { ok = true, value = { identity_version = "2.1", institution_id,
+  ---       student_ref, student_pubkey } }
+  ---   | { ok = false, error = { kind = "invalid_json", message } }
+  ---   | { ok = false, error = { kind = "unsupported_identity_version", format_version } }
+  ---   | { ok = false, error = { kind = "legacy_2_0", error = <EnrollmentImportError> } }
+  ---   | { ok = false, error = { kind = "current_2_1", error = <CredentialImportError> } }
+  function store.save_identity_artifact(raw_json)
+    local decode_ok, parsed = pcall(vim.json.decode, raw_json)
+    if not decode_ok or type(parsed) ~= "table" or vim.islist(parsed) then
+      return result.err({ kind = "invalid_json", message = "expected a JSON object" })
+    end
+
+    local slot = parsed.enrollment_cert
+    local declared = type(slot) == "table" and slot.format_version or nil
+    local version = type(declared) == "string" and declared or ""
+
+    if version == core_institution.FORMAT_VERSION then
+      local saved = store.save_student_credential(raw_json)
+      if not saved.ok then
+        return result.err({ kind = "current_2_1", error = saved.error })
+      end
+      return result.ok({
+        identity_version = core_institution.FORMAT_VERSION,
+        institution_id = saved.value.institution_id,
+        student_ref = saved.value.student_ref,
+        student_pubkey = saved.value.student_pubkey,
+      })
+    end
+
+    if version == core_enrollment.FORMAT_VERSION then
+      local saved = store.save_enrollment(raw_json)
+      if not saved.ok then
+        return result.err({ kind = "legacy_2_0", error = saved.error })
+      end
+      return result.ok({
+        identity_version = core_enrollment.FORMAT_VERSION,
+        course_id = saved.value.course_id,
+      })
+    end
+
+    return result.err({ kind = "unsupported_identity_version", format_version = version })
   end
 
   --- Course ids with a stored enrollment, sorted. For the status command.
