@@ -578,4 +578,105 @@ describe("recording_session bundle openability with an unflushed second session"
     -- Teardown: the secondary was never registered on scratch.
     secondary.stop("test-teardown")
   end)
+
+  --- THE SAME DEFECT, ONE ARTIFACT LATER.
+  ---
+  --- The rolling seal is a THIRD per-session artifact, and write point 1 fires
+  --- at session start — right after `session.start` is emitted, and therefore
+  --- BEFORE the `.slog` has been flushed even once. A session that is torn down
+  --- or abandoned in that window leaves a `manifest-<its id>.json` naming a log
+  --- that seal then (correctly) drops as `empty_session`.
+  ---
+  --- `analysis-core`'s `reconcileRollingSealsWithSessions` calls that
+  --- `no_session_log` — "the seal names a recording that is not here, and its
+  --- signature can never be checked" — and it fails check 1 (`manifest_sig`) for
+  --- THE WHOLE BUNDLE. Same blast radius as `orphaned_meta`: one stale file
+  --- costs a student every session they recorded.
+  ---
+  --- Hex logical ids on purpose: `rolling_manifest.parse_filename` only accepts
+  --- `[0-9a-f-]`, so a fixture id like "secondary-session" would never be seen
+  --- as a rolling manifest at all and the test would pass vacuously.
+  it("a rolling seal whose session never flushed is not packed", function()
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+
+    local common = {
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = dev_manifest(),
+      clock = core_clock.fixed(0, 0),
+      compute_extension_hash = function() return ("cd"):rep(32) end,
+    }
+
+    local primary_id = "aaaaaaaa-1111-4111-8111-111111111111"
+    local secondary_id = "bbbbbbbb-2222-4222-8222-222222222222"
+
+    local primary = recording_session.start(vim.tbl_extend("force", common, {
+      env = { uuid = function() return primary_id end },
+    }))
+    scratch.session = primary
+
+    local secondary = recording_session.start(vim.tbl_extend("force", common, {
+      env = { uuid = function() return secondary_id end },
+    }))
+
+    -- Both took their session-start roll, so both seals exist on disk.
+    assert.is_true(
+      vim.uv.fs_stat(provenance_dir .. "/manifest-" .. secondary_id .. ".json") ~= nil,
+      "write point 1 must seal a session from its first instant -- INCLUDING one "
+        .. "that records nothing. A zero-event session still has to be sealed, so "
+        .. "the fix must not be to stop rolling here."
+    )
+    assert.is_true(
+      vim.uv.fs_stat(provenance_dir .. "/manifest-" .. primary_id .. ".json") ~= nil,
+      "write point 1 must seal the primary session"
+    )
+
+    local result = primary.seal({ now = function() return "2026-05-19T14:30:00.000Z" end })
+    assert.equals("ok", result.kind)
+    assert.is_true(result.warnings.orphaned_rolling_seal, "the drop must be reported, never silent")
+
+    if vim.fn.executable("unzip") == 1 then
+      local packed = {}
+      for _, name in ipairs(zip_names(result.bundle_path)) do
+        packed[name] = true
+      end
+
+      -- The invariant the analyzer enforces, asserted directly: every rolling
+      -- seal in the bundle names a session whose log is in the bundle too.
+      local logical_ids = {}
+      for name in pairs(packed) do
+        if name:match("%.slog$") then
+          local first = core_ndjson.parse_entries(read_all(provenance_dir .. "/" .. name)).value[1]
+          logical_ids[first.data.session_id] = true
+        end
+      end
+      for name in pairs(packed) do
+        local parsed = require("provenance.core.rolling_manifest").parse_filename(name)
+        if parsed then
+          assert.is_true(
+            logical_ids[parsed.session_id] == true,
+            "rolling seal in bundle with no session log: " .. name
+          )
+        end
+      end
+
+      assert.is_true(packed["manifest-" .. primary_id .. ".json"], "the good session keeps its seal")
+      assert.is_true(packed["manifest-" .. primary_id .. ".sig"])
+      assert.is_false(packed["manifest-" .. secondary_id .. ".json"] == true)
+      assert.is_false(packed["manifest-" .. secondary_id .. ".sig"] == true, "the .sig goes with its .json")
+
+      -- Dropped from the ZIP only. Never destroyed: the on-disk seal is what a
+      -- git-submitted `.provenance/` is read from, and it may be a partner's.
+      assert.is_true(vim.uv.fs_stat(provenance_dir .. "/manifest-" .. secondary_id .. ".json") ~= nil)
+      assert.is_true(vim.uv.fs_stat(provenance_dir .. "/manifest-" .. secondary_id .. ".sig") ~= nil)
+
+      -- The classic seal is never touched by the rolling guard.
+      assert.is_true(packed["manifest.json"])
+      assert.is_true(packed["manifest.sig"])
+    end
+
+    secondary.stop("test-teardown")
+  end)
 end)
