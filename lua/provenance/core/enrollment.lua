@@ -1,8 +1,26 @@
---- Enrollment certificate + enrollment token — the identity half of the trust
---- chain (program spec §S2). Lua port of log-core's `enrollment.ts`.
+--- Enrollment certificate + enrollment token — the LEGACY course-scoped identity
+--- chain, at identity `format_version` 2.0 (program spec §S2). Lua port of
+--- log-core's `enrollment.ts`. Plus `M.verify_identity_chain`, which ROUTES
+--- between this chain and the current institution-scoped one in
+--- `institution.lua`.
 ---
 --- Structurally parallel to `course_cert.lua`: read that file first, this one
 --- deliberately mirrors its shape, its Result style, and its rules.
+---
+--- ## THIS CHAIN IS SUPERSEDED, AND IS SUPPORTED FOREVER
+---
+--- Identity is no longer course-scoped. A course-scoped credential required a
+--- roster match, rosters are populated by the Gradescope ingest path, and that
+--- path only runs AFTER a student submits — so a student could not hold an
+--- identity until after their first submission, while their first session needs
+--- one before they do any work. `institution.lua` describes the replacement and
+--- why it exists; new material is written there, at 2.1.
+---
+--- Nothing in this file may change behaviour. Every bundle already archived
+--- carries a 2.0 identity block, and program spec §9 makes parsing it permanent:
+--- adjudicating a case years after the fact is the entire justification for this
+--- system. Treat the code below as a format contract that happens to be
+--- executable.
 ---
 --- ## The problem this layer exists to solve
 ---
@@ -94,7 +112,8 @@
 local json = require("provenance.core.json")
 local result = require("provenance.core.result")
 local ed25519 = require("provenance.core.ed25519")
-local course_cert = require("provenance.core.course_cert")
+local shapes = require("provenance.core.identity_shapes")
+local institution = require("provenance.core.institution")
 
 local M = {}
 
@@ -115,91 +134,20 @@ M.SESSION_PUBKEY_BINDING_PURPOSE = "provenance-session-pubkey-binding-v1"
 
 -- ---------------------------------------------------------------------------
 -- Helpers
+--
+-- The shape and window primitives now live in `identity_shapes.lua`, shared
+-- verbatim with the institution-scoped chain in `institution.lua`. Two copies of
+-- "is this an ISO 8601 bound" is exactly how two ports of the same rule drift
+-- apart, and this file is a port of a port. The local aliases below keep the
+-- call sites in this module unchanged.
 -- ---------------------------------------------------------------------------
 
-local function is_nonempty_string(v)
-  return type(v) == "string" and v ~= ""
-end
-
-local function is_hex(v, n)
-  return type(v) == "string" and #v == n and v:match("^[0-9a-f]+$") ~= nil
-end
-
-local function is_plain_object(v)
-  return type(v) == "table" and not json.is_array(v) and v ~= json.NULL
-end
-
---- Validate a required non-empty string field. A missing key and a null-valued
---- key are treated identically — canonicalization erases the difference, so
---- nothing downstream can rely on it.
-local function require_string(obj, field)
-  local v = obj[field]
-  if not is_nonempty_string(v) then
-    return result.err({ reason = "must be a non-empty string", field = field })
-  end
-  return result.ok(v)
-end
-
-local function require_hex(obj, field, n)
-  local v = obj[field]
-  if not is_hex(v, n) then
-    return result.err({ reason = "must be a " .. n .. "-char hex string", field = field })
-  end
-  return result.ok(v)
-end
-
---- Validate an ordered pair of ISO 8601 bounds.
----
---- Both bounds MUST parse. Short validity windows are the only offline
---- mitigation this scheme has for the absence of revocation, so a bound that
---- silently never binds would undercut the sole control there is. These
---- artifacts are new, so unlike `manifest.issued_at` there is no archived-data
---- compatibility cost to enforcing it.
-local function require_ordered_bounds(obj, lower_field, upper_field)
-  local parsed = {}
-  for _, field in ipairs({ lower_field, upper_field }) do
-    local as_string = require_string(obj, field)
-    if not as_string.ok then
-      return as_string
-    end
-    local ms = course_cert.parse_iso_instant_ms(as_string.value)
-    if ms == nil then
-      return result.err({ reason = "must be an ISO 8601 date or timestamp", field = field })
-    end
-    parsed[field] = ms
-  end
-  if parsed[lower_field] > parsed[upper_field] then
-    return result.err({
-      reason = "must not be earlier than " .. lower_field,
-      field = upper_field,
-    })
-  end
-  return result.ok({ lower = obj[lower_field], upper = obj[upper_field] })
-end
-
---- Shared window arithmetic: is `at` inside `[lower, upper]`?
----
---- `lower` is inclusive from its first instant; a date-only `upper` is inclusive
---- through the END of that day, via course_cert.resolve_valid_until_exclusive_ms.
---- Identical semantics to course_cert.check_window, deliberately reusing the same
---- two primitives so the asymmetric date rule is implemented exactly ONCE in this
---- port.
-local function check_window(lower, upper, at)
-  local from = course_cert.parse_iso_instant_ms(lower)
-  local until_exclusive = course_cert.resolve_valid_until_exclusive_ms(upper)
-  local instant = course_cert.parse_iso_instant_ms(at)
-
-  if from == nil or until_exclusive == nil or instant == nil then
-    return { in_window = false, reason = "unparseable_timestamp" }
-  end
-  if instant < from then
-    return { in_window = false, reason = "before_valid_from" }
-  end
-  if instant >= until_exclusive then
-    return { in_window = false, reason = "after_valid_until" }
-  end
-  return { in_window = true }
-end
+local is_hex = shapes.is_hex
+local is_plain_object = shapes.is_plain_object
+local require_string = shapes.require_string
+local require_hex = shapes.require_hex
+local require_ordered_bounds = shapes.require_ordered_bounds
+local check_window = shapes.check_window
 
 -- ---------------------------------------------------------------------------
 -- Signed payloads — the exact bytes three ports must reproduce
@@ -378,17 +326,11 @@ end
 --- Shared ed25519 verification. Every malformed input is a verification FAILURE
 --- rather than an error: these values arrive from a student-editable file, so a
 --- bad hex string is an expected condition, not an exceptional one.
+---
+--- Delegates to `identity_shapes`, so both identity families verify a detached
+--- signature through exactly one implementation.
 local function verify_detached(payload, sig_hex, pubkey_hex)
-  local ok, verified = pcall(function()
-    if not is_hex(sig_hex, 128) or not is_hex(pubkey_hex, 64) then
-      return false
-    end
-    return ed25519.verify(ed25519.from_hex(sig_hex), payload, pubkey_hex)
-  end)
-  if not ok then
-    return false
-  end
-  return verified == true
+  return shapes.verify_detached(ed25519, payload, sig_hex, pubkey_hex)
 end
 
 --- Identity chain step 1: verify an enrollment cert against the course public
@@ -471,9 +413,12 @@ function M.check_enrollment_cert_window(cert, at)
 end
 
 -- ---------------------------------------------------------------------------
--- The full identity chain
+-- The full identity chain — TWO versions, one entry point
 -- ---------------------------------------------------------------------------
 
+--- Read the version an artifact DECLARES, without trusting anything else about
+--- it. Safe on an unvalidated object precisely because nothing else has
+--- happened yet.
 local function declared_version(artifact)
   if type(artifact) ~= "table" then
     return ""
@@ -493,91 +438,29 @@ local function shape_error(kind, inner)
   }
 end
 
---- Walk the identity chain:
---- course_cert -> enrollment_cert -> token -> session_pubkey_sig.
+--- The LEGACY 2.0 course-scoped walk. Unchanged behaviour, kept FOREVER so an
+--- archived bundle still verifies during an adjudication years from now.
 ---
---- **The steps run in this order and the order is load-bearing**, mirroring
---- manifest.verify_chain:
+--- Steps, in an order that is load-bearing:
 ---
----  0. Both artifacts declare `format_version == "2.0"`. Gated before any
----     signature work, so a future format cannot be walked under today's
----     assumptions about which fields are signed.
----  0b. Both artifacts satisfy the 2.0 shape. Also before signature work: a
----     canonicalizer OMITS absent keys, so an artifact missing a required field
----     would otherwise sign and verify cleanly while carrying nothing there.
----  1. `enrollment_cert` minus `course_sig` verifies against
----     `course_cert.course_pubkey`.
----  2. The token minus `enrollment_sig` verifies against
----     `enrollment_cert.enrollment_pubkey`.
----  3. `token.course_id == enrollment_cert.course_id == course_cert.course_id`.
----  4. `session_pubkey_sig` verifies against `token.student_pubkey` over the
----     binding payload for THIS exact session pubkey.
----  5. Both validity windows — NON-FATAL, returned on the success value.
----
---- Step 3 is not a formality, and it is why ALL THREE ids are compared rather
---- than two. Without it, 61B's course key can certify an enrollment key "for
---- 61C", that key can mint a 61C token, and steps 1 and 2 both pass: every
---- signature is genuine. Only comparing ids across every link catches a
---- cross-course forgery, and the requirement is that it be impossible, not
---- merely unlikely.
----
---- ## The `course_cert` MUST already be verified
----
---- This function takes the course certificate as a TRUST ANCHOR and does not
---- re-verify it against the root key — exactly as course_cert.verify takes the
---- root public key as a parameter rather than knowing one. The caller is
---- responsible for having obtained it from a successful manifest.verify_chain.
---- Passing an unverified cert makes every result below meaningless, because an
---- attacker who supplies the cert supplies `course_pubkey` too and can then
---- satisfy the entire chain with keys of their own.
----
---- @param input table {
----   identity: { enrollment, enrollment_cert, session_pubkey_sig },
----   session_pubkey: string,      -- 64-char hex, this session's ephemeral key
----   course_cert: table,          -- an ALREADY ROOT-VERIFIED course certificate
----   session_started_at: string,  -- ISO 8601; the token's window is judged
----                                -- against this, never wall-clock now
---- }
---- @return table
----   { ok = true, value = { course_id, student_ref, student_pubkey,
----       enrollment_pubkey, cert, token, cert_window, token_window } }
----   | { ok = false, error = { kind = "not_enrollment_2_0", artifact, format_version } }
----   | { ok = false, error = { kind = "invalid_cert_shape", field?, reason? } }
----   | { ok = false, error = { kind = "invalid_token_shape", field?, reason? } }
----   | { ok = false, error = { kind = "invalid_course_signature" } }
----   | { ok = false, error = { kind = "invalid_enrollment_signature" } }
----   | { ok = false, error = { kind = "course_id_mismatch", token_course_id,
----       cert_course_id, course_cert_course_id } }
----   | { ok = false, error = { kind = "invalid_session_pubkey" } }
----   | { ok = false, error = { kind = "invalid_session_pubkey_signature" } }
-function M.verify_identity_chain(input)
-  if type(input) ~= "table" or type(input.identity) ~= "table" then
-    return result.err({ kind = "invalid_cert_shape", reason = "not_object" })
-  end
-  local identity = input.identity
-  local course_cert_in = input.course_cert
+---  0b. Both artifacts satisfy the 2.0 shape — before any signature work,
+---      because a canonicalizer OMITS absent keys, so an artifact missing a
+---      required field would sign and verify cleanly while carrying nothing
+---      there.
+---  1.  `enrollment_cert` minus `course_sig` verifies against
+---      `course_cert.course_pubkey`.
+---  2.  The token minus `enrollment_sig` verifies against
+---      `enrollment_cert.enrollment_pubkey`.
+---  3.  `token.course_id == enrollment_cert.course_id == course_cert.course_id`.
+---      Not a formality: without it 61B's course key can certify an enrollment
+---      key "for 61C", that key mints a 61C token, and steps 1 and 2 both pass
+---      because every signature is genuine.
+---  4.  `session_pubkey_sig` verifies against `token.student_pubkey` over the v1
+---      binding payload for THIS exact session pubkey.
+---  5.  Both validity windows — NON-FATAL, returned on the success value.
+local function walk_course_chain(identity, session_pubkey, course_cert_in, session_started_at)
   if type(course_cert_in) ~= "table" then
-    return result.err({ kind = "invalid_cert_shape", reason = "course_cert must be an object" })
-  end
-
-  -- Step 0 — version gate, before anything is trusted or verified. Reading the
-  -- declared version off an unvalidated object is safe precisely because
-  -- nothing else has happened yet.
-  local cert_version = declared_version(identity.enrollment_cert)
-  if cert_version ~= M.FORMAT_VERSION then
-    return result.err({
-      kind = "not_enrollment_2_0",
-      artifact = "cert",
-      format_version = cert_version,
-    })
-  end
-  local token_version = declared_version(identity.enrollment)
-  if token_version ~= M.FORMAT_VERSION then
-    return result.err({
-      kind = "not_enrollment_2_0",
-      artifact = "token",
-      format_version = token_version,
-    })
+    return result.err({ kind = "missing_trust_anchor", required = "course_cert" })
   end
 
   -- Step 0b — shape before signatures, for both artifacts.
@@ -616,7 +499,6 @@ function M.verify_identity_chain(input)
   end
 
   -- Step 4 — the student key adopted THIS session key.
-  local session_pubkey = input.session_pubkey
   if not is_hex(session_pubkey, 64) then
     return result.err({ kind = "invalid_session_pubkey" })
   end
@@ -631,6 +513,8 @@ function M.verify_identity_chain(input)
 
   -- Step 5 — non-fatal windows, each against its own relevant issue time.
   return result.ok({
+    identity_version = M.FORMAT_VERSION,
+    scope = "course",
     course_id = token.course_id,
     student_ref = token.student_ref,
     student_pubkey = token.student_pubkey,
@@ -638,8 +522,228 @@ function M.verify_identity_chain(input)
     cert = cert,
     token = token,
     cert_window = M.check_enrollment_cert_window(cert, token.issued_at),
-    token_window = M.check_token_window(token, input.session_started_at),
+    token_window = M.check_token_window(token, session_started_at),
   })
+end
+
+--- The CURRENT 2.1 institution-scoped walk. See `institution.lua`.
+---
+---  0b. Both artifacts satisfy the 2.1 shape. Same reasoning as above.
+---  1.  The credential minus `institution_sig` verifies against the ANCHOR's
+---      `institution_pubkey` — never the travelling cert's copy, so a swapped
+---      cert can never introduce a key of the attacker's choosing even if step 2
+---      were somehow bypassed.
+---  2.  **The institution anchor check — the replacement for 2.0's step 3, and
+---      mandatory for the same reason.** `credential.institution_id`, the
+---      travelling cert's `institution_id`, and the anchor's must all agree, and
+---      the travelling cert must name the anchor's `institution_pubkey`. Root
+---      legitimately certifies many institutions; without this, a holder of a
+---      genuinely root-certified key for one institution can mint a credential
+---      naming ANOTHER and ship it with their own genuine cert, and every
+---      signature verifies. One signer's credential must never be replayable
+---      under another signer's authority.
+---  3.  `session_pubkey_sig` verifies against `credential.student_pubkey` over
+---      the v2 binding payload (a distinct `purpose` tag, so 2.0 and 2.1
+---      countersignatures can never be swapped).
+---  4.  Both validity windows — NON-FATAL, returned on the success value.
+local function walk_institution_chain(identity, session_pubkey, anchor, session_started_at)
+  if type(anchor) ~= "table" then
+    return result.err({ kind = "missing_trust_anchor", required = "institution_cert" })
+  end
+
+  -- Step 0b — shape before signatures, for both artifacts.
+  local parsed_cert = institution.parse_institution_cert(identity.enrollment_cert)
+  if not parsed_cert.ok then
+    return result.err(shape_error("invalid_cert_shape", parsed_cert.error))
+  end
+  local parsed_credential = institution.parse_student_credential(identity.enrollment)
+  if not parsed_credential.ok then
+    return result.err(shape_error("invalid_token_shape", parsed_credential.error))
+  end
+
+  local cert = parsed_cert.value
+  local credential = parsed_credential.value
+
+  -- Step 1 — the credential verifies against the key the ROOT vouched for.
+  --
+  -- Deliberately the ANCHOR's `institution_pubkey`, never the travelling cert's.
+  -- Step 2 forces the two to be equal anyway, but reading the key from the
+  -- already-root-verified value means a swapped travelling cert can never
+  -- introduce a key of the attacker's choosing, whatever happens downstream.
+  if not institution.verify_student_credential(credential, anchor.institution_pubkey) then
+    return result.err({ kind = "invalid_institution_signature" })
+  end
+
+  -- Step 2 — THE INSTITUTION ANCHOR CHECK. The replacement for 2.0's course_id
+  -- triple-comparison, and mandatory for exactly the same reason: root certifies
+  -- many institutions, so a genuine signature by a genuinely certified key
+  -- proves only WHO signed, never WHOM they were entitled to speak for.
+  -- Comparing the id at every link is what makes replaying one signer's
+  -- credential under another's authority impossible rather than merely unlikely.
+  local pubkey_mismatch = cert.institution_pubkey ~= anchor.institution_pubkey
+  if
+    credential.institution_id ~= cert.institution_id
+    or cert.institution_id ~= anchor.institution_id
+    or pubkey_mismatch
+  then
+    return result.err({
+      kind = "institution_mismatch",
+      credential_institution_id = credential.institution_id,
+      cert_institution_id = cert.institution_id,
+      anchor_institution_id = anchor.institution_id,
+      pubkey_mismatch = pubkey_mismatch,
+    })
+  end
+
+  -- Step 3 — the student key adopted THIS session key.
+  if not is_hex(session_pubkey, 64) then
+    return result.err({ kind = "invalid_session_pubkey" })
+  end
+  local binding = {
+    institution_id = credential.institution_id,
+    student_ref = credential.student_ref,
+    session_pubkey = session_pubkey,
+  }
+  if
+    not institution.verify_session_binding(
+      binding,
+      identity.session_pubkey_sig,
+      credential.student_pubkey
+    )
+  then
+    return result.err({ kind = "invalid_session_pubkey_signature" })
+  end
+
+  -- Step 4 — non-fatal windows, each against its own relevant issue time.
+  return result.ok({
+    identity_version = institution.FORMAT_VERSION,
+    scope = "institution",
+    institution_id = credential.institution_id,
+    student_ref = credential.student_ref,
+    student_pubkey = credential.student_pubkey,
+    institution_pubkey = anchor.institution_pubkey,
+    cert = cert,
+    credential = credential,
+    cert_window = institution.check_institution_cert_window(cert, credential.issued_at),
+    token_window = institution.check_credential_window(credential, session_started_at),
+  })
+end
+
+--- Walk the identity chain for whichever identity version the bundle declares.
+---
+--- ## Routing — on a SIGNED discriminator, never on field presence
+---
+--- Step 0 reads `identity.enrollment_cert.format_version`. That field is inside
+--- the cert's signed payload in BOTH versions, at the same wire slot, so it
+--- cannot be flipped without invalidating a signature and it can be found
+--- without first guessing which shape is present.
+---
+--- Routing on which fields EXIST would have been the obvious alternative and is
+--- FORBIDDEN here: the monorepo's `bundle-manifest.ts` once treated the mere
+--- presence of an embedded manifest as a 2.0 claim, and that made the entire
+--- legacy path unreachable. Presence is attacker-controlled and ambiguous; a
+--- signed version is neither. The credential's own `format_version` must then
+--- MATCH the cert's, so a legacy course-signed cert can never be paired with an
+--- institution credential — each artifact would otherwise be read under rules
+--- the other never agreed to.
+---
+--- ## `"2.0"` — legacy, COURSE-scoped. Supported forever.
+---
+--- Every bundle already archived carries this shape, and program spec §9 makes
+--- 1.x/2.0 parsing permanent: adjudicating a case years after the fact is the
+--- entire justification for this system. The walk is unchanged from the day it
+--- shipped, down to the error values.
+---
+--- ## `"2.1"` — current, INSTITUTION-scoped. See `institution.lua`.
+---
+--- ## The trust anchor MUST already be verified
+---
+--- This function takes its anchor as a parameter and does NOT re-verify it
+--- against the root key — exactly as `course_cert.verify` and
+--- `institution.verify_institution_cert` take the root public key as a parameter
+--- rather than knowing one. The caller obtains a `course_cert` from a successful
+--- `manifest.verify_chain`, or root-verifies the `institution_cert` with
+--- `institution.verify_institution_cert` before passing it. Passing an
+--- unverified anchor makes every result meaningless, because an attacker who
+--- supplies the anchor supplies its public key too and can then satisfy the
+--- whole chain with keys of their own.
+---
+--- @param input table {
+---   identity: { enrollment, enrollment_cert, session_pubkey_sig },
+---   session_pubkey: string,       -- 64-char hex, this session's ephemeral key
+---   course_cert: table|nil,       -- an ALREADY ROOT-VERIFIED course certificate.
+---                                 -- Required for a 2.0 chain, ignored by 2.1.
+---   institution_cert: table|nil,  -- an ALREADY ROOT-VERIFIED institution cert.
+---                                 -- Required for a 2.1 chain, ignored by 2.0.
+---   session_started_at: string,   -- ISO 8601; the credential's window is judged
+---                                 -- against this, never wall-clock now
+--- }
+--- @return table
+---   2.0 ok: { identity_version = "2.0", scope = "course", course_id, student_ref,
+---       student_pubkey, enrollment_pubkey, cert, token, cert_window, token_window }
+---   2.1 ok: { identity_version = "2.1", scope = "institution", institution_id,
+---       student_ref, student_pubkey, institution_pubkey, cert, credential,
+---       cert_window, token_window }
+---   | { ok = false, error = { kind = "unsupported_identity_version", format_version } }
+---   | { ok = false, error = { kind = "identity_version_mismatch", cert_version,
+---       credential_version } }
+---   | { ok = false, error = { kind = "missing_trust_anchor", required } }
+---   | { ok = false, error = { kind = "invalid_cert_shape", field?, reason? } }
+---   | { ok = false, error = { kind = "invalid_token_shape", field?, reason? } }
+---   | { ok = false, error = { kind = "invalid_course_signature" } }            -- 2.0
+---   | { ok = false, error = { kind = "invalid_enrollment_signature" } }        -- 2.0
+---   | { ok = false, error = { kind = "course_id_mismatch", token_course_id,
+---       cert_course_id, course_cert_course_id } }                              -- 2.0
+---   | { ok = false, error = { kind = "invalid_institution_signature" } }       -- 2.1
+---   | { ok = false, error = { kind = "institution_mismatch",
+---       credential_institution_id, cert_institution_id, anchor_institution_id,
+---       pubkey_mismatch } }                                                    -- 2.1
+---   | { ok = false, error = { kind = "invalid_session_pubkey" } }
+---   | { ok = false, error = { kind = "invalid_session_pubkey_signature" } }
+function M.verify_identity_chain(input)
+  if type(input) ~= "table" or type(input.identity) ~= "table" then
+    return result.err({ kind = "invalid_cert_shape", reason = "not_object" })
+  end
+  local identity = input.identity
+
+  -- Step 0 — the version gate, before anything is trusted, parsed, or verified.
+  --
+  -- The discriminator lives in the CERT slot: it is signed in both versions and
+  -- sits at the same wire key in both, so it can be read without first knowing
+  -- which shape is present. NEVER route on which fields exist.
+  local cert_version = declared_version(identity.enrollment_cert)
+  if cert_version ~= M.FORMAT_VERSION and cert_version ~= institution.FORMAT_VERSION then
+    return result.err({
+      kind = "unsupported_identity_version",
+      format_version = cert_version,
+    })
+  end
+
+  -- No mixing. A legacy course-signed cert paired with an institution credential
+  -- would leave each artifact read under rules the other never agreed to.
+  local credential_version = declared_version(identity.enrollment)
+  if credential_version ~= cert_version then
+    return result.err({
+      kind = "identity_version_mismatch",
+      cert_version = cert_version,
+      credential_version = credential_version,
+    })
+  end
+
+  if cert_version == institution.FORMAT_VERSION then
+    return walk_institution_chain(
+      identity,
+      input.session_pubkey,
+      input.institution_cert,
+      input.session_started_at
+    )
+  end
+  return walk_course_chain(
+    identity,
+    input.session_pubkey,
+    input.course_cert,
+    input.session_started_at
+  )
 end
 
 return M
