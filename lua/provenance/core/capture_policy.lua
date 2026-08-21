@@ -118,6 +118,24 @@ M.FLOOR_EVENT_KINDS = {
   "ext.activate",
   "recorder.degraded",
   "recorder.recovered_from_corruption",
+  -- `peer.observed` is on the floor, and the placement is worth stating,
+  -- because the floor RULE above points the other way: it is the most
+  -- privacy-sensitive signal in the protocol, being the only one that describes
+  -- a DIFFERENT student's artifact, and sensitivity is an argument FOR a knob.
+  --
+  -- It is floor because collaboration spec §5.6 item 3 assigns the
+  -- disambiguation elsewhere: whether witnessing was AVAILABLE is a
+  -- `session.start` capability report, alongside `git_capture`, not a capture
+  -- knob. A capability report says "I could not"; a knob says "I was told not
+  -- to". Adding a `policy.capture` key here would publish a course-SIGNED
+  -- manifest field ahead of the decision that gives it meaning (collaboration
+  -- spec §8 item 5, still open) — the readers-before-writers inversion §9
+  -- forbids.
+  --
+  -- If §8 item 5 comes back requiring a per-course off switch, this entry moves
+  -- to POLICY_GATED_EVENT_KINDS with a `peer_observation` key — a change the
+  -- monorepo makes first, in its vectors, and this port follows.
+  "peer.observed",
 }
 
 --- The complement of FLOOR_EVENT_KINDS: every event kind a policy can switch

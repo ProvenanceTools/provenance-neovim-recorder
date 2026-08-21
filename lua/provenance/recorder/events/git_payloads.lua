@@ -54,6 +54,49 @@
 ---    also why `parents` is explicitly tagged with `json.array`: an untagged
 ---    empty Lua table canonicalizes as `{}`, not `[]`.
 ---
+--- ## THE REPOSITORY DISCRIMINATOR — `root_commit_sha` (decision D12)
+---
+--- A scope can observe more than one repository: a submodule, or a repository
+--- nested inside the one that owns the assignment root. Their sha spaces are
+--- unrelated, so a reader that keys observed commits by sha alone merges two
+--- graphs that have nothing to do with each other. `root_commit_sha` is what
+--- lets the reader key on `(repository, sha)` for real.
+---
+--- The value is the root of HEAD's FIRST-PARENT lineage, derived ONCE per
+--- repository at git-wiring setup — see `recorder/wiring/root_commit_sha.lua`
+--- for the derivation and `wiring/git_wiring.lua` for the memoization. It was
+--- chosen because BOTH PARTNERS DERIVE THE SAME VALUE OFFLINE, which is the
+--- only thing that makes cross-contributor correlation possible; a discriminator
+--- two partners disagree about correlates nothing.
+---
+--- Four rules bind this builder, all pinned by
+--- `tests/conformance/fixtures/git-event.json`:
+---
+--- 1. **OMIT, never `null`.** Omission and `null` canonicalize differently and
+---    therefore chain to different hashes, exactly as `parents: []` and an
+---    absent `parents` do. ABSENT is a legal, permanent, blameless answer — a
+---    shallow clone has no reachable root commit and every bundle recorded
+---    before D12 has no such field — so the absent case must stay byte-identical
+---    to the pre-D12 world.
+--- 2. **The value is validated through log-core's own reader**
+---    (`core/git_event.read_repository_discriminator`), never a regex restated
+---    on this side. A path, a remote URL, an abbreviated sha, an uppercased sha
+---    and the empty string are all rejected and the key omitted. Rejecting costs
+---    only correlation; letting a path through would put an identifier in a
+---    staff-facing UI (S14(b)).
+--- 3. **One value per repository OBSERVED.** A session that sees a submodule as
+---    well as its outer repository labels each event with its OWN repository's
+---    root. Labelling a submodule event with the outer root re-creates the exact
+---    merge this field exists to prevent — which is why the memoization in
+---    `git_wiring.lua` is keyed by repository, not per session.
+--- 4. **It rides on every payload that carries a `sha`,** not only on commits:
+---    an unlabelled observation does not correlate even when its neighbours in
+---    the same session do. A payload naming no commit gets no discriminator,
+---    because there is nothing for a repository key to key.
+---
+--- Like every other field here, it is a repository identifier and NOTHING else:
+--- never the repository path, never a remote URL, and it reaches no author.
+---
 --- ## Branch names are VALUES at a fixed ASCII key, never keys
 ---
 --- This port's JCS sorts object keys BYTEWISE, which only matches JS/Kotlin's
@@ -62,6 +105,7 @@
 --- `parents` — so a branch named with non-ASCII characters can never reorder a
 --- signed payload or make the three recorders disagree on bytes.
 local json = require("provenance.core.json")
+local git_event = require("provenance.core.git_event")
 
 local M = {}
 
@@ -113,8 +157,12 @@ end
 --- @param branch string|nil — current branch. ABSENT on detached HEAD; never
 ---   invented, because an omitted branch and a branch literally named "HEAD"
 ---   are different claims.
---- @return table {kind="git.event", data={operation, commit_sha?, sha?, parents?, branch?}}
-function M.build_git_event(operation, commit_sha, view, branch)
+--- @param root_commit_sha string|nil — the REPOSITORY DISCRIMINATOR (D12). See
+---   the D12 block in the module docstring. OMITTED, never `null`, and dropped
+---   entirely unless it passes log-core's own reader AND there is a commit for
+---   it to label.
+--- @return table {kind="git.event", data={operation, commit_sha?, sha?, parents?, branch?, root_commit_sha?}}
+function M.build_git_event(operation, commit_sha, view, branch, root_commit_sha)
   local data = {
     operation = operation,
   }
@@ -142,6 +190,34 @@ function M.build_git_event(operation, commit_sha, view, branch)
 
   if branch ~= nil then
     data.branch = branch
+  end
+
+  -- THE REPOSITORY DISCRIMINATOR (D12). Three gates, in this order:
+  --
+  --  1. There must be a commit for it to label. Rule 10 says the field rides on
+  --     every `git.event` that carries a `sha` — not only on commits, because
+  --     an unlabelled observation does not correlate even when its neighbours
+  --     in the same session do — but an `operation_only` payload names no
+  --     commit at all, so there is nothing for a repository key to key.
+  --
+  --  2. It must pass LOG-CORE'S OWN READER, not a regex copied to this side of
+  --     the contract. A writer that shape-checks with its own copy of the rule
+  --     can emit a value its reader rejects; a writer that runs the reader
+  --     cannot. This is the one place a repository PATH or a remote URL is
+  --     stopped (S14(b)) — and running it here means such a value is never
+  --     written down at all, rather than written and later declined.
+  --
+  --  3. OMIT, never `null`. Omission and `null` canonicalize differently and
+  --     therefore chain to different hashes, exactly as `parents: []` and an
+  --     absent `parents` do. Readers accept `null` as absence so a nonconforming
+  --     log still parses; a writer that emits it is nonconforming. Note this
+  --     branch is also what makes `json.NULL` handed in here an OMISSION: the
+  --     reader answers `absent` for it, which is not `recorded`.
+  if
+    (data.sha ~= nil or data.commit_sha ~= nil)
+    and git_event.is_usable_discriminator(root_commit_sha)
+  then
+    data[git_event.REPOSITORY_DISCRIMINATOR_FIELD] = root_commit_sha
   end
 
   return {

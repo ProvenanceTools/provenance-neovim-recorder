@@ -1488,18 +1488,45 @@ end)
 
 local core_json = require("provenance.core.json")
 local git_payloads = require("provenance.recorder.events.git_payloads")
+local git_event = require("provenance.core.git_event")
 
 describe("conformance: git-event.json (program spec S5 — the commit graph)", function()
   local fx = load_fixture("git-event.json")
 
-  -- The five structural keys, and NOTHING else, may ever appear in a
+  -- The six structural keys, and NOTHING else, may ever appear in a
   -- git.event payload. Author identity is not on this list and never will be.
-  local ALLOWED_KEYS = { operation = true, commit_sha = true, sha = true, parents = true, branch = true }
+  local ALLOWED_KEYS = {
+    operation = true,
+    commit_sha = true,
+    sha = true,
+    parents = true,
+    branch = true,
+    root_commit_sha = true,
+  }
+
+  -- Cases whose `data` a CONFORMING WRITER MUST NEVER PRODUCE (decision D12).
+  -- Four spell an unusable discriminator (a repository path, an uppercased sha,
+  -- an abbreviation, the empty string) and one spells the unknown case as
+  -- `null` instead of omitting the key. They are in the vector so a port
+  -- asserts REJECT as well as accept: a reader must still parse them, and this
+  -- writer must refuse to build them. Each is driven through the builder below
+  -- and required to degrade to the ABSENT bytes — not merely to "something
+  -- different", which an arbitrary bug would also satisfy.
+  local WRITER_MUST_REFUSE = {
+    root_commit_sha_null_is_not_absent = true,
+    root_commit_sha_repository_path_rejected = true,
+    root_commit_sha_uppercase_rejected = true,
+    root_commit_sha_abbreviated_rejected = true,
+    root_commit_sha_empty_rejected = true,
+  }
 
   --- Rebuild one vector case's payload through git_payloads.
   --- `data.parents` absent (nil) and `data.parents == []` (an empty Lua table
   --- from vim.json.decode) are the two DIFFERENT inputs the vector exists to
   --- distinguish, so presence is tested with `~= nil`, never with `#`.
+  --- `data.root_commit_sha` is handed in verbatim — including `vim.NIL` for the
+  --- JSON `null` case — because refusing it is the builder's job, not the
+  --- test's.
   local function build(case)
     local d = case.data
     local view = nil
@@ -1513,7 +1540,13 @@ describe("conformance: git-event.json (program spec S5 — the commit graph)", f
       end
       view = git_payloads.commit_view(d.sha, parents)
     end
-    return git_payloads.build_git_event(d.operation, d.commit_sha, view, d.branch)
+    return git_payloads.build_git_event(
+      d.operation,
+      d.commit_sha,
+      view,
+      d.branch,
+      d.root_commit_sha
+    )
   end
 
   local function case_named(name)
@@ -1534,31 +1567,185 @@ describe("conformance: git-event.json (program spec S5 — the commit graph)", f
     return keys
   end
 
-  it("the vector ships all eleven cases this port must satisfy", function()
-    -- Guards against a silently truncated fixture making the loop below pass
-    -- by testing nothing.
-    assert.equals(11, #fx.cases)
+  it("the vector ships all twenty cases this port must satisfy", function()
+    -- Guards against a silently truncated fixture making the loops below pass
+    -- by testing nothing. Eleven pre-D12 cases plus nine discriminator cases,
+    -- of which five the writer must REFUSE.
+    assert.equals(20, #fx.cases)
+    local refuse_seen = 0
+    for _, c in ipairs(fx.cases) do
+      if WRITER_MUST_REFUSE[c.name] then
+        refuse_seen = refuse_seen + 1
+      end
+    end
+    assert.equals(5, refuse_seen)
   end)
 
   for _, case in ipairs(fx.cases) do
-    it("case '" .. case.name .. "': " .. case.note, function()
-      local ev = build(case)
-      assert.equals("git.event", ev.kind)
+    if not WRITER_MUST_REFUSE[case.name] then
+      it("case '" .. case.name .. "': " .. case.note, function()
+        local ev = build(case)
+        assert.equals("git.event", ev.kind)
 
-      -- Byte-exact JCS of the payload.
-      assert.equals(case.canonical_json, core_json.canonicalize(ev.data))
+        -- Byte-exact JCS of the payload.
+        assert.equals(case.canonical_json, core_json.canonicalize(ev.data))
 
-      -- ...and the chain hash of the whole envelope built around OUR payload.
-      local e = case.envelope
-      assert.equals("git.event", e.kind)
-      local env = envelope.new(e.seq, e.t, e.wall, e.kind, ev.data)
-      assert.equals(case.hash, hc.chain_entry(case.prev_hash, env).hash)
+        -- ...and the chain hash of the whole envelope built around OUR payload.
+        local e = case.envelope
+        assert.equals("git.event", e.kind)
+        local env = envelope.new(e.seq, e.t, e.wall, e.kind, ev.data)
+        assert.equals(case.hash, hc.chain_entry(case.prev_hash, env).hash)
 
-      for _, k in ipairs(key_set(ev.data)) do
-        assert.is_true(ALLOWED_KEYS[k] == true, "unexpected key in git.event payload: " .. k)
-      end
-    end)
+        for _, k in ipairs(key_set(ev.data)) do
+          assert.is_true(ALLOWED_KEYS[k] == true, "unexpected key in git.event payload: " .. k)
+        end
+      end)
+    end
   end
+
+  -- -------------------------------------------------------------------------
+  -- D12 — the repository discriminator. Reader rules AND writer refusals.
+  -- -------------------------------------------------------------------------
+
+  it("every case's discriminator narrows exactly as the vector publishes it", function()
+    -- The reader half, run over all twenty cases. The eleven pre-D12 cases
+    -- carry no `discriminator` object at all, which means `absent` — and
+    -- asserting that explicitly is what pins the compatibility claim that every
+    -- bundle in existence keeps reading exactly as it did before D12.
+    local seen = 0
+    for _, case in ipairs(fx.cases) do
+      local expected = case.discriminator or { kind = "absent" }
+      local got = git_event.read_repository_discriminator(case.data)
+      assert.equals(expected.kind, got.kind, case.name)
+      if expected.kind == "recorded" then
+        assert.equals(expected.rootCommitSha, got.root_commit_sha, case.name)
+      elseif expected.kind == "malformed" then
+        assert.equals(expected.problem, got.problem, case.name)
+      end
+      seen = seen + 1
+    end
+    assert.equals(#fx.cases, seen)
+  end)
+
+  it("WRITER RULE: an unusable discriminator is OMITTED, degrading to the absent bytes", function()
+    -- The five cases a conforming writer must never produce, each driven
+    -- through this port's own builder. The assertion is not merely "different
+    -- from the vector" — it is "byte-identical to the ABSENT case", which is
+    -- the only correct degradation. An arbitrary bug would satisfy the former.
+    local absent = case_named("root_commit_sha_absent_shallow_clone")
+    assert.is_not_nil(absent)
+
+    local checked = 0
+    for _, case in ipairs(fx.cases) do
+      if WRITER_MUST_REFUSE[case.name] then
+        local built = build(case).data
+        assert.is_nil(built.root_commit_sha, case.name .. " must omit the key")
+        assert.are_not.equals(
+          case.canonical_json,
+          core_json.canonicalize(built),
+          case.name .. " must not reproduce the nonconforming bytes"
+        )
+        checked = checked + 1
+      end
+    end
+    assert.equals(5, checked)
+
+    -- The `null` case in particular: same payload as the absent case except for
+    -- the explicit null, so refusing it must land exactly on the absent bytes
+    -- and the absent hash. This is the case that proves omission and `null` are
+    -- not interchangeable — they canonicalize differently and therefore chain
+    -- to different hashes, exactly as `parents: []` and an absent `parents` do.
+    local null_case = case_named("root_commit_sha_null_is_not_absent")
+    assert.is_not_nil(null_case)
+    assert.equals(absent.canonical_json, core_json.canonicalize(build(null_case).data))
+    assert.are_not.equals(absent.canonical_json, null_case.canonical_json)
+    assert.are_not.equals(absent.hash, null_case.hash)
+
+    local e = absent.envelope
+    assert.equals(
+      absent.hash,
+      hc
+        .chain_entry(absent.prev_hash, envelope.new(e.seq, e.t, e.wall, e.kind, build(null_case).data))
+        .hash
+    )
+  end)
+
+  it("WRITER RULE: a repository path and a remote URL can never reach a payload", function()
+    -- S14(b). The shape check is the one place a nonconforming writer's path or
+    -- URL is stopped before it reaches a staff-facing UI, and running it on the
+    -- WRITE side means such a value is never written down at all. Driven
+    -- through the builder, not through the reader, because the reader passing
+    -- is not the property under test here.
+    local view = git_payloads.commit_view(("b"):rep(40), { ("a"):rep(40) })
+    for _, bad in ipairs({
+      "/Users/student/cs61b/proj2",
+      "C:\\Users\\student\\proj2",
+      "git@github.com:acme/cs61b-proj2.git",
+      "https://github.com/acme/cs61b-proj2",
+      ("A"):rep(40),
+      ("a"):rep(39),
+      ("a"):rep(41),
+      ("a"):rep(63),
+      ("a"):rep(65),
+      "9999999",
+      "",
+      "  " .. ("a"):rep(38),
+    }) do
+      local data = git_payloads.build_git_event("commit", ("b"):rep(40), view, "main", bad).data
+      assert.is_nil(data.root_commit_sha, "must omit: " .. bad)
+    end
+    -- ...while both legal object-name lengths survive verbatim.
+    for _, good in ipairs({ ("9"):rep(40), ("8"):rep(64) }) do
+      local data = git_payloads.build_git_event("commit", ("b"):rep(40), view, "main", good).data
+      assert.equals(good, data.root_commit_sha)
+    end
+  end)
+
+  it("WRITER RULE: a payload that names no commit carries no discriminator", function()
+    -- Rule 10 rides the field on every payload that carries a `sha` — but an
+    -- `operation_only` payload names no commit, so there is nothing for a
+    -- repository key to key. Pinned so the pre-D12 `operation_only` bytes are
+    -- unreachable-by-accident rather than merely untested.
+    local data = git_payloads.build_git_event("state_change", nil, nil, nil, ("9"):rep(40)).data
+    assert.is_nil(data.root_commit_sha)
+    local operation_only = case_named("operation_only")
+    assert.is_not_nil(operation_only)
+    assert.equals(operation_only.canonical_json, core_json.canonicalize(data))
+  end)
+
+  it("WRITER RULE: the discriminator rides on non-commit operations too", function()
+    -- An unlabelled observation does not correlate even when its neighbours in
+    -- the same session do, so the field is NOT gated on `operation == "commit"`.
+    local view = git_payloads.commit_view(("b"):rep(40), nil)
+    local data =
+      git_payloads.build_git_event("state_change", ("b"):rep(40), view, "main", ("9"):rep(40)).data
+    assert.equals(("9"):rep(40), data.root_commit_sha)
+  end)
+
+  it("adding the discriminator to a payload MUST change its hash", function()
+    -- `root_commit_sha_recorded` is `ordinary_commit` plus the field. A port
+    -- that silently dropped an unrecognised argument would produce the other
+    -- one's bytes and the other one's hash, and every other assertion in this
+    -- file would still pass.
+    local plain, labelled = case_named("ordinary_commit"), case_named("root_commit_sha_recorded")
+    assert.is_not_nil(plain)
+    assert.is_not_nil(labelled)
+    assert.are_not.equals(
+      core_json.canonicalize(build(plain).data),
+      core_json.canonicalize(build(labelled).data)
+    )
+    assert.are_not.equals(plain.hash, labelled.hash)
+    -- ...and JCS places the new key where the vector says: after `parents`,
+    -- before `sha`.
+    local order = {}
+    for k in core_json.canonicalize(build(labelled).data):gmatch('"([%a_]+)":') do
+      order[#order + 1] = k
+    end
+    assert.same(
+      { "branch", "commit_sha", "operation", "parents", "root_commit_sha", "sha" },
+      order
+    )
+  end)
 
   it("IRB (CPHS 2026-06-19796): no vector case carries author identity, and none can", function()
     -- Named explicitly, not just covered by the loop above: the absence of git
@@ -1695,6 +1882,363 @@ describe("conformance: git-event.json (program spec S5 — the commit graph)", f
     })
     assert.is_true(capture_policy.is_event_kind_captured("git.event", all_off))
     assert.is_nil(all_off.capture and all_off.capture.git_event)
+  end)
+end)
+
+-- ===========================================================================
+-- TIER 4.1 PEER WITNESSING — peer-observed.json
+-- ===========================================================================
+--
+-- `peer.observed` is one contributor's signed record of ANOTHER contributor's
+-- `.provenance/` log. Generated by the monorepo's
+-- tools/export-conformance-vectors.ts and byte-identical to what provcode and
+-- provjet consume — never hand-edit it here.
+--
+-- Every ACCEPTED case is rebuilt THROUGH this port's own builder
+-- (`recorder/events/peer_payload.build`, which the write side in
+-- `recorder/watch/peer_watcher.lua` also calls) rather than read out of the
+-- vector's decoded `data`: the whole point is to pin our CONSTRUCTION — that
+-- the three nulls are emitted as keys, that `seq_high: 0` survives, that no
+-- identifier can enter — not vim.json.decode's round-trip. Every REJECTED case
+-- is driven through this port's narrowing (`core/peer_observed.validate`) and
+-- required to produce the vector's own error kind, so a port asserts accept AND
+-- reject rather than only the happy path.
+
+local peer_observed = require("provenance.core.peer_observed")
+local peer_payload = require("provenance.recorder.events.peer_payload")
+
+describe("conformance: peer-observed.json (Tier 4.1 peer witnessing)", function()
+  local fx = load_fixture("peer-observed.json")
+
+  --- Rebuild one vector case's payload through peer_payload.
+  ---
+  --- `session_id` / `seq_high` / `last_hash` arrive from vim.json.decode as
+  --- `vim.NIL` when the vector spells them null, which is exactly the "chain
+  --- was not read" input, so it maps to `unread_tip()`. `seq_high == 0` is fed
+  --- through verbatim: turning it into an unread tip is the mutation the
+  --- `seq_high_zero` case exists to catch.
+  local function build(case)
+    local d = case.data
+    local tip
+    if d.session_id == nil or d.session_id == vim.NIL then
+      tip = peer_payload.unread_tip()
+    else
+      local seq_high = d.seq_high
+      if seq_high == vim.NIL then
+        seq_high = nil
+      end
+      local last_hash = d.last_hash
+      if last_hash == vim.NIL then
+        last_hash = nil
+      end
+      tip = peer_payload.chain_tip(d.session_id, seq_high, last_hash)
+    end
+    return peer_payload.build(d.file, d.sha256, d.bytes, tip, d.state)
+  end
+
+  local function case_named(name)
+    for _, c in ipairs(fx.cases) do
+      if c.name == name then
+        return c
+      end
+    end
+    return nil
+  end
+
+  local function key_set(t)
+    local keys = {}
+    for k in pairs(t) do
+      keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    return keys
+  end
+
+  -- Cases the vector marks `accepted: false`. A conforming WRITER can never
+  -- build them either — three are self-contradictory chain-field combinations
+  -- the builder's all-or-nothing tip rules out structurally, one is an invented
+  -- state, one an uppercased digest — so they are asserted through the READER,
+  -- which is the half that has to keep parsing them.
+  local function is_rejected(case)
+    return case.accepted == false
+  end
+
+  -- ACCEPTED by the reader, but carrying bytes a conforming WRITER cannot
+  -- produce: `accepted_unknown_extra_key` is a FUTURE recorder's payload, and
+  -- forward compatibility runs one way only. It gets its own test below, which
+  -- asserts both halves — the reader ignoring the key, and this writer being
+  -- structurally unable to add it.
+  local WRITER_CANNOT_PRODUCE = { accepted_unknown_extra_key = true }
+
+  it("the vector ships all twelve cases this port must satisfy", function()
+    -- Guards against a silently truncated fixture making the loops below pass
+    -- by testing nothing.
+    assert.equals(12, #fx.cases)
+    local accepted, rejected = 0, 0
+    for _, c in ipairs(fx.cases) do
+      if is_rejected(c) then
+        rejected = rejected + 1
+      else
+        accepted = accepted + 1
+      end
+    end
+    assert.equals(7, accepted)
+    assert.equals(5, rejected)
+    -- Exactly one accepted case is writer-unproducible; if the exporter ever
+    -- adds another, the byte-exact loop above must be told about it rather than
+    -- silently skipping it.
+    local unproducible = 0
+    for _, c in ipairs(fx.cases) do
+      if WRITER_CANNOT_PRODUCE[c.name] then
+        unproducible = unproducible + 1
+      end
+    end
+    assert.equals(1, unproducible)
+  end)
+
+  it("the five states match log-core's PEER_OBSERVED_STATES exactly, in order", function()
+    -- Order is asserted, not just membership: the vector publishes the set as a
+    -- list and a port that reordered it would still pass a set comparison while
+    -- disagreeing with the exporter.
+    assert.same(fx.states, peer_observed.STATES)
+  end)
+
+  for _, case in ipairs(fx.cases) do
+    if not is_rejected(case) and not WRITER_CANNOT_PRODUCE[case.name] then
+      it("case '" .. case.name .. "': " .. case.note, function()
+        local ev = build(case)
+        assert.equals("peer.observed", ev.kind)
+
+        -- Byte-exact JCS of the payload we CONSTRUCTED.
+        assert.equals(case.canonical_json, core_json.canonicalize(ev.data))
+
+        -- ...and the chain hash of the whole envelope built around it.
+        local e = case.envelope
+        assert.equals("peer.observed", e.kind)
+        local env = envelope.new(e.seq, e.t, e.wall, e.kind, ev.data)
+        assert.equals(case.hash, hc.chain_entry(case.prev_hash, env).hash)
+
+        -- ...and our own reader accepts what our own writer built.
+        local narrowed = peer_observed.validate(ev.data)
+        assert.is_true(narrowed.ok, case.name)
+      end)
+    end
+  end
+
+  it("the accepted_unknown_extra_key case: the READER ignores it, the WRITER cannot add it", function()
+    -- Forward compatibility runs one way only. A newer recorder's extra field
+    -- must not make this reader discard the whole witness — but this writer has
+    -- no parameter such a field could arrive through, so the case is asserted
+    -- against the reader with the vector's own bytes, and against the writer as
+    -- an inability to reproduce them.
+    local case = case_named("accepted_unknown_extra_key")
+    assert.is_not_nil(case)
+
+    local narrowed = peer_observed.validate(case.data)
+    assert.is_true(narrowed.ok)
+    -- Ignored, never carried onto the narrowed value.
+    assert.is_nil(narrowed.value.future_signal)
+    assert.same(peer_observed.PAYLOAD_KEYS, key_set(narrowed.value))
+
+    -- The extra key DOES change the canonical bytes, so the builder — which
+    -- cannot produce it — lands on the plain `appeared_parsed` bytes instead.
+    local plain = case_named("appeared_parsed")
+    assert.is_not_nil(plain)
+    assert.equals(plain.canonical_json, core_json.canonicalize(build(case).data))
+    assert.are_not.equals(case.canonical_json, plain.canonical_json)
+    assert.are_not.equals(case.hash, plain.hash)
+  end)
+
+  for _, case in ipairs(fx.cases) do
+    if is_rejected(case) then
+      it("REJECTED case '" .. case.name .. "': " .. case.note, function()
+        local narrowed = peer_observed.validate(case.data)
+        assert.is_false(narrowed.ok, case.name .. " must be rejected")
+        assert.equals(case.error.kind, narrowed.error.kind, case.name)
+        if case.error.present ~= nil then
+          assert.same(case.error.present, narrowed.error.present, case.name)
+        end
+        if case.error.absent ~= nil then
+          assert.same(case.error.absent, narrowed.error.absent, case.name)
+        end
+        if case.error.state ~= nil then
+          assert.equals(case.error.state, narrowed.error.state, case.name)
+        end
+        if case.error.field ~= nil then
+          assert.equals(case.error.field, narrowed.error.field, case.name)
+        end
+        -- A rejection is a sentence a human reads in a staff-facing report, so
+        -- it has to say something.
+        assert.is_true(#peer_observed.describe_shape_error(narrowed.error) > 0)
+      end)
+    end
+  end
+
+  it("MANDATORY: the three nulls are emitted as KEYS — omitting them changes the hash", function()
+    -- The single easiest thing to get wrong in Lua, where a table simply cannot
+    -- hold `nil` and the key vanishes silently. The unparseable case's canonical
+    -- bytes contain all three nulls; a payload with the keys dropped hashes
+    -- differently, so a port that omits them produces a log whose entries hash
+    -- differently from every other recorder's for the same observation.
+    local case = case_named("unparseable_file")
+    assert.is_not_nil(case)
+
+    local data = build(case).data
+    assert.same(peer_observed.PAYLOAD_KEYS, key_set(data))
+    local canon = core_json.canonicalize(data)
+    assert.equals(case.canonical_json, canon)
+    assert.is_true(canon:find('"last_hash":null', 1, true) ~= nil)
+    assert.is_true(canon:find('"seq_high":null', 1, true) ~= nil)
+    assert.is_true(canon:find('"session_id":null', 1, true) ~= nil)
+
+    -- The mutation, driven explicitly: drop the three keys and the bytes and
+    -- the chain hash both move.
+    local omitted = {
+      file = data.file,
+      sha256 = data.sha256,
+      bytes = data.bytes,
+      state = data.state,
+    }
+    assert.are_not.equals(canon, core_json.canonicalize(omitted))
+    local e = case.envelope
+    assert.are_not.equals(
+      case.hash,
+      hc.chain_entry(case.prev_hash, envelope.new(e.seq, e.t, e.wall, e.kind, omitted)).hash
+    )
+  end)
+
+  it("MANDATORY: `seq_high: 0` is a real value, not an absence", function()
+    -- A foreign log holding only its `session.start`. A truthiness check —
+    -- `if seq_high then` in a language where 0 is falsy, or the `x and x or
+    -- NULL` idiom carried over from one — turns the shortest possible honest
+    -- witness into a malformed one. This port's builder and reader both compare
+    -- against nil/NULL explicitly; here is the proof.
+    local case = case_named("seq_high_zero")
+    assert.is_not_nil(case)
+
+    local data = build(case).data
+    assert.equals(0, data.seq_high)
+    assert.equals(case.canonical_json, core_json.canonicalize(data))
+    assert.is_true(core_json.canonicalize(data):find('"seq_high":0', 1, true) ~= nil)
+
+    local narrowed = peer_observed.validate(data)
+    assert.is_true(narrowed.ok)
+    assert.equals(0, narrowed.value.seq_high)
+
+    -- ...and the chain-tip constructor keeps it rather than routing it to the
+    -- unread tip, which is where a truthiness bug would send it.
+    local tip = peer_payload.chain_tip(("x"):rep(8), 0, ("b"):rep(64))
+    assert.equals(0, tip.seq_high)
+    assert.is_true(peer_payload.tip_was_read(tip))
+  end)
+
+  it("MANDATORY: `unparseable` and a read chain are mutually exclusive, both ways", function()
+    -- Correction 5 from the first implementation: "all-null or all-non-null" is
+    -- true but incomplete — a port emitting `grew` with all-nulls passes the
+    -- narrowing while violating the intent. Every unreadable chain must be
+    -- routed to `unparseable`.
+    local unread = peer_payload.unread_tip()
+    assert.is_false(peer_payload.tip_was_read(unread))
+
+    -- `unparseable` + a read chain: rejected.
+    local bad = peer_payload.build(
+      "session-x.slog",
+      ("a"):rep(64),
+      41,
+      peer_payload.chain_tip("s", 3, ("b"):rep(64)),
+      "unparseable"
+    ).data
+    local r = peer_observed.validate(bad)
+    assert.is_false(r.ok)
+    assert.equals("unparseable_with_chain_values", r.error.kind)
+
+    -- ...and the reverse: `unparseable` + all nulls is the ONLY accepted shape
+    -- for an unread chain, which is why the watcher may not report `grew` for
+    -- one.
+    local good =
+      peer_payload.build("session-x.slog", ("a"):rep(64), 41, unread, "unparseable").data
+    assert.is_true(peer_observed.validate(good).ok)
+  end)
+
+  it("MANDATORY: a partially-read chain is unbuildable, not merely rejected", function()
+    -- The most dangerous shape this payload can take: it names a session while
+    -- committing to nothing any later archive could contradict. The reader
+    -- rejects it; the BUILDER cannot express it at all, because `chain_tip` is
+    -- all-three-or-none. Both halves are asserted — a reader-only guarantee
+    -- would let this port write a witness its own analyzer discards.
+    for _, args in ipairs({
+      { "s", nil, ("b"):rep(64) },
+      { "s", 3, nil },
+      { nil, 3, ("b"):rep(64) },
+      { "", 3, ("b"):rep(64) },
+    }) do
+      local tip = peer_payload.chain_tip(args[1], args[2], args[3])
+      assert.is_false(peer_payload.tip_was_read(tip))
+      local data = peer_payload.build("f.slog", ("a"):rep(64), 1, tip, "unparseable").data
+      assert.is_true(peer_observed.validate(data).ok)
+      assert.equals(core_json.NULL, data.session_id)
+      assert.equals(core_json.NULL, data.seq_high)
+      assert.equals(core_json.NULL, data.last_hash)
+    end
+  end)
+
+  it("NO IDENTITY: no case carries one, and the builder has no parameter for one", function()
+    -- The payload names a FILE and a CHAIN POSITION. This one is about somebody
+    -- ELSE, so the CPHS constraint (2026-06-19796) that keeps author identity
+    -- out of `git.event` applies with more force. Enforced structurally: the
+    -- key set is closed, and `build` reads the tip by name rather than merging
+    -- it, so a table handed in carrying an identifier contributes nothing.
+    for _, case in ipairs(fx.cases) do
+      for _, k in ipairs(key_set(case.data)) do
+        local known = k == "future_signal"
+        for _, allowed in ipairs(peer_observed.PAYLOAD_KEYS) do
+          if k == allowed then
+            known = true
+          end
+        end
+        assert.is_true(known, "vector case " .. case.name .. " has unexpected key " .. k)
+      end
+    end
+
+    local smuggled = {
+      session_id = "s",
+      seq_high = 1,
+      last_hash = ("b"):rep(64),
+      student_ref = "0000-1111",
+      author_email = "student@example.edu",
+      absolute_path = "/Users/student/cs61b/.provenance/session-x.slog",
+    }
+    local data = peer_payload.build("session-x.slog", ("a"):rep(64), 10, smuggled, "appeared").data
+    assert.same(peer_observed.PAYLOAD_KEYS, key_set(data))
+    local serialized = core_json.canonicalize(data)
+    assert.is_nil(serialized:find("student_ref", 1, true))
+    assert.is_nil(serialized:find("@", 1, true))
+    assert.is_nil(serialized:find("/Users/", 1, true))
+  end)
+
+  it("peer.observed is on the HARD FLOOR: no policy key, so no gate, so no seq hole", function()
+    -- The vector's own floor_note says so. Mechanically it matters because
+    -- suppression happens before an entry is chained and given a seq, and a seq
+    -- hole reads to validation check 4 (seq_gaps) as a DELETED ENTRY.
+    --
+    -- The placement is provisional by the vector's own words — collaboration
+    -- spec §8 item 5 is open — and if it comes back requiring a per-course off
+    -- switch the monorepo moves the entry and reissues this vector. Until then
+    -- a port must match what the vector publishes, which this asserts.
+    local on_floor = false
+    for _, kind in ipairs(capture_policy.FLOOR_EVENT_KINDS) do
+      if kind == "peer.observed" then
+        on_floor = true
+      end
+    end
+    assert.is_true(on_floor, "peer.observed must be in FLOOR_EVENT_KINDS")
+    assert.is_nil(capture_policy.POLICY_GATED_EVENT_KINDS["peer.observed"])
+
+    local all_off = capture_policy.resolve({
+      capture = { selection_change = false, focus_change = false, terminal = false },
+    })
+    assert.is_true(capture_policy.is_event_kind_captured("peer.observed", all_off))
+    assert.is_nil(all_off.capture and all_off.capture.peer_observation)
   end)
 end)
 
