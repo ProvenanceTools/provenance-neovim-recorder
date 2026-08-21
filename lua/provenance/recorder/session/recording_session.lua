@@ -118,14 +118,17 @@ end
 ---   notify: function|nil           -- (message) -> nil; injected into the disk-full
 ---     handler as its user notification. Defaults to degraded_notifier.notify
 ---     (vim.notify at ERROR level). A seam so tests can capture the degraded message.
----   recover: function|nil          -- () -> RecoveryDecision; full injection seam for tests.
----     Defaults to running chain_recovery.recover_previous_session over the real
----     vim.uv deps (uv_recovery_deps.new(provenance_dir)). Runs BEFORE this
+---   recover: function|nil          -- (own_student_ref) -> RecoveryDecision; full
+---     injection seam for tests. Defaults to running
+---     chain_recovery.recover_previous_session over the real vim.uv deps
+---     (uv_recovery_deps.new(provenance_dir, own_student_ref)). Runs BEFORE this
 ---     session's own artifacts (.slog/.slog.meta) exist, so it only ever sees
----     a PRIOR session. A "previous_session_dangling" decision links
----     prev_session_id (unless overridden above); "previous_session_corrupt"
----     additionally emits recorder.recovered_from_corruption as the entry
----     right after session.start. clean_start/complete do neither.
+---     a PRIOR session — but AFTER this session's identity is resolved, so the
+---     ownership gate has a student_ref to work with (see step 1d). A
+---     "previous_session_dangling" decision links prev_session_id (unless
+---     overridden above); "previous_session_corrupt" additionally emits
+---     recorder.recovered_from_corruption as the entry right after
+---     session.start. clean_start/complete do neither.
 --- }
 --- @return table session {
 ---   session_id, slog_path, meta_path, public_key_hex,
@@ -176,31 +179,6 @@ function M.start(opts)
     error(mkdir_err)
   end
 
-  -- 0b. Startup chain recovery (Plan 8, Task 4/5): run BEFORE any of this
-  -- session's own artifacts exist, so recovery only ever sees a PRIOR
-  -- session's .slog(s) — never the one about to be created below. `recover`
-  -- is a full-injection seam for tests; production wires the real vim.uv
-  -- deps layer.
-  local recover = opts.recover
-  local recovery
-  if recover then
-    recovery = recover()
-  else
-    local deps = uv_recovery_deps.new(provenance_dir)
-    recovery = chain_recovery.recover_previous_session(deps)
-  end
-
-  -- Derive prev_session_id from the recovery decision: an explicit
-  -- opts.prev_session_id override always wins (backward compat for callers/
-  -- tests that already pass it); otherwise a DANGLING prior session is
-  -- linked, and clean_start/complete/corrupt leave it nil (no link — a
-  -- complete prior session is reported by recovery but is deliberately not
-  -- linked here, per chain_recovery.lua's own docstring).
-  local prev_session_id = opts.prev_session_id
-  if prev_session_id == nil and recovery.kind == "previous_session_dangling" then
-    prev_session_id = recovery.prev_session_id
-  end
-
   -- 1. Fresh per-session ed25519 keypair (recorder PRD §4.6).
   local keypair = core_session_keys.generate()
 
@@ -226,6 +204,58 @@ function M.start(opts)
     key_cache = opts.identity_key_cache,
   })
   local identity = identity_outcome.kind == "emitted" and identity_outcome.identity or nil
+
+  -- 1d. Startup chain recovery (Plan 8, Task 4/5): run BEFORE any of this
+  -- session's own artifacts exist, so recovery only ever sees a PRIOR
+  -- session's .slog(s) — never the one about to be created below. `recover`
+  -- is a full-injection seam for tests; production wires the real vim.uv
+  -- deps layer.
+  --
+  -- ORDERING: this used to be step 0b, before the keypair and the identity
+  -- existed. It runs HERE, after 1c, because it needs this session's
+  -- `student_ref` to tell our own `.slog` files from a partner's in a shared,
+  -- committed `.provenance/` (decision-log bug 2; see chain_recovery.lua's
+  -- "Decision — OWNERSHIP"). Nothing between step 0 and here reads the
+  -- recovery result and nothing above depends on it, so the move is
+  -- behaviour-preserving apart from the ownership gate itself. It is still
+  -- well before the writer/meta_writer create this session's artifacts in
+  -- step 6, which is the invariant that matters.
+  --
+  -- `own_student_ref` is nil whenever session_identity did not emit — not
+  -- enrolled, no store, a lapsed cert. That is the common case today, it is
+  -- handled explicitly inside recover_previous_session, and it must never
+  -- throw or block recording.
+  local own_student_ref = nil
+  if identity ~= nil and type(identity.enrollment) == "table" then
+    local ref = identity.enrollment.student_ref
+    if type(ref) == "string" and #ref > 0 then
+      own_student_ref = ref
+    end
+  end
+
+  local recover = opts.recover
+  local recovery
+  if recover then
+    recovery = recover(own_student_ref)
+  else
+    local deps = uv_recovery_deps.new(provenance_dir, own_student_ref)
+    recovery = chain_recovery.recover_previous_session(deps)
+  end
+
+  -- Derive prev_session_id from the recovery decision: an explicit
+  -- opts.prev_session_id override always wins (backward compat for callers/
+  -- tests that already pass it); otherwise a DANGLING prior session is
+  -- linked, and clean_start/complete/corrupt leave it nil (no link — a
+  -- complete prior session is reported by recovery but is deliberately not
+  -- linked here, per chain_recovery.lua's own docstring).
+  --
+  -- The session it names is now guaranteed to be one this contributor can
+  -- prove is their own, so the back-pointer is a real intra-contributor chain
+  -- link rather than "whoever's filename happened to sort last".
+  local prev_session_id = opts.prev_session_id
+  if prev_session_id == nil and recovery.kind == "previous_session_dangling" then
+    prev_session_id = recovery.prev_session_id
+  end
 
   -- 2. Logical session context — the session.start payload. session_id
   -- here is the LOGICAL session id (chain/manifest identity), distinct
