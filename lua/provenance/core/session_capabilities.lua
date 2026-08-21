@@ -48,14 +48,62 @@
 ---
 --- `git_capture` is a three-value enum in the cross-language contract because
 --- VS Code's `vscode.git` extension can see repositories across an entire
---- multi-root workspace and route by ownership. provnvim's git wiring
---- (`recorder/wiring/git_wiring.lua`) watches exactly ONE repository — the
---- activated assignment workspace itself, via `git -C <workspace>` — with no
---- cross-repo enumeration or ownership filter, so there is no "git worked but
---- pointed elsewhere" state for this recorder to be in. `'not_owned'` stays a
---- legal READ value (a bundle from a different producer may use it), but this
---- recorder's own writer never emits it. See `recorder/session/recording_session.lua`
---- for where `git_capture` is derived.
+--- multi-root workspace and route by ownership, and because provjet's IDE
+--- performs a single PROJECT-WIDE VCS-root discovery (every nested `.git` the
+--- IDE has indexed) and then routes each observed repo to a session by a
+--- path-prefix predicate (`RecorderSessionManager.sessionOwning`) — so a repo
+--- the discovery step finds that matches no session's root is exactly
+--- `not_owned`. That requires a SHARED discovery/routing layer sitting between
+--- "git observation" and "which session gets this event", one that can find a
+--- repo and then fail to route it.
+---
+--- provnvim structurally has no such layer, and this was re-checked against
+--- the concurrent-session case specifically (program spec S0: `registry.lua`
+--- keeps a root -> session map so more than one assignment root CAN record at
+--- once — the premise that broke the equivalent claim for provjet). Even so:
+--- `recording_session.lua` calls `git_wiring.start({ workspace = <that
+--- session's own root>, ... })` once per session (see
+--- `recorder/session/recording_session.lua`'s step 1e), and `git_wiring.lua`'s
+--- repo discovery for that call is entirely LOCAL to `workspace` — `git -C
+--- <workspace> rev-parse --git-dir` (which is git's own upward directory
+--- search, not a repo enumeration) and an `fs_stat` of `<workspace>/.git`.
+--- There is no step, anywhere, that lists "every repo this Neovim instance can
+--- see" and then matches roots against it. A second, concurrently-recording
+--- session's repository is not merely unmatched by this session's routing —
+--- it is never looked at, because the seam is scoped by construction to one
+--- session's own `workspace` and cannot observe another session's `-C`
+--- argument. So there is no "git worked, and pointed at a repo that belongs to
+--- someone else" state to land in: whatever `git -C workspace ...` finds (if
+--- anything) is, by construction, this session's own answer.
+---
+--- This also covers the classic "shared class repo, assignment is a
+--- subdirectory" layout (the repo root sits ABOVE the assignment root) without
+--- extra code: `git -C <workspace> rev-parse --git-dir` walks upward exactly
+--- like any other git command, so it finds and returns the ancestor `.git`
+--- (verified empirically: `git -C <subdir> rev-parse --git-dir` from inside a
+--- parent repo prints the parent's `.git`, absolute-or-relative-and-resolved
+--- by `resolve_git_dir`). provjet's `sessionOwning` predicate, by contrast, is
+--- `normalized.startsWith(root)` — it requires the DISCOVERED repo path to be
+--- at-or-below the session's root, so a repo root ABOVE the assignment root
+--- fails that prefix test and the event is dropped (the unfixed defect shape
+--- provjet's agent flagged as "bug 3", left alone as out of scope there).
+--- provnvim never asks that question at all: there is no discovered-repo-path
+--- to compare against a root, only "did `git -C workspace` find something",
+--- so the above/below distinction that trips `sessionOwning` does not arise
+--- here.
+---
+--- (One thing this does NOT claim: if assignment root A is a git-repo
+--- ancestor of a concurrently-recording, nested assignment root B — e.g. two
+--- active sessions from the same class repo — both sessions' own `-C` calls
+--- can independently resolve to the SAME underlying `.git` and both correctly
+--- report `'available'`. That is duplicate observation of one repository by
+--- two sessions, not an ownership gap, and produces no `not_owned` case
+--- either.)
+---
+--- `'not_owned'` stays a legal READ value (a bundle from a different producer
+--- may use it), but this recorder's own writer never emits it. See
+--- `recorder/session/recording_session.lua` for where `git_capture` is
+--- derived.
 ---
 --- Pure: no Neovim editor APIs beyond the `vim.NIL`/`vim.islist` value-model
 --- primitives every other `core/` reader already uses. No I/O. Total: never

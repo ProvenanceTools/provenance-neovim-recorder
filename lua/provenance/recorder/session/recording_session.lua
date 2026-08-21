@@ -296,10 +296,20 @@ function M.start(opts)
   -- SAME repo-detection it uses to decide whether to watch at all — so the
   -- report cannot drift from what the wiring actually does (mirrors the VS
   -- Code reference's `probeGitCapture` reusing `resolveGitApi`). Only
-  -- `'available'`/`'unavailable'` are ever produced here: provnvim's git
-  -- wiring watches exactly one repository (the activated workspace) with no
-  -- cross-repo ownership routing, so there is no `'not_owned'` state for THIS
-  -- writer to be in — see core/session_capabilities.lua's module docstring.
+  -- `'available'`/`'unavailable'` are ever produced here (see the ternary
+  -- below): provnvim's git wiring watches exactly one repository, discovered
+  -- by a `git -C <this session's own workspace>` call with no shared,
+  -- project-wide repo enumeration and no cross-session ownership routing —
+  -- unlike provjet, where a single project-wide VCS-root discovery IS routed
+  -- to sessions by a path-prefix predicate, and a discovered repo matching no
+  -- session's root is exactly `not_owned`. This still holds with more than
+  -- one session recording concurrently (registry.lua): each session's
+  -- git_wiring call is scoped to its OWN `workspace` and cannot observe
+  -- another session's repository, so there is no "git worked, but pointed at
+  -- a repo that belongs to a different session" state for THIS writer to be
+  -- in. See core/session_capabilities.lua's module docstring for the full
+  -- re-derivation, including the shared-class-repo-above-the-assignment-root
+  -- layout (handled for free by git's own upward `-C` search).
   -- Gated on `enable_signals`, matching where `git_wiring.start()` used to be
   -- called (old step 9c): the lean-core test/e2e path that never attempts git
   -- observation must not claim a capability it never tried, and omission is
