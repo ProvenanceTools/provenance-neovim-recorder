@@ -22,8 +22,17 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== Producing bundle via headless Neovim recorder =="
+# --noplugin, same as `make test`. tests/minimal_init.lua puts this repo on the
+# runtimepath, so WITHOUT it Neovim also sources plugin/provenance.lua, whose
+# BufEnter/BufReadPost activation starts a SECOND recorder in the same
+# `.provenance/` the moment this script `:edit`s a file in an activated
+# workspace. Two live sessions writing one directory is not what this gate is
+# about, and it made the produced bundle nondeterministic: an extra session log,
+# an extra rolling seal, and — because startup chain recovery renames the
+# lexicographically last `.slog` it cannot parse — an occasional
+# `.slog.corrupt-<ts>` beside a log that was merely still being written.
 PROVNVIM_E2E_OUT="$OUT_DIR" \
-  "$NVIM" --headless -u tests/minimal_init.lua -l scripts/e2e/produce_bundle.lua
+  "$NVIM" --headless --noplugin -u tests/minimal_init.lua -l scripts/e2e/produce_bundle.lua
 
 BUNDLE_PATH="$OUT_DIR/e2e-bundle.zip"
 if [ ! -f "$BUNDLE_PATH" ]; then

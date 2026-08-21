@@ -290,14 +290,22 @@ describe("recording_session: peer witnessing", function()
   end)
 
   it("THE CHAIN ADVANCE IS ATOMIC: a concurrent emitter cannot split the drain", function()
-    -- The mutation this exists to catch is an `await`-shaped step in the drain
-    -- — a `vim.schedule`, a `vim.wait`, a uv async callback — between reading a
-    -- partner's log and emitting the observation. With one, another emitter
-    -- lands mid-batch, and if the session host ever grew a yield of its own
-    -- between reading `prev_hash` and advancing `seq`, the chain would break
-    -- outright. provcode's equivalent test caught a mutation in the SESSION
-    -- HOST, not in the watcher, which is why this is driven through the real
-    -- host and the real `.slog` rather than against a stub.
+    -- The mutation this exists to catch is a DEFERRED emit in the drain — a
+    -- `vim.schedule`, a `vim.wait`, a uv async callback — between reading a
+    -- partner's log and chaining the observation. With one, the entries land
+    -- after stop() has flushed and closed the writer, or land out of order
+    -- relative to the editor's own emitter, and the chain the analyzer reads is
+    -- broken. provcode's equivalent test caught a mutation in the SESSION HOST
+    -- rather than in the watcher, which is why this drives the real host, the
+    -- real doc-wiring emitter and the real `.slog` rather than a stub.
+    --
+    -- Scope note, so this is not read as proving more than it does: the FINER
+    -- mutation — emitting inside the read loop, still synchronously, so the
+    -- observations interleave with a competing emitter — is caught by
+    -- peer_watcher_spec's "no other emitter can land BETWEEN two peer.observed
+    -- entries", which fires its competing emitter from inside each read. That
+    -- test also uses a real `session_host`. This one covers the coarse case and
+    -- the end-to-end chain.
     local buf, provenance_dir = start_session()
     for i = 1, 4 do
       write_foreign_log(

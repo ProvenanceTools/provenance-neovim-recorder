@@ -2091,6 +2091,16 @@ describe("conformance: peer-observed.json (Tier 4.1 peer witnessing)", function(
     assert.is_true(canon:find('"seq_high":null', 1, true) ~= nil)
     assert.is_true(canon:find('"session_id":null', 1, true) ~= nil)
 
+    -- A caller handing in a tip that is missing the keys altogether — a bare
+    -- `{}`, or nothing at all — still produces the three nulls. This is the
+    -- last line of defence: `unread_tip()` spells them, and `build` re-spells
+    -- them, so BOTH would have to be broken for a key to go missing.
+    for _, bare in ipairs({ {}, "not a table", 42 }) do
+      local rebuilt = peer_payload.build(data.file, data.sha256, data.bytes, bare, "unparseable")
+      assert.same(peer_observed.PAYLOAD_KEYS, key_set(rebuilt.data))
+      assert.equals(case.canonical_json, core_json.canonicalize(rebuilt.data))
+    end
+
     -- The mutation, driven explicitly: drop the three keys and the bytes and
     -- the chain hash both move.
     local omitted = {

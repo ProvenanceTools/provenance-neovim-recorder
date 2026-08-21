@@ -110,14 +110,87 @@ local ok, err = pcall(function()
   rf:close()
 
   -- ---------------------------------------------------------------------
+  -- 2b. A PARTNER'S SESSION, recorded in its own workspace (Tier 4.1, peer
+  --     witnessing). This stands in for the other student in a shared repo:
+  --     a real recording session, real keypair, real signed chain, produced by
+  --     this same recorder — just not by this student.
+  --
+  --     Its `.slog` + `.slog.meta` are copied into the student's
+  --     `.provenance/` at step 3b, which is exactly what a `git pull` does.
+  --     The student's own session then witnesses it into ITS OWN signed chain,
+  --     and the real monorepo `reconcileWitnesses` must read that witness as
+  --     `corroborated` — see scripts/verify-bundle-with-analyzer.mjs.
+  --
+  --     Sequential, not concurrent: the partner session is fully stopped before
+  --     the student's starts, so nothing about two live sessions in one Neovim
+  --     is being relied on.
+  -- ---------------------------------------------------------------------
+  --     NOTE the partner workspace deliberately gets NO `.provenance-manifest`
+  --     on disk. `recording_session.start` takes the already-verified manifest
+  --     TABLE, so the file is not needed — and writing one would make the
+  --     plugin's own BufEnter/BufReadPost activation fire when this script
+  --     `:edit`s a file there, starting a SECOND, unasked-for recorder. See the
+  --     `--noplugin` note in run_e2e.sh.
+  local partner_workspace = vim.fs.normalize(vim.fn.tempname())
+  vim.fn.mkdir(partner_workspace, "p")
+  local partner_provenance = partner_workspace .. "/.provenance"
+  vim.fn.mkdir(partner_provenance, "p")
+  local partner_file = partner_workspace .. "/" .. reviewed_rel
+  vim.fn.mkdir(vim.fn.fnamemodify(partner_file, ":h"), "p")
+  do
+    local pf = assert(io.open(partner_file, "w"))
+    pf:write("print('partner')\n")
+    pf:close()
+  end
+
+  local partner_session = recording_session.start({
+    workspace = partner_workspace,
+    provenance_dir = partner_provenance,
+    manifest = manifest,
+    clock = core_clock.system(),
+  })
+  vim.cmd("edit " .. vim.fn.fnameescape(partner_file))
+  local partner_buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(partner_buf, 1, 1, false, { "print('partner edit')" })
+  vim.cmd("write")
+  partner_session.stop("partner-complete")
+  pcall(vim.cmd, "bwipeout! " .. partner_buf)
+
+  local partner_slog = partner_session.slog_path
+  local partner_meta = partner_session.meta_path
+  if vim.fn.filereadable(partner_slog) ~= 1 then
+    error("partner session produced no .slog at " .. partner_slog)
+  end
+
+  -- ---------------------------------------------------------------------
   -- 3. Start a real recording session against the activated workspace.
+  --
+  --    `checkpoint_interval = 2` so the peer-witness drain — which runs on the
+  --    checkpoint cadence — actually fires within the handful of entries this
+  --    script produces, rather than only at stop() after the seal.
   -- ---------------------------------------------------------------------
   local session = recording_session.start({
     workspace = workspace,
     provenance_dir = provenance_dir,
     manifest = manifest,
     clock = core_clock.system(),
+    checkpoint_interval = 2,
   })
+
+  -- ---------------------------------------------------------------------
+  -- 3b. `git pull`: the partner's log lands in the student's `.provenance/`.
+  --     Copied, never moved — the partner's own tree is left untouched, which
+  --     is the same rule the watcher itself obeys.
+  -- ---------------------------------------------------------------------
+  local function copy_file(src, dest)
+    local text = table.concat(vim.fn.readfile(src, "b"), "\n")
+    local f = assert(io.open(dest, "w"))
+    f:write(text)
+    f:close()
+  end
+  local pulled_slog = provenance_dir .. "/" .. vim.fn.fnamemodify(partner_slog, ":t")
+  copy_file(partner_slog, pulled_slog)
+  copy_file(partner_meta, provenance_dir .. "/" .. vim.fn.fnamemodify(partner_meta, ":t"))
 
   -- ---------------------------------------------------------------------
   -- 4. Drive doc.open/doc.change/doc.save through the live wiring: open the
@@ -131,6 +204,38 @@ local ok, err = pcall(function()
   vim.cmd("write")
 
   -- ---------------------------------------------------------------------
+  -- 4b. Wait for the peer-witness drain to land in the .slog. The checkpoint
+  --     scheduler defers via vim.schedule, so the observation appears a tick
+  --     or two after the edits above trip the cadence. A few more edits keep
+  --     the cadence firing while we wait, and the writer flushes on its own
+  --     timer.
+  --
+  --     Polling the FILE, not an in-memory counter, because what the analyzer
+  --     will read is the bytes on disk.
+  -- ---------------------------------------------------------------------
+  local function slog_has_witness()
+    if vim.fn.filereadable(session.slog_path) ~= 1 then
+      return false
+    end
+    local text = table.concat(vim.fn.readfile(session.slog_path, "b"), "\n")
+    return text:find("peer.observed", 1, true) ~= nil
+  end
+
+  local witnessed = vim.wait(10000, function()
+    if slog_has_witness() then
+      return true
+    end
+    local n = vim.api.nvim_buf_line_count(buf)
+    vim.api.nvim_buf_set_lines(buf, n, n, false, { "# keep the cadence turning" })
+    return false
+  end, 100)
+
+  if not witnessed then
+    error("no peer.observed reached the .slog: the peer-witness drain did not run")
+  end
+  vim.cmd("write")
+
+  -- ---------------------------------------------------------------------
   -- 5. Seal. The saved on-disk bytes (from step 4's :write) are what seal
   --    reads for submission_files, so they match what was recorded.
   -- ---------------------------------------------------------------------
@@ -140,6 +245,7 @@ local ok, err = pcall(function()
   end
 
   session.stop("e2e-complete")
+  pcall(vim.fn.delete, partner_workspace, "rf")
 
   -- ---------------------------------------------------------------------
   -- 6. Copy the produced bundle to a stable name in PROVNVIM_E2E_OUT.
