@@ -203,6 +203,18 @@ describe("recording_controller.start (full-signals capstone)", function()
     local chain = core_chain_validator.validate_chain(parsed.value)
     assert.is_true(chain.ok)
 
+    -- ---- The three §5.6 CAPABILITY REPORTS, on the real session.start ----
+    -- Full-signals (enable_signals forced true by the controller), workspace
+    -- is NOT a git repo: git_capture is 'unavailable'. witness_capture is
+    -- ALWAYS reported (peer witnessing is unconditional). file_scope mirrors
+    -- the manifest's files_under_review verbatim.
+    local start_entry = parsed.value[1]
+    assert.equals("session.start", start_entry.kind)
+    assert.equals("unavailable", start_entry.data.git_capture)
+    assert.equals("available", start_entry.data.witness_capture)
+    assert.same({ "foo.txt" }, start_entry.data.file_scope.watched)
+    assert.is_true(start_entry.data.file_scope.complete)
+
     -- ---- Teardown: no leaked augroups from any signal ----
     assert.is_number(scratch.session._doc_wiring_augroup_id)
     assert.is_true(group_gone(scratch.session._doc_wiring_augroup_id), "ProvenanceDocWiring augroup leaked")

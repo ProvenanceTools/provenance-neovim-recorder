@@ -166,7 +166,36 @@ function M.start(opts)
   -- upvalue now and assigning it later (never re-`local`-ing it) means the
   -- closure sees the real host once writes are actually flowing — a write
   -- error can only happen after the host exists.
+  --
+  -- The SAME trick is used below for git_wiring/peer_watcher, which must
+  -- both run BEFORE `context` (and therefore session.start) is built, so
+  -- their `git_capture`/`witness_capture` capability reports can be included
+  -- in it (collaboration spec §5.6). Neither module calls `emit` synchronously
+  -- during its own `start()` — git_wiring only emits from a later fs_poll/
+  -- timer callback, peer_watcher only from `drain()` — so by the time either
+  -- callback can fire, `host` is already assigned; Neovim's single-threaded
+  -- event loop guarantees nothing else runs in between.
   local host
+
+  --- @param kind string
+  --- @param data table
+  local function deferred_emit(kind, data)
+    if host then
+      return host.emit(kind, data)
+    end
+    return nil
+  end
+
+  -- Forward-declared for the same reason: peer_watcher's `is_own_file`
+  -- closure (built below, before these paths exist) reads them lazily, at
+  -- `drain()` time, not at construction time — so it is safe for
+  -- peer_watcher.start() to run before step 3 assigns them.
+  local slog_path, meta_path
+
+  -- Forward-declared: assigned at step 1e below (before `host` exists), read
+  -- by the checkpoint-drain hook (step 6b) and by session.stop()'s final
+  -- drain + teardown.
+  local peer
 
   -- 0. Ensure provenance_dir exists before anything below writes into it
   -- (meta_writer.create in step 6 atomic-writes immediately and does not
@@ -257,6 +286,56 @@ function M.start(opts)
     prev_session_id = recovery.prev_session_id
   end
 
+  -- 1e. THE CAPABILITY REPORTS (collaboration spec §5.6 items 2 and 3). Both
+  -- must be known BEFORE `context` is built below, because `session.start` is
+  -- the entry that carries them and it is the first line of the chain. They
+  -- say "I could not", never "I was told not to" — neither is policy-gated,
+  -- neither is ever a finding (see core/session_capabilities.lua).
+  --
+  -- git_capture: this recorder's own `git_wiring.start()` IS the probe — the
+  -- SAME repo-detection it uses to decide whether to watch at all — so the
+  -- report cannot drift from what the wiring actually does (mirrors the VS
+  -- Code reference's `probeGitCapture` reusing `resolveGitApi`). Only
+  -- `'available'`/`'unavailable'` are ever produced here: provnvim's git
+  -- wiring watches exactly one repository (the activated workspace) with no
+  -- cross-repo ownership routing, so there is no `'not_owned'` state for THIS
+  -- writer to be in — see core/session_capabilities.lua's module docstring.
+  -- Gated on `enable_signals`, matching where `git_wiring.start()` used to be
+  -- called (old step 9c): the lean-core test/e2e path that never attempts git
+  -- observation must not claim a capability it never tried, and omission is
+  -- exactly the correct "does not report" answer for that case.
+  --
+  -- peer_watcher.start() is called here in full (not merely probed) and
+  -- reused unmodified below: constructing the real `.provenance/` watcher IS
+  -- the answer to whether it could be created, exactly as the VS Code
+  -- reference creates its FileSystemWatcher early for the same reason. It has
+  -- always been unconditional (not gated by enable_signals — peer witnessing
+  -- postdates the Plan 9 signal set and is a provenance-integrity mechanism,
+  -- not an editor signal), so `witness_capture` is always reported, never
+  -- omitted. `emit = deferred_emit` because `host` does not exist yet; see the
+  -- forward-declaration above for why that is safe.
+  local git_capture = nil
+  if enable_signals then
+    git = git_wiring.start({ workspace = workspace, emit = deferred_emit, tagger = tagger })
+    git_capture = git.active and "available" or "unavailable"
+  end
+
+  peer = peer_watcher.start({
+    provenance_dir = provenance_dir,
+    -- This session's own `.slog` and `.slog.meta`, BY BASENAME. Reads
+    -- `slog_path`/`meta_path` as upvalues — forward-declared above, assigned
+    -- at step 3 below — so this closure is only ever CALLED (at drain() time)
+    -- after they hold real values. A chain cannot corroborate itself, and the
+    -- reader excluding a self-witness is not a licence for the writer to
+    -- produce one.
+    is_own_file = function(basename)
+      return basename == vim.fn.fnamemodify(slog_path, ":t")
+        or basename == vim.fn.fnamemodify(meta_path, ":t")
+    end,
+    emit = deferred_emit,
+  })
+  local witness_capture = peer._watching and "available" or "unavailable"
+
   -- 2. Logical session context — the session.start payload. session_id
   -- here is the LOGICAL session id (chain/manifest identity), distinct
   -- from the filename uuid generated below (two-uuid rule).
@@ -266,13 +345,17 @@ function M.start(opts)
     session_pubkey_hex = keypair.public_key_hex,
     identity = identity,
     env = opts.env,
+    git_capture = git_capture,
+    witness_capture = witness_capture,
   })
 
   -- 3. TWO-UUID RULE: the `.slog` FILENAME uses a SEPARATE fresh uuid, not
-  -- context.session_id.
+  -- context.session_id. Assigns the upvalues forward-declared above (no
+  -- `local`): peer_watcher's `is_own_file` closure, built earlier at step 1e,
+  -- reads them lazily and only from here on holds real paths.
   local file_uuid = generate_file_uuid()
-  local slog_path = provenance_dir .. "/session-" .. file_uuid .. ".slog"
-  local meta_path = slog_path .. ".meta"
+  slog_path = provenance_dir .. "/session-" .. file_uuid .. ".slog"
+  meta_path = slog_path .. ".meta"
 
   -- 3b. Disk-full handler (Plan 8, Task 6/7). Wired as the writer's
   -- on_error below so a write failure flips it into degraded mode: notify
@@ -395,12 +478,14 @@ function M.start(opts)
   -- is scheduled: signing/persisting is deferred off the on_lines hot path
   -- (checkpoint_scheduler defers via vim.schedule) and drained synchronously
   -- at stop()/seal() so nothing pending is lost.
+  --
   -- PEER WITNESSING (program spec §7 mechanism 2, collaboration spec §5.5).
-  -- Forward reference: the watcher needs `host.emit`, which does not exist
-  -- until step 7 below, while the checkpoint hook that DRAINS it is defined
-  -- here. It is created at step 9d and is guaranteed to exist long before the
-  -- first checkpoint, which is `checkpoint_interval` entries away.
-  local peer = nil
+  -- `peer` was already constructed at step 1e above, via `deferred_emit`
+  -- (host does not exist until step 7 below, but nothing in peer_watcher's
+  -- own `start()` calls emit synchronously — only `drain()` does, which is
+  -- always called after `host` is assigned). The checkpoint hook below just
+  -- DRAINS it, on the checkpoint cadence, which is guaranteed to be long
+  -- after the first checkpoint, `checkpoint_interval` entries away.
 
   local cadence = checkpoint_cadence.new(checkpoint_interval)
   local scheduler = checkpoint_scheduler.new({
@@ -550,50 +635,25 @@ function M.start(opts)
     focus = focus_wiring.start({ emit = host.emit })
   end
 
-  -- 9c. Terminal / git / snapshot / clock-skew signals (Plan 9). snapshot
-  -- emits an ext.snapshot immediately on start; git degrades to an inert
-  -- handle when the workspace is not a git repo; clock-skew + snapshot both
-  -- run unref'd timers that never block headless exit.
+  -- 9c. Terminal / snapshot / clock-skew signals (Plan 9). snapshot emits an
+  -- ext.snapshot immediately on start; clock-skew + snapshot both run
+  -- unref'd timers that never block headless exit.
+  --
+  -- `git` is NOT started here: it was already constructed at step 1e, before
+  -- `context`/`session.start` were built, via `deferred_emit`, so that its
+  -- `.active` could feed `git_capture`. Nothing here re-starts it — a second
+  -- `git_wiring.start()` would double-watch the reflog and double-derive
+  -- `root_commit_sha`. Same for `peer` (peer witnessing): also built at step
+  -- 1e, also via `deferred_emit`, also never gated by `enable_signals` — see
+  -- that step's comment for the full reasoning.
   if enable_signals then
     term = terminal_wiring.start({ emit = host.emit, workspace = workspace })
-    git = git_wiring.start({ workspace = workspace, emit = host.emit, tagger = tagger })
     snap = snapshot_wiring.start({ emit = host.emit })
     -- ext.activate: polls for plugins that load AFTER start (baseline covered
     -- by snap's immediate ext.snapshot). Mirrors VS Code's activation poller.
     extact = ext_activation_wiring.start({ emit = host.emit })
     skew = clock_skew_watcher.start({ emit = host.emit })
   end
-
-  -- 9d. Peer witnessing (program spec §7 mechanism 2, collaboration spec §5.5).
-  -- ONE watcher on `.provenance/` — not one per file, because a partner's
-  -- `.slog` filename is a uuid minted on their machine and is not knowable in
-  -- advance, and because only a directory watcher sees a file APPEAR, which is
-  -- the case this exists for. Distinct from the `files_under_review` watchers
-  -- in watch/fs_watcher.lua: those watch the student's own source under the
-  -- assignment root, this watches provenance artifacts.
-  --
-  -- NOT gated on `enable_signals`. That switch turns off EDITOR signals — the
-  -- things a headless test does not want to simulate. Witnessing is a
-  -- provenance-integrity mechanism about files already on disk, and a session
-  -- recording without it produces a bundle that silently cannot testify to a
-  -- partner's deleted log. It costs nothing when `.provenance/` holds only this
-  -- session's own files, which is the case in every single-student workspace.
-  --
-  -- Nothing here ever writes, renames or deletes: the watcher is constructed
-  -- with a read function and a list function and no write capability at all
-  -- (decision-log bug 2 — a recorder that quarantined its partner's log, in a
-  -- shared repo, so git blamed the victim).
-  peer = peer_watcher.start({
-    provenance_dir = provenance_dir,
-    -- This session's own `.slog` and `.slog.meta`, BY BASENAME. A chain cannot
-    -- corroborate itself, and the reader excluding a self-witness is not a
-    -- licence for the writer to produce one.
-    is_own_file = function(basename)
-      return basename == vim.fn.fnamemodify(slog_path, ":t")
-        or basename == vim.fn.fnamemodify(meta_path, ":t")
-    end,
-    emit = host.emit,
-  })
 
   -- 10. Heartbeat: get_active_file uses heartbeat's own default; get_focused
   -- is threaded from the focus tracker when signals are enabled (so the

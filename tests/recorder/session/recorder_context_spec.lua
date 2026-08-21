@@ -311,3 +311,113 @@ describe("build_recorder_context session.start 2.0", function()
     assert.equals("dev-course", res.value.course_id)
   end)
 end)
+
+--- The three §5.6 CAPABILITY REPORTS. `git_capture`/`witness_capture` are
+--- passed straight through by the caller (recording_session.lua derives
+--- them); `file_scope` is resolved HERE, from `manifest.files_under_review`,
+--- mirroring log-core's `resolveFileScope`.
+describe("build_recorder_context session.start capability reports (collaboration spec §5.6)", function()
+  local function build(extra)
+    return recorder_context.build_recorder_context(vim.tbl_extend("force", {
+      manifest = MANIFEST,
+      prev_session_id = nil,
+      session_pubkey_hex = "deadbeef",
+      env = FIXED_ENV,
+    }, extra or {}))
+  end
+
+  it("omits all three fields when the caller reports nothing and the manifest lists no files", function()
+    local payload = build({})
+    assert.is_nil(payload.git_capture)
+    assert.is_nil(payload.witness_capture)
+    -- An empty files_under_review still yields a RECORDED (not absent)
+    -- file_scope: {watched=[], complete=true} is a real answer.
+    assert.is_not_nil(payload.file_scope)
+    assert.same({}, payload.file_scope.watched)
+    assert.is_true(payload.file_scope.complete)
+  end)
+
+  it("passes git_capture through verbatim when supplied", function()
+    for _, v in ipairs({ "available", "unavailable", "not_owned" }) do
+      assert.equals(v, build({ git_capture = v }).git_capture)
+    end
+  end)
+
+  it("passes witness_capture through verbatim when supplied", function()
+    for _, v in ipairs({ "available", "unavailable" }) do
+      assert.equals(v, build({ witness_capture = v }).witness_capture)
+    end
+  end)
+
+  it("git_capture and witness_capture are independent: one can be reported without the other", function()
+    local payload = build({ witness_capture = "available" })
+    assert.is_nil(payload.git_capture)
+    assert.equals("available", payload.witness_capture)
+  end)
+
+  it("OMIT never null: an unreported capability is absent from the canonical bytes, not `null`", function()
+    local payload = build({ witness_capture = "available" })
+    local canon = core_json.canonicalize(payload)
+    assert.is_nil(canon:find("git_capture", 1, true))
+    assert.is_not_nil(canon:find('"witness_capture":"available"', 1, true))
+  end)
+
+  it("resolves file_scope.watched from manifest.files_under_review, verbatim and in order", function()
+    local m = vim.tbl_extend("force", {}, MANIFEST, { files_under_review = { "Solver.java", "src/Board.java" } })
+    local payload = recorder_context.build_recorder_context({
+      manifest = m,
+      prev_session_id = nil,
+      session_pubkey_hex = "deadbeef",
+      env = FIXED_ENV,
+    })
+    assert.same({ "Solver.java", "src/Board.java" }, payload.file_scope.watched)
+    assert.is_true(payload.file_scope.complete)
+  end)
+
+  it("EMPTY-WATCHED-ARRAY SERIALIZATION: file_scope.watched canonicalizes as [] when empty", function()
+    local payload = build({})
+    local canon = core_json.canonicalize(payload)
+    assert.is_not_nil(canon:find('"watched":%[%]'))
+    assert.is_nil(canon:find('"watched":{}', 1, true))
+  end)
+
+  it("MALFORMED-PATH REJECTION: an absolute path in files_under_review omits file_scope entirely", function()
+    local m = vim.tbl_extend(
+      "force",
+      {},
+      MANIFEST,
+      { files_under_review = { "Solver.java", "/Users/student/Solver.java" } }
+    )
+    local payload = recorder_context.build_recorder_context({
+      manifest = m,
+      prev_session_id = nil,
+      session_pubkey_hex = "deadbeef",
+      env = FIXED_ENV,
+    })
+    assert.is_nil(payload.file_scope)
+    assert.is_nil(core_json.canonicalize(payload):find("file_scope", 1, true))
+  end)
+
+  it("caps watched at FILE_SCOPE_MAX_ENTRIES and reports complete=false past the cap", function()
+    local files = {}
+    for i = 1, recorder_context.FILE_SCOPE_MAX_ENTRIES + 5 do
+      files[i] = "f" .. i .. ".txt"
+    end
+    local m = vim.tbl_extend("force", {}, MANIFEST, { files_under_review = files })
+    local payload = recorder_context.build_recorder_context({
+      manifest = m,
+      prev_session_id = nil,
+      session_pubkey_hex = "deadbeef",
+      env = FIXED_ENV,
+    })
+    assert.equals(recorder_context.FILE_SCOPE_MAX_ENTRIES, #payload.file_scope.watched)
+    assert.is_false(payload.file_scope.complete)
+    assert.equals("f1.txt", payload.file_scope.watched[1])
+  end)
+
+  it("resolve_file_scope is exposed directly and matches the manifest-driven path", function()
+    local direct = recorder_context.resolve_file_scope({ "a.txt", "b.txt" })
+    assert.same({ "a.txt", "b.txt" }, direct.watched)
+    assert.is_true(direct.complete)
+  end)
+end)

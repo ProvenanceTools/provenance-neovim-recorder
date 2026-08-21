@@ -503,6 +503,96 @@ describe("recording_session capture policy", function()
   end)
 end)
 
+--- The three §5.6 CAPABILITY REPORTS, derived from the REAL wiring
+--- (git_wiring.start()'s `.active`, peer_watcher.start()'s `._watching`) at
+--- the point session.start is actually built — not a stub. Real `git` shells
+--- out via `vim.fn.system`; real `vim.uv.new_fs_event` watches `.provenance/`.
+describe("recording_session session.start capability reports (collaboration spec §5.6)", function()
+  local scratch
+
+  before_each(function()
+    scratch = new_scratch()
+  end)
+
+  after_each(function()
+    scratch.teardown()
+  end)
+
+  local function start(extra)
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    local opts = {
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = dev_manifest(),
+      clock = core_clock.fixed(0, 0),
+      env = { uuid = function() return "fixed-session-id" end },
+    }
+    for k, v in pairs(extra or {}) do
+      opts[k] = v
+    end
+    scratch.session = recording_session.start(opts)
+    return scratch.session, workspace
+  end
+
+  local function entries_of(session)
+    session.stop()
+    local parsed = core_ndjson.parse_entries(read_all(session.slog_path))
+    assert.is_true(parsed.ok)
+    return parsed.value
+  end
+
+  it("lean core (enable_signals absent): git_capture is OMITTED — git wiring never even ran", function()
+    local entries = entries_of(start({}))
+    assert.is_nil(entries[1].data.git_capture)
+  end)
+
+  it("witness_capture is ALWAYS reported, even in lean core — peer witnessing is unconditional", function()
+    local entries = entries_of(start({}))
+    assert.equals("available", entries[1].data.witness_capture)
+  end)
+
+  it("file_scope resolves from the manifest's files_under_review", function()
+    local entries = entries_of(start({}))
+    assert.same({ "foo.txt" }, entries[1].data.file_scope.watched)
+    assert.is_true(entries[1].data.file_scope.complete)
+  end)
+
+  it("enable_signals=true, no git repo at workspace: git_capture is 'unavailable'", function()
+    local entries = entries_of(start({ enable_signals = true }))
+    assert.equals("unavailable", entries[1].data.git_capture)
+  end)
+
+  it("enable_signals=true, workspace IS a git repo: git_capture is 'available'", function()
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    vim.fn.system({ "git", "-C", workspace, "init", "-q" })
+    if vim.v.shell_error ~= 0 then
+      pending("git binary unavailable in this test environment")
+      return
+    end
+
+    scratch.session = recording_session.start({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = dev_manifest(),
+      clock = core_clock.fixed(0, 0),
+      env = { uuid = function() return "fixed-session-id" end },
+      enable_signals = true,
+    })
+    local entries = entries_of(scratch.session)
+    assert.equals("available", entries[1].data.git_capture)
+  end)
+
+  it("the whole chain still validates with all three capability reports present", function()
+    local entries = entries_of(start({ enable_signals = true }))
+    local chain = core_chain_validator.validate_chain(entries)
+    assert.is_true(chain.ok)
+  end)
+end)
+
 --- THE BUNDLE-OPENABILITY REGRESSION.
 ---
 --- Two real sessions in one `.provenance` dir, the second started and never

@@ -8,6 +8,7 @@
 --- function, separately from the editor wiring."
 local core_sha256 = require("provenance.core.sha256")
 local core_json = require("provenance.core.json")
+local session_capabilities = require("provenance.core.session_capabilities")
 local bit = require("bit")
 local band, bor = bit.band, bit.bor
 
@@ -17,6 +18,49 @@ local M = {}
 -- for the recorder's own version until Plan 9 (dist) sources it centrally
 -- (e.g. from a generated version file or the plugin manifest).
 local PLUGIN_VERSION = "0.2.0"
+
+--- The cap on `file_scope.watched`, in entries (collaboration spec §5.6
+--- item 1). Today's resolver is the manifest's own `files_under_review` — a
+--- hand-authored course list of a handful of files — so this never bites; it
+--- exists so a future `scope: 'repo'` resolver cannot produce an unbounded
+--- list inside a single hash-chained entry by accident. Part of the WRITER
+--- CONTRACT: the three recorders must cap at the same number, or two ports
+--- disagree about when `complete` goes false. Mirrors log-core's
+--- `FILE_SCOPE_MAX_ENTRIES` (recorder-context.ts).
+M.FILE_SCOPE_MAX_ENTRIES = 4096
+
+--- Resolve the EFFECTIVE FILE SET this session will watch — collaboration
+--- spec §5.6 item 1, S25. Today's resolver is the identity function:
+--- `files_under_review` IS the effective set, because
+--- `watch/fs_watcher.lua`/`watch/external_change_coordinator.lua` watch
+--- exactly those entries.
+---
+--- RELATIVE TO WHAT: this recorder's activation keys off cwd, and the
+--- manifest that supplies `files_under_review` lives at exactly
+--- `<cwd>/.provenance-manifest` — so "workspace-relative" and "manifest-root
+--- -relative" are the SAME base directory here, unlike a hypothetical layout
+--- where the manifest could live somewhere other than the activated root.
+--- Entries already travel verbatim as `<workspace>`-relative paths
+--- everywhere else in this port (`doc.open.path`, `fs_watcher.lua`'s
+--- `RelativePattern`-equivalent matching, the D12 root_commit_sha's own
+--- workspace), which is the identical convention the VS Code reference
+--- (`recorder-context.ts`) uses for `assignmentRoot`-relative paths. No
+--- divergence needed: `file_scope.watched` is emitted exactly as
+--- `files_under_review` already is, with no re-basing.
+--- @param files_under_review string[]|nil
+--- @return table|nil SessionFileScope, or nil when nothing honest can be built
+function M.resolve_file_scope(files_under_review)
+  local list = files_under_review or {}
+  local complete = #list <= M.FILE_SCOPE_MAX_ENTRIES
+  local watched = list
+  if not complete then
+    watched = {}
+    for i = 1, M.FILE_SCOPE_MAX_ENTRIES do
+      watched[i] = list[i]
+    end
+  end
+  return session_capabilities.build_file_scope(watched, complete)
+end
 
 -- Pinned producer id (design.md §6 / CLAUDE.md "Producer identity"): this is
 -- how the analyzer distinguishes hosts. Never rename or derive this.
@@ -130,13 +174,23 @@ local function build_manifest_block(m)
   return block
 end
 
---- @param opts table {manifest, prev_session_id, session_pubkey_hex, identity?, env?}
----   manifest: table with assignment_id, semester, sig.
+--- @param opts table {manifest, prev_session_id, session_pubkey_hex, identity?, env?, git_capture?, witness_capture?}
+---   manifest: table with assignment_id, semester, sig, files_under_review.
 ---   identity: the verified session.start identity block, or nil to omit it.
 ---   prev_session_id: string or nil (fresh session).
 ---   session_pubkey_hex: string or nil.
 ---   env: optional overrides — uuid (function -> string), hostname, username,
 ---     nvim_version, platform, recorder_version.
+---   git_capture: the §5.6 item 2 capability report ("available" |
+---     "unavailable" | "not_owned"), or nil to OMIT the field. Derived by the
+---     caller from `git_wiring.start()`'s `.active` — see
+---     `recorder/session/recording_session.lua`, which is also where the
+---     `'not_owned'` non-emission is explained.
+---   witness_capture: the §5.6 item 3 capability report ("available" |
+---     "unavailable"). Derived by the caller from `peer_watcher.start()`'s
+---     `._watching`. Unlike `git_capture` this recorder always has an answer
+---     (creating the `.provenance/` watcher either succeeds or it does not),
+---     so callers should pass a value rather than nil.
 --- @return table SessionStartPayload
 function M.build_recorder_context(opts)
   opts = opts or {}
@@ -158,6 +212,14 @@ function M.build_recorder_context(opts)
   if prev_session_id == nil then
     prev_session_id = core_json.NULL
   end
+
+  -- The three CAPABILITY REPORTS (collaboration spec §5.6). Each field is
+  -- assigned directly, never through `core_json.NULL`: a Lua `nil` assigned
+  -- to a table key already omits it, which is the OMIT-never-null rule this
+  -- format requires (see core/session_capabilities.lua's module docstring).
+  -- `file_scope` is resolved HERE, from the manifest already in scope,
+  -- mirroring log-core's `resolveFileScope(manifest.files_under_review)`.
+  local file_scope = M.resolve_file_scope(manifest.files_under_review)
 
   return {
     format_version = "1.0",
@@ -188,6 +250,11 @@ function M.build_recorder_context(opts)
     -- because session.start is signed and hash-chained and a broken claim in
     -- there is permanent. See identity/session_identity.lua.
     identity = opts.identity,
+    -- The three §5.6 CAPABILITY REPORTS. Each is nil-omitted, never
+    -- `core_json.NULL`, when the caller has nothing honest to report.
+    git_capture = opts.git_capture,
+    witness_capture = opts.witness_capture,
+    file_scope = file_scope,
     -- NEW in 2.0: the editor-neutral host block that replaces `vscode`.
     -- `editor_build` is "" because Neovim has no build-commit concept — the
     -- spec explicitly permits the empty string (VS Code does not expose one
