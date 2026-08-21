@@ -69,6 +69,46 @@
 --- Two `run_git` invocations, ONCE per repository at wiring setup — never on
 --- the event path, never on the keystroke path. The value cannot change for the
 --- life of a repository.
+---
+--- ## REACHING GIT AT ALL — the 2026-08-20 platform corrections, and the gap
+---
+--- A second corrections block was added to the writer contract covering how a
+--- recorder FINDS git on a machine other than the one it was written on. It
+--- names provnvim. Where this port stands, item by item:
+---
+---  - **4 (trim every line).** SATISFIED. `vim.trim` is applied per LINE here,
+---    not only once to the whole output, so Windows CRLF cannot make
+---    `--is-shallow-repository` answer `"false\r\n"` — which would silently
+---    make every repository look shallow — and cannot leave a `\r` on a sha,
+---    which the reader would then reject as not-lowercase-hex. Neither failure
+---    raises; both would just produce an entire platform that omits the field.
+---    Pinned by three cases in root_commit_sha_spec.
+---  - **5 (no shell).** SATISFIED, and for free: `git_wiring`'s seam calls
+---    `vim.fn.system` with a LIST, which Neovim execs directly. A path
+---    containing spaces (`C:\Program Files\Git\cmd\git.exe`, the Windows
+---    default) therefore needs no quoting.
+---  - **6 ("git could not be found" is an omission).** SATISFIED. There is no
+---    sentinel, no diagnostic field and no defect count; a missing binary and a
+---    shallow clone produce the identical answer, which is the point.
+---  - **7 (derive once per repository).** SATISFIED — see `git_wiring.lua`.
+---
+---  - **1, 2, 3 (the git-path ladder).** NOT DONE, deliberately, and OWED.
+---    This port spawns a bare `git` and so depends on git being on the PATH
+---    Neovim inherited. On Windows that is routinely not the PATH a
+---    GUI-launched application has. The correction's remedy is to ask the HOST
+---    for its resolved binary and its configured path — but Neovim publishes
+---    neither: core Neovim has no `git.path` setting and no git extension whose
+---    API could be consulted. Building the ladder here therefore means
+---    INVENTING a provnvim-specific configuration surface (a `vim.g` option
+---    accepting a string or a list, with fall-through rules), which is a
+---    product decision about a user-facing knob rather than an implementation
+---    detail — and it would harden a `run_git` seam shared by every git read in
+---    this plugin, not just this one. Both are reasons it is a separate,
+---    approved change rather than a line added here.
+---
+---    Until then the consequence is bounded and blameless: on a machine where
+---    git is not on Neovim's PATH, the field is OMITTED, which is a legal,
+---    permanent answer that costs correlation and can never accuse anybody.
 local git_event = require("provenance.core.git_event")
 
 local M = {}

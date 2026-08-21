@@ -219,6 +219,84 @@ describe("root_commit_sha.derive", function()
     end)
   end)
 
+  describe("reaching git at all — the 2026-08-20 platform corrections", function()
+    -- A SECOND corrections block was added to the writer contract after the
+    -- value rules, covering how a recorder finds and talks to `git` on a
+    -- machine other than the one it was written on. It names provnvim
+    -- explicitly. The items that apply to this port's existing `run_git` seam
+    -- are pinned here; the ones that do not are recorded in the module
+    -- docstring, with the gap this port still has.
+
+    it("CORRECTION 4: EVERY LINE is trimmed, so Windows CRLF cannot fake a shallow clone", function()
+      -- On Windows git's stdout is CRLF. `'false\r\n' ~= 'false'` silently
+      -- makes every repository look shallow, and a `\r`-suffixed sha is not
+      -- lowercase hex so the reader rejects it. Neither produces an error —
+      -- they produce an entire PLATFORM that omits the field and quietly fails
+      -- to correlate.
+      local run = seam({
+        ["rev-parse --is-shallow-repository"] = { ok = true, out = "false\r\n" },
+        [ROOTS] = { ok = true, out = A40 .. "\r\n" },
+      })
+      assert.equals(A40, root_commit_sha.derive(run))
+    end)
+
+    it("CORRECTION 4: interior CRLF between several roots is trimmed too", function()
+      -- The whole-output trim the seam already does would leave the INTERIOR
+      -- `\r` on every line but the last, so all but one root would be
+      -- rejected — and the "lexicographically smallest" tie-break would then
+      -- silently answer with whichever one happened to survive.
+      local run = seam({
+        ["rev-parse --is-shallow-repository"] = { ok = true, out = "false\r\n" },
+        [ROOTS] = { ok = true, out = B40 .. "\r\n" .. A40 .. "\r\n" .. ("0"):rep(40) .. "\r\n" },
+      })
+      assert.equals(("0"):rep(40), root_commit_sha.derive(run))
+    end)
+
+    it("CORRECTION 4: a lone CR, and trailing spaces, are trimmed the same way", function()
+      local run = seam({
+        ["rev-parse --is-shallow-repository"] = { ok = true, out = "  false  " },
+        [ROOTS] = { ok = true, out = "  " .. A40 .. "  \r\n" },
+      })
+      assert.equals(A40, root_commit_sha.derive(run))
+    end)
+
+    it("CORRECTION 6: `git could not be found` is an omission, not a new answer", function()
+      -- No sentinel value, no diagnostic field on the payload, no defect count
+      -- — the same silent omit as a shallow clone. A port that distinguished
+      -- them would be inventing a fact it cannot establish: an unreachable cwd
+      -- and a missing binary are indistinguishable from the caller's side.
+      local missing = seam({}) -- every command fails, as a missing binary does
+      local shallow = seam({
+        ["rev-parse --is-shallow-repository"] = { ok = true, out = "true" },
+      })
+      assert.is_nil(root_commit_sha.derive(missing))
+      assert.is_nil(root_commit_sha.derive(shallow))
+      -- Identical answers: nothing downstream can tell the two apart, which is
+      -- the point.
+      assert.equals(root_commit_sha.derive(missing), root_commit_sha.derive(shallow))
+    end)
+  end)
+
+  it("CORRECTION 5: the default seam passes an ARGV, never a shell command line", function()
+    -- `vim.fn.system` with a LIST execs directly; with a STRING it goes through
+    -- 'shell'. The argv form means `C:\Program Files\Git\cmd\git.exe` — the
+    -- Windows default install path — needs no quoting and behaves identically
+    -- everywhere. Asserted against git_wiring's seam, which is the one this
+    -- module is always handed.
+    local git_wiring_src = table.concat(
+      vim.fn.readfile(
+        vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h:h")
+          .. "/lua/provenance/recorder/wiring/git_wiring.lua"
+      ),
+      "\n"
+    )
+    -- The seam builds a list and hands it to vim.fn.system. A string command
+    -- line, or any use of vim.fn.systemlist with a string, would be a shell.
+    assert.is_true(git_wiring_src:find("vim.list_extend({ \"git\", \"-C\", workspace }", 1, true) ~= nil)
+    assert.is_nil(git_wiring_src:find("os.execute", 1, true))
+    assert.is_nil(git_wiring_src:find("io.popen", 1, true))
+  end)
+
   it("makes no network call and reads no author identity", function()
     -- PRD NG2 plus the CPHS constraint (2026-06-19796). Both commands are local
     -- object-database reads, and neither can surface a name, an email, a date
