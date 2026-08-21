@@ -906,3 +906,153 @@ describe("git_wiring: the repository discriminator (decision D12)", function()
     pcall(vim.fn.delete, no_repo, "rf")
   end)
 end)
+
+-- ---------------------------------------------------------------------------
+-- Repository root ABOVE the workspace: one shared class repo with the
+-- assignment as a subdirectory — the standard 61B layout and a primary
+-- target of the multi-course/git/group program (program spec S0-S3). This
+-- deliberately uses the REAL `git` binary end to end (no injected run_git):
+-- the claim under test is that `git -C <workspace>` walks UPWARD to find an
+-- ancestor repository, which a scripted seam would just assert by fiat
+-- rather than exercise. `pending()`s out if no usable git binary exists,
+-- mirroring recording_session_spec.lua's real-git guard.
+--
+-- Why this exists as a regression test rather than only a one-off manual
+-- check (session decision log, 2026-08-21): provjet's `sessionOwning`
+-- predicate (`normalized.startsWith(root)`) requires the DISCOVERED repo to
+-- be at-or-below a session's root, so this exact layout drops every
+-- git.event for that recorder (the unfixed "bug 3" shape). provnvim's
+-- git_wiring never asks that question — there is no discovered-repo-path
+-- compared against a root, only "did `git -C workspace ...` find something"
+-- — but until this test existed, that was established only by a manual
+-- scratch-repo check run once and then deleted. If a future change ever
+-- narrows `detect_repo`/`resolve_git_dir` to only match a repo at-or-below
+-- the workspace (e.g. "for consistency with provjet"), this is what would
+-- catch it: `handle.active` would flip to false, or the reflog watch would
+-- silently fall back to the coarser poll timer, for every 61B-style
+-- submission — a student whose assignment is a subdirectory of the class
+-- repo would get zero git.event coverage with no error and no capability
+-- signal, since git_capture would still read from whatever detect_repo
+-- reports.
+-- ---------------------------------------------------------------------------
+describe("git_wiring: repository root ABOVE the workspace (shared class repo, standard 61B layout)", function()
+  local uv = vim.uv or vim.loop
+  local base
+  local handles
+
+  before_each(function()
+    base = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(base, "p")
+    handles = {}
+  end)
+
+  after_each(function()
+    for _, h in ipairs(handles) do
+      pcall(h.dispose)
+    end
+    handles = {}
+    pcall(vim.fn.delete, base, "rf")
+  end)
+
+  local function track(h)
+    table.insert(handles, h)
+    return h
+  end
+
+  --- Real `git`: inits a class repo at `<base>/course-repo`, commits one
+  --- file, and returns (class_repo, hw_dir) where `hw_dir` is a subdirectory
+  --- (the assignment root) with NO `.git` of its own. Returns nil when no
+  --- usable git binary exists in this test environment.
+  local function make_shared_class_repo()
+    local class_repo = base .. "/course-repo"
+    local hw_dir = class_repo .. "/hw1"
+    vim.fn.mkdir(hw_dir, "p")
+
+    local function git(args)
+      vim.fn.system(vim.list_extend({ "git", "-C", class_repo }, args))
+      return vim.v.shell_error == 0
+    end
+
+    if not git({ "init", "-q" }) then
+      return nil
+    end
+    git({ "config", "user.email", "test@example.com" })
+    git({ "config", "user.name", "Test" })
+    vim.fn.writefile({ "hi" }, hw_dir .. "/file.txt")
+    if not git({ "add", "-A" }) then
+      return nil
+    end
+    if not git({ "commit", "-q", "-m", "init" }) then
+      return nil
+    end
+
+    return class_repo, hw_dir
+  end
+
+  it(
+    "detects the ANCESTOR repo via git's own upward -C search, watches its reflog, "
+      .. "and does not drop the HEAD-change event",
+    function()
+      local class_repo, hw_dir = make_shared_class_repo()
+      if class_repo == nil then
+        pending("git binary unavailable in this test environment")
+        return
+      end
+
+      local events, emit = new_emit()
+      -- DEFAULT run_git deliberately — no injected seam. See the describe
+      -- block comment: a scripted answer would only assert this by fiat.
+      local handle = track(git_wiring.start({ workspace = hw_dir, emit = emit }))
+
+      assert.is_true(
+        handle.active,
+        "repo root ABOVE the workspace must still be detected as a repo -- a student "
+          .. "whose assignment is a subdirectory of the class repo (the standard 61B "
+          .. "layout) would otherwise get git_capture='unavailable' and no git.event "
+          .. "ever, with no signal that anything is wrong"
+      )
+
+      -- Compare via realpath, not raw string concatenation: on macOS
+      -- `vim.fn.tempname()` lives under `/var/folders/...`, which is itself a
+      -- symlink to `/private/var/folders/...` that `git rev-parse --git-dir`
+      -- resolves through — a naive string comparison here would be a false
+      -- failure on exactly the machines this test is meant to run on, not a
+      -- real defect.
+      local expected_reflog = uv.fs_realpath(class_repo .. "/.git/logs/HEAD")
+      local actual_reflog = handle._watch_path and uv.fs_realpath(handle._watch_path) or nil
+      assert.equals(
+        expected_reflog,
+        actual_reflog,
+        "must watch the ANCESTOR repo's own reflog file, not fall back to the "
+          .. "coarser run_git poll timer -- falling back here would still technically "
+          .. "record commits (on a delay) but means repo detection resolved a git-dir "
+          .. "it could not actually confirm has a reflog"
+      )
+
+      handle._on_head_change()
+
+      assert.equals(
+        1,
+        #events,
+        "a HEAD-change event for the shared class repo must reach THIS session's log -- "
+          .. "if this is 0, the shared-class-repo layout (assignment as a subdirectory) "
+          .. "silently records NO git activity at all for every 61B-style submission"
+      )
+      assert.equals("git.event", events[1].kind)
+      assert.equals("state_change", events[1].data.operation)
+
+      local head_ok, head_sha = (function()
+        local out = vim.fn.system({ "git", "-C", class_repo, "rev-parse", "HEAD" })
+        return vim.v.shell_error == 0, vim.trim(out or "")
+      end)()
+      assert.is_true(head_ok)
+      assert.equals(
+        head_sha,
+        events[1].data.commit_sha,
+        "the recorded commit_sha must be the CLASS REPO's real HEAD -- a mismatch means "
+          .. "the ancestor-repo resolution and the HEAD read disagree about which "
+          .. "repository is actually being watched"
+      )
+    end
+  )
+end)

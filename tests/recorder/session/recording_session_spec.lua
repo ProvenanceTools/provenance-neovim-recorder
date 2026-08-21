@@ -591,6 +591,124 @@ describe("recording_session session.start capability reports (collaboration spec
     local chain = core_chain_validator.validate_chain(entries)
     assert.is_true(chain.ok)
   end)
+
+  -- -------------------------------------------------------------------------
+  -- CONCURRENT sessions, one shared underlying repository (program spec
+  -- S0/S3: registry.lua's whole reason to exist is more than one assignment
+  -- root recording at the same instant). This is the exact premise that made
+  -- provjet's equivalent "not_owned is unreachable" claim false there: its
+  -- IDE indexes every nested `.git` PROJECT-WIDE and routes a discovered
+  -- repo to a session by path prefix, so a repo visible to the IDE but
+  -- outside a given session's own root reads as `not_owned` FOR THAT
+  -- SESSION. provnvim's `git_capture` derivation is a two-armed ternary
+  -- (recording_session.lua step 1e: `git.active and "available" or
+  -- "unavailable"`) fed by a `git_wiring.start()` call scoped to that one
+  -- session's own `workspace` — there is no shared, project-wide repo
+  -- enumeration for a second session's repo to be routed away from.
+  --
+  -- Why this is a regression test and not only a docstring claim (session
+  -- decision log, 2026-08-21): the reachability verdict rests entirely on
+  -- "provnvim has no shared cross-session repo-discovery/routing layer". If
+  -- that ever stopped being true — which is precisely how provjet ended up
+  -- reachable — nothing in the type system would catch it; only a test that
+  -- actually runs two sessions at once, against one real shared repo, and
+  -- checks neither ever answers `'not_owned'`, does.
+  -- -------------------------------------------------------------------------
+  it(
+    "two concurrently-recording assignment roots under the SAME shared class repo "
+      .. "both report git_capture='available'; neither ever reads 'not_owned'",
+    function()
+      local root = scratch.workspace()
+      local class_repo = root .. "/course"
+      local hw1 = class_repo .. "/hw1"
+      local hw2 = class_repo .. "/hw2"
+      vim.fn.mkdir(hw1, "p")
+      vim.fn.mkdir(hw2, "p")
+
+      local function git(args)
+        vim.fn.system(vim.list_extend({ "git", "-C", class_repo }, args))
+        return vim.v.shell_error == 0
+      end
+
+      if not git({ "init", "-q" }) then
+        pending("git binary unavailable in this test environment")
+        return
+      end
+      git({ "config", "user.email", "test@example.com" })
+      git({ "config", "user.name", "Test" })
+      vim.fn.writefile({ "hi" }, hw1 .. "/file.txt")
+      git({ "add", "-A" })
+      git({ "commit", "-q", "-m", "init" })
+
+      local function start_at(workspace, uuid)
+        local provenance_dir = workspace .. "/.provenance"
+        vim.fn.mkdir(provenance_dir, "p")
+        return recording_session.start({
+          workspace = workspace,
+          provenance_dir = provenance_dir,
+          manifest = dev_manifest(),
+          clock = core_clock.fixed(0, 0),
+          env = { uuid = function() return uuid end },
+          enable_signals = true,
+        })
+      end
+
+      -- Both started BEFORE either is stopped: both git_wiring watchers are
+      -- live AT THE SAME INSTANT, which is the scenario under test — not two
+      -- sessions run sequentially.
+      local session_a = start_at(hw1, "session-a")
+      local session_b = start_at(hw2, "session-b")
+
+      local ok_a, entries_a = pcall(function()
+        session_a.stop()
+        local parsed = core_ndjson.parse_entries(read_all(session_a.slog_path))
+        assert.is_true(parsed.ok)
+        return parsed.value
+      end)
+      local ok_b, entries_b = pcall(function()
+        session_b.stop()
+        local parsed = core_ndjson.parse_entries(read_all(session_b.slog_path))
+        assert.is_true(parsed.ok)
+        return parsed.value
+      end)
+
+      -- Belt-and-braces: stop both unconditionally so a failed pcall above
+      -- never leaks a live fs_poll/timer into a later test.
+      pcall(session_a.stop)
+      pcall(session_b.stop)
+
+      assert.is_true(ok_a, "session A (hw1) crashed instead of producing a readable log")
+      assert.is_true(ok_b, "session B (hw2) crashed instead of producing a readable log")
+
+      local capture_a = entries_a[1].data.git_capture
+      local capture_b = entries_b[1].data.git_capture
+
+      assert.equals(
+        "available",
+        capture_a,
+        "session A (hw1) must see the shared class repo as 'available' -- "
+          .. "'unavailable' here would mean the concurrently-live second session "
+          .. "somehow interfered with this session's own, independently-scoped "
+          .. "repo detection"
+      )
+      assert.equals(
+        "available",
+        capture_b,
+        "session B (hw2) must see the shared class repo as 'available' too -- "
+          .. "same repo, different subdirectory, same claim"
+      )
+      assert.are_not.equals(
+        "not_owned",
+        capture_a,
+        "git_capture must never be 'not_owned' for THIS recorder's own writer -- "
+          .. "seeing it here would mean provnvim has grown a shared, cross-session "
+          .. "git-repo routing layer (see core/session_capabilities.lua's docstring), "
+          .. "and every reachability claim resting on 'provnvim has no such layer' "
+          .. "needs re-auditing"
+      )
+      assert.are_not.equals("not_owned", capture_b, "same claim, for session B")
+    end
+  )
 end)
 
 --- THE BUNDLE-OPENABILITY REGRESSION.
