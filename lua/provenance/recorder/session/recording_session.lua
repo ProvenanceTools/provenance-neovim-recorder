@@ -50,6 +50,7 @@ local clock_skew_watcher = require("provenance.recorder.events.clock_skew_watche
 local explanation_tags = require("provenance.recorder.events.explanation_tags")
 local seal_cmd = require("provenance.recorder.commands.seal")
 local rolling_seal_writer = require("provenance.recorder.io.rolling_seal_writer")
+local peer_watcher = require("provenance.recorder.watch.peer_watcher")
 local extension_hash_cmd = require("provenance.recorder.commands.extension_hash")
 local chain_recovery = require("provenance.recorder.startup.chain_recovery")
 local uv_recovery_deps = require("provenance.recorder.startup.uv_recovery_deps")
@@ -364,6 +365,13 @@ function M.start(opts)
   -- is scheduled: signing/persisting is deferred off the on_lines hot path
   -- (checkpoint_scheduler defers via vim.schedule) and drained synchronously
   -- at stop()/seal() so nothing pending is lost.
+  -- PEER WITNESSING (program spec §7 mechanism 2, collaboration spec §5.5).
+  -- Forward reference: the watcher needs `host.emit`, which does not exist
+  -- until step 7 below, while the checkpoint hook that DRAINS it is defined
+  -- here. It is created at step 9d and is guaranteed to exist long before the
+  -- first checkpoint, which is `checkpoint_interval` entries away.
+  local peer = nil
+
   local cadence = checkpoint_cadence.new(checkpoint_interval)
   local scheduler = checkpoint_scheduler.new({
     sign = function(seq, hash)
@@ -373,6 +381,18 @@ function M.start(opts)
       -- WRITE POINT 2 of 3: after each checkpoint LANDS in the `.meta`, so the
       -- seal's `meta_sha256` covers it.
       local ok, err = pcall(mw.append_checkpoint, cp)
+      -- Peer witnessing drains on the CHECKPOINT CADENCE (writer contract rule
+      -- 3) and BEFORE the rolling seal, so the observations it emits are in the
+      -- `.slog` that the seal about to be written commits to. The watcher's
+      -- callbacks did no I/O; all of it happens here, off the event path.
+      --
+      -- Synchronous, and that is the safety property: `drain` reads everything
+      -- first and only then emits, with no yield across the session host's
+      -- read-and-advance of `prev_hash`/`seq`. It never raises, so a witnessing
+      -- failure cannot cost the checkpoint or the seal.
+      if peer then
+        pcall(peer.drain)
+      end
       -- Rolled even when the checkpoint itself failed, so a session whose
       -- `.meta` append broke still gets the best seal available. The scheduler's
       -- on_error still sees the failure: it is re-raised below.
@@ -514,6 +534,37 @@ function M.start(opts)
     skew = clock_skew_watcher.start({ emit = host.emit })
   end
 
+  -- 9d. Peer witnessing (program spec §7 mechanism 2, collaboration spec §5.5).
+  -- ONE watcher on `.provenance/` — not one per file, because a partner's
+  -- `.slog` filename is a uuid minted on their machine and is not knowable in
+  -- advance, and because only a directory watcher sees a file APPEAR, which is
+  -- the case this exists for. Distinct from the `files_under_review` watchers
+  -- in watch/fs_watcher.lua: those watch the student's own source under the
+  -- assignment root, this watches provenance artifacts.
+  --
+  -- NOT gated on `enable_signals`. That switch turns off EDITOR signals — the
+  -- things a headless test does not want to simulate. Witnessing is a
+  -- provenance-integrity mechanism about files already on disk, and a session
+  -- recording without it produces a bundle that silently cannot testify to a
+  -- partner's deleted log. It costs nothing when `.provenance/` holds only this
+  -- session's own files, which is the case in every single-student workspace.
+  --
+  -- Nothing here ever writes, renames or deletes: the watcher is constructed
+  -- with a read function and a list function and no write capability at all
+  -- (decision-log bug 2 — a recorder that quarantined its partner's log, in a
+  -- shared repo, so git blamed the victim).
+  peer = peer_watcher.start({
+    provenance_dir = provenance_dir,
+    -- This session's own `.slog` and `.slog.meta`, BY BASENAME. A chain cannot
+    -- corroborate itself, and the reader excluding a self-witness is not a
+    -- licence for the writer to produce one.
+    is_own_file = function(basename)
+      return basename == vim.fn.fnamemodify(slog_path, ":t")
+        or basename == vim.fn.fnamemodify(meta_path, ":t")
+    end,
+    emit = host.emit,
+  })
+
   -- 10. Heartbeat: get_active_file uses heartbeat's own default; get_focused
   -- is threaded from the focus tracker when signals are enabled (so the
   -- heartbeat's `focused` field reflects real focus state instead of the
@@ -630,6 +681,21 @@ function M.start(opts)
     end
     stopped = true
 
+    -- FINAL peer-witness drain, BEFORE session.end so the observations land
+    -- inside the session they belong to. Checkpoints fire every
+    -- `checkpoint_interval` entries, so a partner's log that arrived after the
+    -- last one would otherwise never be witnessed by this session at all — and
+    -- a `git pull` immediately before closing the editor is an ordinary thing
+    -- to do. This is also the whole of the answer to the contract's "or a
+    -- timer": there is no timer, and stop() always drains, so a long-idle
+    -- session delays witnessing but never loses it.
+    --
+    -- drain() never raises; the pcall is belt-and-braces so witnessing can
+    -- never block shutdown.
+    if peer then
+      pcall(peer.drain)
+    end
+
     host.emit("session.end", { reason = reason or "deactivate" })
 
     -- Drain any pending checkpoint (including one scheduled by session.end
@@ -651,6 +717,10 @@ function M.start(opts)
     if snap then snap.dispose() end
     if git then git.dispose() end
     if term then term.dispose() end
+    -- Disposed AFTER its final drain above, and before the writer closes, so
+    -- no libuv fs_event handle outlives the session (a leaked handle keeps
+    -- headless Neovim from exiting).
+    if peer then peer.dispose() end
 
     hb.dispose()
     wiring.dispose()
