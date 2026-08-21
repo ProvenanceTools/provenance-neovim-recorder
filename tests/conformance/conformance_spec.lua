@@ -2253,6 +2253,275 @@ describe("conformance: peer-observed.json (Tier 4.1 peer witnessing)", function(
 end)
 
 -- ===========================================================================
+-- SESSION.START CAPABILITY REPORTS — session-capabilities.json
+-- ===========================================================================
+--
+-- collaboration spec §5.6: the three `session.start` capability reports
+-- (`git_capture`, `witness_capture`, `file_scope`). Unlike git-event.json /
+-- peer-observed.json this fixture publishes FULL `session.start` payloads,
+-- one per case, each already the base 1.x payload plus at most the field(s)
+-- under test — so the READERS (core/session_capabilities.lua) are the thing
+-- under test here, not a per-event builder.
+describe("conformance: session-capabilities.json (collaboration spec §5.6)", function()
+  local core_json = require("provenance.core.json")
+  local ndjson = require("provenance.core.ndjson")
+  local session_capabilities = require("provenance.core.session_capabilities")
+
+  local fx = load_fixture("session-capabilities.json")
+
+  local function case_named(name)
+    for _, c in ipairs(fx.cases) do
+      if c.name == name then
+        return c
+      end
+    end
+    return nil
+  end
+
+  --- Re-derive a properly VALUE-MODEL-TAGGED `data` table for one case.
+  ---
+  --- `load_fixture` decodes the whole JSON file with a plain `vim.json.decode`,
+  --- so `case.data`'s arrays (e.g. `file_scope.watched`) are NOT tagged with
+  --- `core_json.array`'s metatable — `core_json.is_array` would report every
+  --- one of them false, and `core_json.canonicalize` would then treat them as
+  --- OBJECTS (wrong shape) rather than arrays. Production code never sees data
+  --- in that state: a real `session.start` reaches every reader through
+  --- `ndjson.parse_entries`, which normalizes exactly this ambiguity (see
+  --- `core/ndjson.lua`'s `normalize`). Round-tripping through the real parser
+  --- — re-encode the case as one NDJSON line, parse it back — reproduces that
+  --- normalization exactly, with no logic duplicated here.
+  local function normalized_data(case)
+    local entry = {
+      seq = case.envelope.seq,
+      t = case.envelope.t,
+      wall = case.envelope.wall,
+      kind = case.envelope.kind,
+      data = case.envelope.data,
+      prev_hash = case.prev_hash,
+      hash = case.hash,
+    }
+    local line = vim.json.encode(entry)
+    local parsed = ndjson.parse_entries(line)
+    assert.is_true(parsed.ok, "fixture case '" .. case.name .. "' failed to parse: " .. tostring(parsed.error))
+    assert.equals(1, #parsed.value)
+    return parsed.value[1].data
+  end
+
+  it("the vector ships all twenty-six cases this port must satisfy", function()
+    -- Guards against a silently truncated fixture making the loops below pass
+    -- by testing nothing.
+    assert.equals(26, #fx.cases)
+  end)
+
+  it("the two enums match core/session_capabilities.lua exactly, in order", function()
+    assert.same(fx.git_capture_values, session_capabilities.GIT_CAPTURE_VALUES)
+    assert.same(fx.witness_capture_values, session_capabilities.WITNESS_CAPTURE_VALUES)
+  end)
+
+  it("the field names match core/session_capabilities.lua exactly", function()
+    assert.equals(fx.fields.git_capture, session_capabilities.GIT_CAPTURE_FIELD)
+    assert.equals(fx.fields.witness_capture, session_capabilities.WITNESS_CAPTURE_FIELD)
+    assert.equals(fx.fields.file_scope, session_capabilities.FILE_SCOPE_FIELD)
+  end)
+
+  --- Assert one narrowed read against the vector's own published verdict.
+  --- `expected` is the JSON-decoded reader-result object the exporter
+  --- published (e.g. `{kind="recorded", capture="available"}` or
+  --- `{kind="malformed", problem="unknown_value"}`).
+  local function assert_read_matches(expected, got, label)
+    assert.equals(expected.kind, got.kind, label)
+    if expected.kind == "recorded" then
+      if expected.capture ~= nil then
+        assert.equals(expected.capture, got.capture, label)
+      end
+      if expected.watched ~= nil then
+        assert.same(expected.watched, got.watched, label)
+        assert.equals(expected.complete, got.complete, label)
+      end
+    elseif expected.kind == "malformed" then
+      assert.equals(expected.problem, got.problem, label)
+    end
+  end
+
+  for _, case in ipairs(fx.cases) do
+    it("case '" .. case.name .. "': " .. case.note, function()
+      local data = normalized_data(case)
+
+      -- Byte-exact JCS of the payload, AND the chain hash of the whole
+      -- envelope — proving this port's canonicalizer and hash chain agree
+      -- with log-core's on payloads carrying these three new fields, exactly
+      -- as every other conformance describe block in this file pins its own
+      -- event kind.
+      assert.equals(case.canonical_json, core_json.canonicalize(data))
+      local e = case.envelope
+      local env = envelope.new(e.seq, e.t, e.wall, e.kind, data)
+      assert.equals(case.hash, hc.chain_entry(case.prev_hash, env).hash)
+
+      -- ...and all three readers narrow it exactly as the vector publishes.
+      assert_read_matches(case.git_capture, session_capabilities.read_git_capture(data), case.name)
+      assert_read_matches(
+        case.witness_capture,
+        session_capabilities.read_witness_capture(data),
+        case.name
+      )
+      assert_read_matches(case.file_scope, session_capabilities.read_file_scope(data), case.name)
+    end)
+  end
+
+  it("ABSENCE IS THE ORDINARY CASE: no_capability_reports hashes as a pre-§5.6 payload would", function()
+    -- All three fields read absent, and adding them to the format did not
+    -- change what an old payload's bytes look like — the whole point of
+    -- OMIT-never-null.
+    local case = case_named("no_capability_reports")
+    assert.is_not_nil(case)
+    local data = normalized_data(case)
+    assert.equals("absent", session_capabilities.read_git_capture(data).kind)
+    assert.equals("absent", session_capabilities.read_witness_capture(data).kind)
+    assert.equals("absent", session_capabilities.read_file_scope(data).kind)
+    assert.is_nil(data.git_capture)
+    assert.is_nil(data.witness_capture)
+    assert.is_nil(data.file_scope)
+  end)
+
+  it("MANDATORY: null and omission read the same but hash DIFFERENTLY, for all three fields", function()
+    -- The whole reason a writer must OMIT rather than emit `null`: the two
+    -- are the same narrowed verdict (`absent`) but different canonical bytes
+    -- and therefore a different chain hash, exactly as `parents: []` and an
+    -- absent `parents` do for git.event (git_payloads.lua).
+    local absent = case_named("no_capability_reports")
+    assert.is_not_nil(absent)
+    for _, pair in ipairs({
+      { field = "git_capture", null_case = "git_capture_null_is_not_absent" },
+      { field = "witness_capture", null_case = "witness_capture_null_is_not_absent" },
+      { field = "file_scope", null_case = "file_scope_null_is_not_absent" },
+    }) do
+      local null_case = case_named(pair.null_case)
+      assert.is_not_nil(null_case, pair.null_case)
+      assert.are_not.equals(
+        absent.canonical_json,
+        null_case.canonical_json,
+        pair.field .. ": null must not be byte-identical to omission"
+      )
+      assert.are_not.equals(absent.hash, null_case.hash, pair.field)
+    end
+  end)
+
+  it("witness_capture has no 'not_owned' analogue: sharing git_capture's enum is rejected", function()
+    -- There is no witnessing analogue of git_capture's third value: a
+    -- recorder witnesses the .provenance/ directory it is itself writing
+    -- into, so there is no ownership question to route on. A port that
+    -- shares one enum between the two fields fails this case.
+    local case = case_named("witness_capture_not_owned_rejected")
+    assert.is_not_nil(case)
+    local data = normalized_data(case)
+    local got = session_capabilities.read_witness_capture(data)
+    assert.equals("malformed", got.kind)
+    assert.equals("unknown_value", got.problem)
+  end)
+
+  it("file_scope: an empty watched list is a REAL answer, distinct from absence, and serializes as []", function()
+    local case = case_named("file_scope_empty_is_a_real_answer")
+    assert.is_not_nil(case)
+    local data = normalized_data(case)
+    local got = session_capabilities.read_file_scope(data)
+    assert.equals("recorded", got.kind)
+    assert.same({}, got.watched)
+    assert.is_true(got.complete)
+    -- The byte-level assertion the DoD calls for by name: `watched` is a JSON
+    -- ARRAY even when empty, never an object.
+    assert.is_true(case.canonical_json:find('"watched":[]', 1, true) ~= nil, case.canonical_json)
+    assert.is_nil(case.canonical_json:find('"watched":{}', 1, true))
+  end)
+
+  it("file_scope: a bad element rejects the WHOLE list, not just that entry", function()
+    for _, name in ipairs({
+      "file_scope_absolute_path_rejected",
+      "file_scope_windows_path_rejected",
+      "file_scope_remote_url_rejected",
+      "file_scope_scp_remote_rejected",
+      "file_scope_parent_escape_rejected",
+    }) do
+      local case = case_named(name)
+      assert.is_not_nil(case, name)
+      local data = normalized_data(case)
+      local got = session_capabilities.read_file_scope(data)
+      assert.equals("malformed", got.kind, name)
+    end
+  end)
+
+  it("file_scope: paths that merely LOOK risky are ordinary and accepted verbatim", function()
+    local case = case_named("file_scope_dotted_names_accepted")
+    assert.is_not_nil(case)
+    local data = normalized_data(case)
+    local got = session_capabilities.read_file_scope(data)
+    assert.equals("recorded", got.kind)
+    assert.same(
+      { ".hidden/config.txt", "a..b/Solver.java", "src\\main\\Board.java" },
+      got.watched
+    )
+  end)
+
+  it("file_scope: forward compatibility — an unknown extra key does not reject the scope", function()
+    local case = case_named("file_scope_unknown_extra_key_accepted")
+    assert.is_not_nil(case)
+    local data = normalized_data(case)
+    local got = session_capabilities.read_file_scope(data)
+    assert.equals("recorded", got.kind)
+    assert.same({ "Solver.java" }, got.watched)
+    assert.is_true(got.complete)
+  end)
+
+  -- ---------------------------------------------------------------------
+  -- WRITER RULES: core/session_capabilities.lua's own build_file_scope.
+  -- ---------------------------------------------------------------------
+
+  it("WRITER RULE: build_file_scope reproduces the vector's accepted watched lists verbatim", function()
+    for _, spec in ipairs({
+      { name = "file_scope_complete", watched = { "Solver.java", "src/Board.java" }, complete = true },
+      { name = "file_scope_empty_is_a_real_answer", watched = {}, complete = true },
+      { name = "file_scope_truncated", watched = { "Solver.java" }, complete = false },
+    }) do
+      local case = case_named(spec.name)
+      assert.is_not_nil(case, spec.name)
+      local built = session_capabilities.build_file_scope(spec.watched, spec.complete)
+      assert.is_not_nil(built, spec.name)
+      assert.equals(spec.complete, built.complete, spec.name)
+      assert.same(spec.watched, built.watched, spec.name)
+      assert.is_true(core_json.is_array(built.watched), spec.name .. ": watched must be a tagged array")
+    end
+  end)
+
+  it("WRITER RULE: build_file_scope refuses every path the vector rejects, returning nil", function()
+    for _, bad in ipairs({
+      "/Users/student/cs61b/Solver.java",
+      "C:\\Users\\student\\Solver.java",
+      "https://github.com/some-student/proj2/Solver.java",
+      "git@github.com:someone/proj2.git",
+      "../other-course/Solver.java",
+    }) do
+      assert.is_nil(
+        session_capabilities.build_file_scope({ "Solver.java", bad }, true),
+        "must refuse: " .. bad
+      )
+    end
+  end)
+
+  it("IRB / S14(b): no accepted case's file_scope carries an absolute path, a colon, or '..'", function()
+    for _, case in ipairs(fx.cases) do
+      if case.file_scope and case.file_scope.kind == "recorded" then
+        for _, p in ipairs(case.file_scope.watched) do
+          assert.is_nil(p:match("^[/\\]"), case.name .. ": " .. p)
+          assert.is_nil(p:find(":", 1, true), case.name .. ": " .. p)
+          for segment in (p .. "/"):gmatch("([^\\/]*)[\\/]") do
+            assert.are_not.equals("..", segment, case.name .. ": " .. p)
+          end
+        end
+      end
+    end
+  end)
+end)
+
+-- ===========================================================================
 -- S3 ROLLING SEAL — rolling-manifest.json
 -- ===========================================================================
 --
