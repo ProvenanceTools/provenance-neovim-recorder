@@ -91,6 +91,37 @@
 --- tests/recorder/wiring/git_wiring_spec.lua and
 --- tests/recorder/events/git_payloads_spec.lua.
 ---
+--- ## THE REPOSITORY DISCRIMINATOR (decision D12)
+---
+--- `git.event` also carries `root_commit_sha`: the root of HEAD's first-parent
+--- lineage, which is what lets a reader key observed commits by
+--- `(repository, sha)` instead of by `sha` alone. Without it, a scope that
+--- observed a submodule alongside its outer repository merges two unrelated sha
+--- spaces into one graph.
+---
+--- Derived ONCE here, at `start()`, and memoized for the life of the handle —
+--- writer rule 1. It cannot change for the life of a repository, and the event
+--- path must not pay for it. `_on_head_change` reads a settled local, never a
+--- subprocess.
+---
+--- ONE VALUE PER REPOSITORY OBSERVED (writer rule 9). This port watches exactly
+--- one repository — the activated workspace — and derives the discriminator
+--- through the SAME `run_git` seam that `_on_head_change` reads `HEAD` through.
+--- That is the invariant, not merely a convenience: the label and the sha it
+--- labels are resolved by one `git -C <workspace>`, so a workspace that IS a
+--- submodule gets the submodule's own root, and a workspace that CONTAINS one
+--- never observes the inner repository's commits in the first place. Labelling
+--- a submodule's event with the outer repository's root would re-create the
+--- exact merge the field exists to prevent, so a future change that widened
+--- this module to several repositories must give each its own seam and its own
+--- derivation — never share this one.
+---
+--- OMITTED, never null, on a shallow clone or any failure — see
+--- `wiring/root_commit_sha.lua` for the derivation rules and
+--- `events/git_payloads.lua` for the omission rule. Absence is legal,
+--- permanent and blameless; it is the state of every bundle recorded before
+--- D12 and of every shallow clone forever.
+---
 --- ## WHY EMISSION STAYS SYNCHRONOUS (unlike provcode/provjet)
 ---
 --- The other two recorders had to make emission asynchronous, because their
@@ -127,6 +158,7 @@
 --- (commit_view, build_git_event), recorder.events.explanation_tags
 --- (tagger.mark_git()).
 local git_payloads = require("provenance.recorder.events.git_payloads")
+local root_commit_sha = require("provenance.recorder.wiring.root_commit_sha")
 
 local M = {}
 
@@ -415,7 +447,30 @@ function M.start(opts)
   local disposed = false
   local watcher = nil -- either a uv fs_poll or a uv timer, both stop()/close()
 
+  -- THE REPOSITORY DISCRIMINATOR (D12), derived ONCE here — writer rule 1 —
+  -- and never on the event path. Two local object-database reads, at wiring
+  -- setup, only for a workspace already established to be a repository:
+  -- running git in a workspace whose events are dropped is work it should
+  -- never do.
+  --
+  -- Derived through the SAME `run_git` seam `_on_head_change` reads HEAD
+  -- through, which is writer rule 9: the label and the sha it labels come from
+  -- one `git -C <workspace>`, so a workspace that IS a submodule is labelled
+  -- with the submodule's own root rather than an outer repository's.
+  --
+  -- `derive` never raises; a pcall here is belt-and-braces against a caller
+  -- supplied `run_git` that does something exotic, and its failure is an
+  -- omission like every other.
+  local derive_ok, discriminator = pcall(root_commit_sha.derive, run_git)
+  if not derive_ok or type(discriminator) ~= "string" then
+    discriminator = nil
+  end
+
   local handle = { active = true }
+
+  -- Test/inspection seam: the memoized value, so a spec can prove the
+  -- derivation ran ONCE at setup rather than per event.
+  handle._root_commit_sha = discriminator
 
   --- Deterministic decision handler: read the current HEAD commit sha and
   --- its graph position (parents, branch), build+emit a state_change
@@ -455,7 +510,15 @@ function M.start(opts)
 
       -- `commit_sha` and `sha` carry the same value on purpose: 1.x readers
       -- only know the former, and 1.x support is permanent (program spec §9).
-      local ev = git_payloads.build_git_event("state_change", commit_sha, view, branch)
+      --
+      -- `root_commit_sha` rides along on every event that carries a sha (D12
+      -- writer rule 10) — not only on commits, because an unlabelled
+      -- observation does not correlate even when its neighbours in the same
+      -- session do. It is the value derived at setup: a settled local, so this
+      -- costs a table read and never a git invocation. The builder OMITS it,
+      -- never nulls it, and re-checks it through log-core's own reader.
+      local ev =
+        git_payloads.build_git_event("state_change", commit_sha, view, branch, discriminator)
       emit(ev.kind, ev.data)
 
       if tagger then

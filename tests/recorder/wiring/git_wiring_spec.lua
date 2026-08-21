@@ -540,6 +540,14 @@ describe("git_wiring: commit graph (program spec S5)", function()
     })
     table.insert(handles, handle)
 
+    -- The D12 discriminator is derived ONCE at start() (writer rule 1), so its
+    -- git invocations are already in `order` and are not part of what this case
+    -- is about. Cleared, not filtered, so the assertion below still describes
+    -- the handler EXACTLY — every call it makes, in sequence, and nothing else.
+    -- That the derivation happens at setup and never here is asserted in
+    -- "derived ONCE at setup, never per event" below.
+    order = {}
+
     handle._on_head_change()
 
     -- Everything happened inside the call, in order, with exactly one emit.
@@ -636,5 +644,265 @@ describe("git_wiring: commit graph (program spec S5)", function()
     assert.is_nil(data.commit_sha)
     assert.is_nil(data.sha)
     assert.equals("main", data.branch)
+  end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- D12 — the repository discriminator, as WIRED.
+--
+-- root_commit_sha_spec.lua covers the derivation rules. These cases cover the
+-- three things only the wiring can get wrong: deriving ONCE instead of per
+-- event, labelling the wrong repository, and letting a value the reader would
+-- reject reach a payload anyway.
+-- ---------------------------------------------------------------------------
+
+describe("git_wiring: the repository discriminator (decision D12)", function()
+  local SHA = ("a"):rep(40)
+  local P1 = ("b"):rep(40)
+  local ROOT = ("9"):rep(40)
+
+  local dir
+  local handles
+
+  before_each(function()
+    dir = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(dir .. "/.git", "p")
+    handles = {}
+  end)
+
+  after_each(function()
+    for _, h in ipairs(handles) do
+      pcall(h.dispose)
+    end
+    handles = {}
+    pcall(vim.fn.delete, dir, "rf")
+  end)
+
+  --- Start a handle with a scripted git. `overrides` maps a joined argv to a
+  --- run_git result; anything unlisted falls back to the sane defaults below.
+  --- Returns the handle, the emitted events, and the argv log.
+  local function start(overrides)
+    local events, calls = {}, {}
+    local defaults = {
+      ["rev-parse HEAD"] = { ok = true, out = SHA },
+      ["rev-list --parents -n 1 " .. SHA] = { ok = true, out = SHA .. " " .. P1 },
+      ["symbolic-ref --quiet --short HEAD"] = { ok = true, out = "main" },
+      ["rev-parse --is-shallow-repository"] = { ok = true, out = "false" },
+      ["rev-list --max-parents=0 --first-parent HEAD"] = { ok = true, out = ROOT },
+      ["rev-parse --git-dir"] = { ok = true, out = ".git" },
+    }
+    local handle = git_wiring.start({
+      workspace = dir,
+      emit = function(kind, data)
+        table.insert(events, { kind = kind, data = data })
+      end,
+      run_git = function(args)
+        local key = table.concat(args, " ")
+        table.insert(calls, key)
+        local answer = (overrides or {})[key]
+        if answer ~= nil then
+          return answer
+        end
+        return defaults[key] or { ok = false, out = "" }
+      end,
+    })
+    table.insert(handles, handle)
+    return handle, events, calls
+  end
+
+  local function count(calls, needle)
+    local n = 0
+    for _, c in ipairs(calls) do
+      if c == needle then
+        n = n + 1
+      end
+    end
+    return n
+  end
+
+  it("labels every git.event that carries a sha", function()
+    local handle, events = start()
+    handle._on_head_change()
+    assert.equals(1, #events)
+    assert.equals(ROOT, events[1].data.root_commit_sha)
+    -- `state_change`, not `commit`: writer rule 10 rides the field on every
+    -- observation carrying a sha, because an unlabelled one does not correlate
+    -- even when its neighbours in the same session do.
+    assert.equals("state_change", events[1].data.operation)
+  end)
+
+  it("WRITER RULE 1: derived ONCE at setup, never per event", function()
+    -- Two subprocess spawns at wiring setup are fine. Two per HEAD movement are
+    -- not: `_on_head_change` runs from an fs_poll callback, and the value
+    -- cannot change for the life of a repository anyway.
+    local handle, events, calls = start()
+    local after_setup_shallow = count(calls, "rev-parse --is-shallow-repository")
+    local after_setup_roots = count(calls, "rev-list --max-parents=0 --first-parent HEAD")
+    assert.equals(1, after_setup_shallow)
+    assert.equals(1, after_setup_roots)
+
+    for _ = 1, 5 do
+      handle._on_head_change()
+    end
+
+    assert.equals(after_setup_shallow, count(calls, "rev-parse --is-shallow-repository"))
+    assert.equals(after_setup_roots, count(calls, "rev-list --max-parents=0 --first-parent HEAD"))
+    assert.equals(5, #events)
+    for _, e in ipairs(events) do
+      assert.equals(ROOT, e.data.root_commit_sha)
+    end
+  end)
+
+  it("WRITER RULE 9: the label comes from the SAME seam that read the sha", function()
+    -- One value per repository OBSERVED. This port watches exactly one
+    -- repository and resolves both the label and the sha through one
+    -- `git -C <workspace>`, so a workspace that IS a submodule is labelled with
+    -- the submodule's own root — never an outer repository's.
+    --
+    -- Driven as the failure it prevents: a seam representing a SUBMODULE, whose
+    -- root differs from the outer repository's. The emitted label must be the
+    -- submodule's. A wiring that reached past its seam for an "outer" value
+    -- would re-create the exact sha-space merge the field exists to prevent.
+    local SUBMODULE_ROOT = ("1"):rep(40)
+    local handle, events = start({
+      ["rev-list --max-parents=0 --first-parent HEAD"] = { ok = true, out = SUBMODULE_ROOT },
+    })
+    handle._on_head_change()
+    assert.equals(SUBMODULE_ROOT, events[1].data.root_commit_sha)
+    assert.are_not.equals(ROOT, events[1].data.root_commit_sha)
+
+    -- ...and two handles on two different seams get two different labels,
+    -- rather than one of them adopting the other's.
+    local other_dir = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(other_dir .. "/.git", "p")
+    local other_events = {}
+    local other = git_wiring.start({
+      workspace = other_dir,
+      emit = function(kind, data)
+        table.insert(other_events, { kind = kind, data = data })
+      end,
+      run_git = function(args)
+        local key = table.concat(args, " ")
+        if key == "rev-parse HEAD" then
+          return { ok = true, out = SHA }
+        elseif key == "rev-parse --is-shallow-repository" then
+          return { ok = true, out = "false" }
+        elseif key == "rev-list --max-parents=0 --first-parent HEAD" then
+          return { ok = true, out = ROOT }
+        end
+        return { ok = false, out = "" }
+      end,
+    })
+    table.insert(handles, other)
+    other._on_head_change()
+    assert.equals(ROOT, other_events[1].data.root_commit_sha)
+    assert.are_not.equals(
+      other_events[1].data.root_commit_sha,
+      events[1].data.root_commit_sha
+    )
+    pcall(vim.fn.delete, other_dir, "rf")
+  end)
+
+  it("OMITS — never nulls — on a shallow clone", function()
+    local handle, events = start({
+      ["rev-parse --is-shallow-repository"] = { ok = true, out = "true" },
+    })
+    handle._on_head_change()
+    -- Absent, and absent means the key is not in the table at all. In Lua a
+    -- table cannot hold nil, so `is_nil` here IS the omission assertion — but
+    -- the canonical bytes are what actually matter, and the conformance suite
+    -- pins those against the vector's absent case.
+    assert.is_nil(events[1].data.root_commit_sha)
+    assert.same({ "branch", "commit_sha", "operation", "parents", "sha" }, (function()
+      local keys = {}
+      for k in pairs(events[1].data) do
+        keys[#keys + 1] = k
+      end
+      table.sort(keys)
+      return keys
+    end)())
+  end)
+
+  it("OMITS on any derivation failure, and still emits the event", function()
+    -- Witnessing the repository is optional; recording is not. Every failure
+    -- costs the label and nothing else.
+    for _, override in ipairs({
+      { ["rev-parse --is-shallow-repository"] = { ok = false, out = "" } },
+      { ["rev-list --max-parents=0 --first-parent HEAD"] = { ok = false, out = "" } },
+      { ["rev-list --max-parents=0 --first-parent HEAD"] = { ok = true, out = "" } },
+      { ["rev-list --max-parents=0 --first-parent HEAD"] = { ok = true, out = "/Users/s/proj" } },
+      { ["rev-list --max-parents=0 --first-parent HEAD"] = { ok = true, out = ("A"):rep(40) } },
+    }) do
+      local handle, events = start(override)
+      handle._on_head_change()
+      assert.equals(1, #events)
+      assert.equals(SHA, events[1].data.sha)
+      assert.is_nil(events[1].data.root_commit_sha)
+    end
+  end)
+
+  it("a throwing run_git at setup degrades to an unlabelled, still-recording session", function()
+    local events = {}
+    local handle = git_wiring.start({
+      workspace = dir,
+      emit = function(kind, data)
+        table.insert(events, { kind = kind, data = data })
+      end,
+      run_git = function(args)
+        if args[1] == "rev-parse" and args[2] == "--is-shallow-repository" then
+          error("boom")
+        end
+        if args[1] == "rev-parse" and args[2] == "HEAD" then
+          return { ok = true, out = SHA }
+        end
+        return { ok = true, out = ".git" }
+      end,
+    })
+    table.insert(handles, handle)
+    assert.is_true(handle.active)
+    assert.has_no.errors(function()
+      handle._on_head_change()
+    end)
+    assert.equals(1, #events)
+    assert.is_nil(events[1].data.root_commit_sha)
+  end)
+
+  it("a value the READER would reject never reaches a payload", function()
+    -- Belt and braces: `root_commit_sha.derive` filters, and
+    -- `build_git_event` re-checks through log-core's own reader. Driven here
+    -- through the wiring so both gates are exercised end to end.
+    local git_event = require("provenance.core.git_event")
+    for _, bad in ipairs({
+      "/Users/student/cs61b/proj2",
+      "git@github.com:acme/proj.git",
+      ("A"):rep(40),
+      "9999999",
+      "",
+    }) do
+      assert.is_false(git_event.is_usable_discriminator(bad))
+      local handle, events = start({
+        ["rev-list --max-parents=0 --first-parent HEAD"] = { ok = true, out = bad },
+      })
+      handle._on_head_change()
+      assert.is_nil(events[1].data.root_commit_sha, "leaked: " .. bad)
+    end
+  end)
+
+  it("a workspace with no repo derives nothing and spawns no git for it", function()
+    local no_repo = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(no_repo, "p")
+    local calls = {}
+    local handle = git_wiring.start({
+      workspace = no_repo,
+      emit = function() end,
+      run_git = function(args)
+        table.insert(calls, table.concat(args, " "))
+        return { ok = false, out = "" }
+      end,
+    })
+    table.insert(handles, handle)
+    assert.is_false(handle.active)
+    assert.equals(0, count(calls, "rev-list --max-parents=0 --first-parent HEAD"))
+    pcall(vim.fn.delete, no_repo, "rf")
   end)
 end)
