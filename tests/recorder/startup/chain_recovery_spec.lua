@@ -2,8 +2,16 @@ local chain_recovery = require("provenance.recorder.startup.chain_recovery")
 local hc = require("provenance.core.hash_chain")
 local envelope = require("provenance.core.envelope")
 local ndjson = require("provenance.core.ndjson")
+local clock = require("provenance.core.clock")
 
 local FIXED_NOW = "2026-05-19T14-30-00.000Z"
+
+--- Wall clock of the session.start of a built chain, epoch ms
+--- (2026-01-01T00:00:00.000Z), and one day in ms. Selection is by
+--- `session.start.wall`, so every example that has more than one candidate
+--- says which session actually ran last by choosing these.
+local BASE_WALL_MS = 1767225600000
+local DAY_MS = 86400000
 
 local function fixed_now()
   return FIXED_NOW
@@ -55,20 +63,23 @@ end
 --- A valid chain: session.start (data.session_id = id) ... optionally
 --- ending on session.end. `middle_kind` lets a dangling case end on a
 --- non-terminal event.
-local function build_chain(session_id, with_end)
+--- `start_wall_ms` sets the session.start wall; later entries step forward 1s
+--- each so the chain's own monotonic-wall check still passes.
+local function build_chain(session_id, with_end, start_wall_ms)
+  local wall0 = start_wall_ms or BASE_WALL_MS
   local e0 = hc.chain_entry(
     hc.GENESIS_PREV_HASH,
-    envelope.new(0, 0, "2026-01-01T00:00:00.000Z", "session.start", { session_id = session_id })
+    envelope.new(0, 0, clock.format_wall(wall0), "session.start", { session_id = session_id })
   )
   local e1 = hc.chain_entry(
     e0.hash,
-    envelope.new(1, 1000, "2026-01-01T00:00:01.000Z", "doc.change", { path = "a.py" })
+    envelope.new(1, 1000, clock.format_wall(wall0 + 1000), "doc.change", { path = "a.py" })
   )
   local entries = { e0, e1 }
   if with_end then
     local e2 = hc.chain_entry(
       e1.hash,
-      envelope.new(2, 2000, "2026-01-01T00:00:02.000Z", "session.end", { reason = "seal" })
+      envelope.new(2, 2000, clock.format_wall(wall0 + 2000), "session.end", { reason = "seal" })
     )
     entries[#entries + 1] = e2
   end
@@ -91,18 +102,38 @@ describe("chain_recovery.recover_previous_session", function()
     assert.same({ kind = "clean_start" }, decision)
   end)
 
-  it("picks the alphabetically-last .slog when unsorted and multiple exist", function()
-    local chain_c = build_chain("id-c", true)
+  it("picks the .slog whose session.start wall is LATEST, not the alphabetically last", function()
+    -- The filename uuid is minted independently of the session id (the two-uuid
+    -- rule), so alphabetical order says nothing about which session ran last.
+    -- All three chains here are valid; only the wall separates them, and the
+    -- winner is the file that sorts FIRST.
     local deps = make_deps({
+      names = { "session-b.slog", "session-a.slog", "session-c.slog" },
+      slog_texts = {
+        ["session-a.slog"] = serialize(build_chain("id-a", true, BASE_WALL_MS + 2 * DAY_MS)),
+        ["session-b.slog"] = serialize(build_chain("id-b", true, BASE_WALL_MS)),
+        ["session-c.slog"] = serialize(build_chain("id-c", true, BASE_WALL_MS + DAY_MS)),
+      },
+    })
+    local decision = chain_recovery.recover_previous_session(deps)
+    assert.same({ kind = "previous_session_complete", prev_session_id = "id-a" }, decision)
+  end)
+
+  it("falls back to the alphabetically last .slog when nothing has a parseable wall", function()
+    -- Every file is unorderable garbage. There is nothing to sort by, and the
+    -- quarantine path still needs one deterministic target.
+    local deps, rename_calls = make_deps({
       names = { "session-b.slog", "session-a.slog", "session-c.slog" },
       slog_texts = {
         ["session-a.slog"] = "garbage that would fail to parse {not ndjson",
         ["session-b.slog"] = "garbage that would fail to parse {not ndjson",
-        ["session-c.slog"] = serialize(chain_c),
+        ["session-c.slog"] = "garbage that would fail to parse {not ndjson",
       },
     })
     local decision = chain_recovery.recover_previous_session(deps)
-    assert.same({ kind = "previous_session_complete", prev_session_id = "id-c" }, decision)
+    assert.equals("previous_session_corrupt", decision.kind)
+    assert.equals(1, #rename_calls)
+    assert.equals("session-c.slog", rename_calls[1].from)
   end)
 
   it("returns previous_session_complete when the chain's last entry is session.end", function()
@@ -246,26 +277,27 @@ describe("chain_recovery.recover_previous_session — shared repo ownership", fu
   --- A real chained slog whose session.start carries `student_ref`.
   --- `with_end = false` leaves it DANGLING, which is what a partner whose
   --- editor is open right now looks like on disk.
-  local function build_attributed_chain(session_id, student_ref, with_end)
+  local function build_attributed_chain(session_id, student_ref, with_end, start_wall_ms)
     local data = { session_id = session_id }
     if student_ref ~= nil then
       data.identity = {
         enrollment = { student_ref = student_ref, course_id = "berkeley-cs61b" },
       }
     end
+    local wall0 = start_wall_ms or BASE_WALL_MS
     local e0 = hc.chain_entry(
       hc.GENESIS_PREV_HASH,
-      envelope.new(0, 0, "2026-01-01T00:00:00.000Z", "session.start", data)
+      envelope.new(0, 0, clock.format_wall(wall0), "session.start", data)
     )
     local e1 = hc.chain_entry(
       e0.hash,
-      envelope.new(1, 1000, "2026-01-01T00:00:01.000Z", "doc.change", { path = "a.py" })
+      envelope.new(1, 1000, clock.format_wall(wall0 + 1000), "doc.change", { path = "a.py" })
     )
     local entries = { e0, e1 }
     if with_end then
       entries[#entries + 1] = hc.chain_entry(
         e1.hash,
-        envelope.new(2, 2000, "2026-01-01T00:00:02.000Z", "session.end", { reason = "seal" })
+        envelope.new(2, 2000, clock.format_wall(wall0 + 2000), "session.end", { reason = "seal" })
       )
     end
     return serialize(entries)
@@ -275,8 +307,8 @@ describe("chain_recovery.recover_previous_session — shared repo ownership", fu
   --- FIRST LINE is intact and names them. That is the realistic shape: the
   --- header is written once at session start; the tail is what a copy catches
   --- half-done — and it is precisely the shape the old code renamed.
-  local function truncated_partner_log(student_ref)
-    local full = build_attributed_chain("bob-live", student_ref, false)
+  local function truncated_partner_log(student_ref, start_wall_ms)
+    local full = build_attributed_chain("bob-live", student_ref, false, start_wall_ms)
     return full:sub(1, #full - 20)
   end
 
@@ -295,15 +327,16 @@ describe("chain_recovery.recover_previous_session — shared repo ownership", fu
     assert.same({ kind = "clean_start" }, decision)
   end)
 
-  it("a partner's log sorting alphabetically last does not become 'the previous session'", function()
-    -- Alice's own crashed session sorts FIRST; Bob's sorts last. The filename
-    -- is a uuid minted on someone else's machine and carries no information
-    -- about whose session it is, let alone which came first.
+  it("a partner's log does not become 'the previous session', even as the newest file", function()
+    -- Alice's own crashed session sorts FIRST and is the OLDER of the two;
+    -- Bob's sorts last and is the more recent. Ownership outranks ordering, so
+    -- neither the filename nor the wall can promote a file this recorder cannot
+    -- prove is its own.
     local deps, rename_calls = make_deps({
       names = { "session-aaa-alice.slog", "session-zzz-bob.slog" },
       slog_texts = {
-        ["session-aaa-alice.slog"] = build_attributed_chain("alice-crashed", ALICE, false),
-        ["session-zzz-bob.slog"] = build_attributed_chain("bob-session", BOB, false),
+        ["session-aaa-alice.slog"] = build_attributed_chain("alice-crashed", ALICE, false, BASE_WALL_MS),
+        ["session-zzz-bob.slog"] = build_attributed_chain("bob-session", BOB, false, BASE_WALL_MS + DAY_MS),
       },
       own_student_ref = ALICE,
     })
@@ -313,6 +346,27 @@ describe("chain_recovery.recover_previous_session — shared repo ownership", fu
     assert.equals("previous_session_dangling", decision.kind)
     assert.equals("alice-crashed", decision.prev_session_id)
     assert.equals("session-aaa-alice.slog", decision.dangling_path)
+    assert.equals(0, #rename_calls)
+  end)
+
+  it("among this contributor's OWN files the latest wall wins, not the last filename", function()
+    -- The back-pointer has to name the session that actually preceded this one.
+    -- Alice's most recent session sorts first, her older completed one sorts
+    -- last, and Bob's — newer than both — sorts in the middle.
+    local deps, rename_calls = make_deps({
+      names = { "session-a-alice.slog", "session-m-bob.slog", "session-z-alice.slog" },
+      slog_texts = {
+        ["session-a-alice.slog"] = build_attributed_chain("alice-newest", ALICE, false, BASE_WALL_MS + 2 * DAY_MS),
+        ["session-m-bob.slog"] = build_attributed_chain("bob-newest", BOB, false, BASE_WALL_MS + 3 * DAY_MS),
+        ["session-z-alice.slog"] = build_attributed_chain("alice-older", ALICE, true, BASE_WALL_MS),
+      },
+      own_student_ref = ALICE,
+    })
+
+    local decision = chain_recovery.recover_previous_session(deps)
+
+    assert.equals("previous_session_dangling", decision.kind)
+    assert.equals("alice-newest", decision.prev_session_id)
     assert.equals(0, #rename_calls)
   end)
 
@@ -481,11 +535,16 @@ describe("chain_recovery.recover_previous_session — shared repo ownership", fu
     -- behaviour is what remains. This test exists so the gap is visible in the
     -- suite, and so closing it (enrollment, or peer witnessing) shows up here
     -- as a deliberate change rather than a surprise.
+    -- The partner's log is the most recent thing in the directory and its first
+    -- line is intact, so wall order selects it; the truncated tail then fails to
+    -- parse and the quarantine lands on their evidence.
+    local partner_head =
+      build_attributed_chain("partner-live", nil, false, BASE_WALL_MS + DAY_MS):match("^[^\n]*\n")
     local deps, rename_calls = make_deps({
       names = { "session-a-mine.slog", "session-z-partner.slog" },
       slog_texts = {
-        ["session-a-mine.slog"] = build_attributed_chain("mine", nil, false),
-        ["session-z-partner.slog"] = "{partner log, mid-write",
+        ["session-a-mine.slog"] = build_attributed_chain("mine", nil, false, BASE_WALL_MS),
+        ["session-z-partner.slog"] = partner_head .. "{partner log, mid-write",
       },
       own_student_ref = nil,
     })

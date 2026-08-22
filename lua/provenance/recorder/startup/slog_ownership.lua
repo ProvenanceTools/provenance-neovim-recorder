@@ -93,6 +93,47 @@
 --- able to touch anything it cannot prove is its own.
 ---
 --- ===========================================================================
+--- SELECTION AMONG ELIGIBLE FILES: LATEST `session.start.wall`
+--- ===========================================================================
+---
+--- Ownership decides WHICH files may be touched; this decides which of them is
+--- "the previous session". It is the latest parseable `session.start.wall`,
+--- ties broken on filename descending — the same rule as the VS Code twin
+--- (`recorder/src/startup/chain-recovery.ts`, `chooseMostRecentOwnSlog`).
+---
+--- This port used to take the alphabetically LAST eligible filename. That is
+--- wrong wherever filename order disagrees with recording order, which is
+--- always: the `.slog` filename carries a uuid minted independently of the
+--- session's own `session_id` (the two-uuid rule), so it encodes nothing about
+--- when the session ran. The VS Code recorder observed the consequence on a
+--- real 10-session bundle — six consecutive sessions all reporting the same
+--- `prev_session_id`, because one file happened to sort last and kept winning.
+--- It is also a cross-port question, not a local one: three recorders that
+--- disagree about which log resumes give a student who switches editors
+--- different recovery behaviour out of the same directory.
+---
+--- Cost: one first-line read per ELIGIBLE file, since which one is latest
+--- cannot be known without looking at all of them. The old scan walked
+--- backwards and stopped at the first eligible file — one read in the solo
+--- case — but that shortcut IS alphabetical-last, so it cannot be kept.
+--- `.provenance/` holds one file per session for one assignment, and a
+--- partner's files are classified on their first line and then dropped.
+---
+--- FALLBACK: when no eligible file yields a parseable `session.start` wall we
+--- return the alphabetically last ELIGIBLE name, so `chain_recovery`'s corrupt
+--- path still runs on something we are entitled to touch. When nothing is
+--- eligible we return nil and every file stays where it is.
+---
+--- DELIBERATE DELTA from the VS Code twin, in the safe direction: there the
+--- head parse is all-or-nothing, so a `session.start` whose `wall` does not
+--- parse also loses its `student_ref` and reads as `unattributed` — which an
+--- unenrolled recorder may quarantine. Here ownership is read off
+--- `student_ref` alone and never depends on the wall, so a malformed wall
+--- costs a file its place in the ORDER and nothing else. No Provenance
+--- recorder writes a malformed wall; if one ever does, this port refuses to
+--- touch the file rather than adopting it.
+---
+--- ===========================================================================
 --- NO WRITE-CAPABLE SEAM
 --- ===========================================================================
 ---
@@ -101,6 +142,12 @@
 --- delete and no write reachable from this module even by mistake, so the
 --- scan that decides ownership physically cannot act on a file it is in the
 --- middle of classifying.
+---
+--- `course_cert` is required only for `parse_iso_instant_ms` — the repo's ONE
+--- ISO 8601 parser, shared with the cert windows so the three implementations
+--- keep one accepting set. This module does no cert work.
+local course_cert = require("provenance.core.course_cert")
+
 local M = {}
 
 --- Table-typed field access that treats `vim.NIL`, scalars and absent keys
@@ -135,15 +182,15 @@ local function student_ref_of_payload(data)
   return nil
 end
 
---- The `student_ref` a `.slog` claims, read from its FIRST LINE only.
+--- Decode a `.slog`'s FIRST LINE if and only if it is a `session.start`.
 ---
---- Returns nil for anything that is not a parseable `session.start` carrying a
---- non-empty `student_ref` — including a nil `text`, i.e. a file that could
---- not be read at all. A file we cannot read cannot tell us whose it is, so it
---- is `unattributed`, never `own`.
+--- One line is enough — `session.start` is always seq 0 — and startup cost
+--- must not scale with the size of a partner's log. Returns nil for a nil
+--- text (a file that could not be read at all), a blank or non-JSON line, or
+--- any other event kind.
 --- @param text string|nil  raw `.slog` bytes
---- @return string|nil
-function M.student_ref_of_slog_text(text)
+--- @return table|nil  the decoded `session.start` entry
+local function decode_session_start_head(text)
   if type(text) ~= "string" then
     return nil
   end
@@ -158,7 +205,35 @@ function M.student_ref_of_slog_text(text)
   if decoded.kind ~= "session.start" then
     return nil
   end
-  return student_ref_of_payload(decoded.data)
+  return decoded
+end
+
+--- The `session.start.wall` of an already-decoded head, as epoch ms, or nil
+--- when it is absent or does not parse. nil means "not an ordering candidate";
+--- it never means "not ours" — see the DELIBERATE DELTA note in the header.
+--- @param head table|nil
+--- @return number|nil
+local function wall_ms_of_head(head)
+  if head == nil or type(head.wall) ~= "string" then
+    return nil
+  end
+  return course_cert.parse_iso_instant_ms(head.wall)
+end
+
+--- The `student_ref` a `.slog` claims, read from its FIRST LINE only.
+---
+--- Returns nil for anything that is not a parseable `session.start` carrying a
+--- non-empty `student_ref` — including a nil `text`, i.e. a file that could
+--- not be read at all. A file we cannot read cannot tell us whose it is, so it
+--- is `unattributed`, never `own`.
+--- @param text string|nil  raw `.slog` bytes
+--- @return string|nil
+function M.student_ref_of_slog_text(text)
+  local head = decode_session_start_head(text)
+  if head == nil then
+    return nil
+  end
+  return student_ref_of_payload(head.data)
 end
 
 --- @param own_student_ref string|nil        this session's ref, nil = unenrolled
@@ -193,16 +268,13 @@ function M.is_eligible(ownership, own_student_ref)
   return own_student_ref == nil
 end
 
---- Walk an ALREADY-SORTED list of `.slog` paths from the end and return the
---- first ELIGIBLE one, with the text already read so the caller need not
---- re-read it.
+--- Scan an ALREADY-SORTED list of `.slog` paths and return the ELIGIBLE one
+--- whose `session.start.wall` is latest, with the text already read so the
+--- caller need not re-read it. See "SELECTION AMONG ELIGIBLE FILES" above for
+--- the rule, the fallback, and why alphabetical order was retired.
 ---
---- Walking from the end preserves this port's documented "alphabetically last
---- wins" tie-break (see `chain_recovery.lua`) restricted to eligible files,
---- and it means the solo case still reads exactly ONE file — the ownership
---- gate costs a solo student nothing. In a shared repo we read backwards past
---- the partner's logs until we reach one of our own; each such read is one
---- file, first line parsed, text discarded.
+--- At most two texts are alive at once (the current best and the current
+--- fallback); a partner's log is classified on its first line and dropped.
 ---
 --- @param read_slog function  (path) -> string|nil. READ ONLY: this is the
 ---   entire capability this scan is given, so a foreign file cannot be renamed,
@@ -212,7 +284,12 @@ end
 --- @return table|nil  { path = string, text = string|nil }, or nil when no
 ---   candidate is eligible (every file in the directory is someone else's)
 function M.select_eligible(read_slog, sorted_paths, own_student_ref)
-  for i = #sorted_paths, 1, -1 do
+  -- The latest-wall eligible candidate, and the alphabetically last eligible
+  -- name regardless of whether it could be ordered.
+  local best = nil
+  local fallback = nil
+
+  for i = 1, #sorted_paths do
     local path = sorted_paths[i]
     -- A read failure is not an error here: it yields a nil text, which reads
     -- as `unattributed`, which an enrolled recorder is not allowed to touch.
@@ -220,12 +297,37 @@ function M.select_eligible(read_slog, sorted_paths, own_student_ref)
     if not read_ok then
       text = nil
     end
-    local ownership = M.classify(own_student_ref, M.student_ref_of_slog_text(text))
-    if M.is_eligible(ownership, own_student_ref) then
-      return { path = path, text = text }
+
+    local head = decode_session_start_head(text)
+    local candidate_ref = nil
+    if head ~= nil then
+      candidate_ref = student_ref_of_payload(head.data)
+    end
+
+    -- A foreign file is dropped HERE, before it can be selected, linked or
+    -- (downstream) renamed. Everything below sees our own sessions only.
+    if M.is_eligible(M.classify(own_student_ref, candidate_ref), own_student_ref) then
+      -- sorted_paths is ascending, so the last eligible file seen is the
+      -- alphabetically last eligible one.
+      fallback = { path = path, text = text }
+
+      local wall = wall_ms_of_head(head)
+      if wall ~= nil then
+        -- Ties (two sessions starting in the same millisecond) fall back to
+        -- filename order, so the choice stays deterministic.
+        if best == nil or wall > best.wall or (wall == best.wall and path > best.path) then
+          best = { path = path, text = text, wall = wall }
+        end
+      end
     end
   end
-  return nil
+
+  if best ~= nil then
+    return { path = best.path, text = best.text }
+  end
+  -- Nothing orderable. The fallback keeps the corrupt path running on a file
+  -- we are entitled to touch; nil means the whole directory is someone else's.
+  return fallback
 end
 
 return M

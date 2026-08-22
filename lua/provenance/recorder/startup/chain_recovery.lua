@@ -3,10 +3,13 @@
 --- logic over injected deps — no vim.uv/fs here (that deps layer + the
 --- activation wiring that actually calls this land in Task 5).
 ---
---- Decision — multiple .slog files / tie-breaking: alphabetically-last
---- ELIGIBLE file (deterministic, no stat()/TOCTOU). See OWNERSHIP below for
---- what "eligible" means; before that gate existed this was simply
---- "alphabetically last", which is the whole of decision-log bug 2.
+--- Decision — multiple .slog files: the previous session is the ELIGIBLE file
+--- whose `session.start.wall` is latest, ties broken on filename descending,
+--- with the alphabetically last ELIGIBLE name as the fallback when nothing is
+--- orderable. Both halves of that — what "eligible" means, and why selection
+--- is by wall rather than by filename — live in `startup/slog_ownership.lua`;
+--- read it there rather than re-deriving it here. No stat(), no TOCTOU: the
+--- ordering value is the one the previous session RECORDED.
 ---
 --- Decision — this function only REPORTS facts. It never resumes or
 --- truncates a chain, and it never emits `chain.broken` — that event is
@@ -45,9 +48,10 @@
 ---
 --- Consequences for this module, one line each:
 ---
----   - Selection considers ELIGIBLE files only. A foreign `.slog` is dropped
----     before anything else can happen to it: never selected, never linked,
----     never renamed, never read past its first line.
+---   - Selection considers ELIGIBLE files only, and ownership outranks
+---     ordering: a foreign `.slog` is dropped before anything else can happen
+---     to it — never selected, never linked, never renamed, never read past
+---     its first line — however recent it is.
 ---   - `quarantine()` is therefore unreachable for a foreign file — it can
 ---     only ever be called with the path `select_eligible` returned, and the
 ---     scan that produces that path is handed a read function and nothing else.
@@ -61,13 +65,6 @@
 --- separate them, and both defects above remain reachable in that one
 --- configuration. Nothing in this module can close it — see
 --- `slog_ownership.lua`.
----
---- NOT CHANGED HERE, deliberately: selection among eligible files is still
---- alphabetically-last rather than by `session.start.wall`. The VS Code
---- recorder moved to wall ordering for a DIFFERENT bug (one stale filename
---- winning repeatedly). Restricted to a single contributor's own files, that
---- mis-ordering costs at most a wrong-but-own back-pointer, and reordering is
---- a separate change from fixing ownership.
 local ndjson = require("provenance.core.ndjson")
 local chain_validator = require("provenance.core.chain_validator")
 local slog_ownership = require("provenance.recorder.startup.slog_ownership")
@@ -107,10 +104,9 @@ local function decide(deps)
     return { kind = "clean_start" }
   end
 
-  -- Sorted ascending so that "alphabetically last" is well defined;
-  -- select_eligible walks it backwards and stops at the first file this
-  -- recorder is entitled to touch. In the solo case that is the last file and
-  -- exactly one read, so the ownership gate costs a solo student nothing.
+  -- Sorted ascending so both the wall tie-break and the alphabetically-last
+  -- fallback are well defined; select_eligible scans it and returns the
+  -- eligible file with the latest recorded session.start wall.
   --
   -- `deps.read_slog` is passed on its own: the scan gets a read capability and
   -- no other, so a partner's `.slog` cannot be renamed from inside it.

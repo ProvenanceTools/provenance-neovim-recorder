@@ -26,7 +26,7 @@ local function session_start_line(opts)
   return vim.json.encode({
     seq = 0,
     t = 0,
-    wall = "2026-01-01T00:00:00.000Z",
+    wall = opts.wall or "2026-01-01T00:00:00.000Z",
     kind = opts.kind or "session.start",
     data = data,
     prev_hash = ("00"):rep(32),
@@ -137,14 +137,77 @@ describe("slog_ownership.select_eligible", function()
       reads
   end
 
-  it("returns the alphabetically LAST eligible file, not the alphabetically last file", function()
+  it("returns the LATEST session.start wall among eligible files, not the alphabetically last", function()
+    -- Alice's OLDER session sorts LAST and her NEWER one sorts FIRST. That is
+    -- not a contrived arrangement: the filename uuid is minted independently of
+    -- the session id (the two-uuid rule), so filename order carries no
+    -- information about recording order and disagrees with it routinely.
     local read, _ = reader({
-      ["a.slog"] = session_start_line({ student_ref = ALICE }),
-      ["z.slog"] = session_start_line({ student_ref = BOB }),
+      ["a.slog"] = session_start_line({ student_ref = ALICE, wall = "2026-03-02T09:00:00.000Z" }),
+      ["z.slog"] = session_start_line({ student_ref = ALICE, wall = "2026-03-01T09:00:00.000Z" }),
     })
     local selected = slog_ownership.select_eligible(read, { "a.slog", "z.slog" }, ALICE)
     assert.is_not_nil(selected)
     assert.equals("a.slog", selected.path)
+  end)
+
+  it("a partner's file is skipped whatever its wall and whatever its sort position", function()
+    -- Ownership outranks ordering. Bob's session is both alphabetically last
+    -- AND the most recent one in the directory, and it is still not a candidate.
+    local read, _ = reader({
+      ["a.slog"] = session_start_line({ student_ref = ALICE, wall = "2026-03-01T09:00:00.000Z" }),
+      ["z.slog"] = session_start_line({ student_ref = BOB, wall = "2026-03-09T09:00:00.000Z" }),
+    })
+    local selected = slog_ownership.select_eligible(read, { "a.slog", "z.slog" }, ALICE)
+    assert.is_not_nil(selected)
+    assert.equals("a.slog", selected.path)
+  end)
+
+  it("falls back to the alphabetically last ELIGIBLE file when no eligible wall parses", function()
+    -- Nothing here can be ordered, but the corrupt/quarantine path downstream
+    -- still has to run on a file we are entitled to touch, so the fallback is
+    -- a name, never "give up".
+    local read, _ = reader({
+      ["a.slog"] = "{mid-write garbage",
+      ["z.slog"] = "<<<<<<< HEAD\n",
+    })
+    local selected = slog_ownership.select_eligible(read, { "a.slog", "z.slog" }, nil)
+    assert.is_not_nil(selected)
+    assert.equals("z.slog", selected.path)
+  end)
+
+  it("the fallback is an ELIGIBLE name, never a partner's file", function()
+    local read, _ = reader({
+      ["a.slog"] = "{our own mid-write garbage",
+      ["z.slog"] = session_start_line({ student_ref = BOB, wall = "2026-03-09T09:00:00.000Z" }),
+    })
+    local selected = slog_ownership.select_eligible(read, { "a.slog", "z.slog" }, nil)
+    assert.is_not_nil(selected)
+    assert.equals("a.slog", selected.path)
+  end)
+
+  it("prefers an orderable eligible file over the alphabetically last unorderable one", function()
+    local text = session_start_line({ student_ref = ALICE })
+    local read, _ = reader({
+      ["a.slog"] = text,
+      ["z.slog"] = session_start_line({ student_ref = ALICE, wall = "not-a-timestamp" }),
+    })
+    local selected = slog_ownership.select_eligible(read, { "a.slog", "z.slog" }, ALICE)
+    assert.equals("a.slog", selected.path)
+    assert.equals(text, selected.text)
+  end)
+
+  it("an unparseable wall costs a file its place in the ORDER, never its ownership", function()
+    -- Deliberate, documented delta from the VS Code twin, in the safe
+    -- direction. There the head parse is all-or-nothing, so a `session.start`
+    -- whose `wall` does not parse also loses its `student_ref` and reads as
+    -- `unattributed` — which an UNENROLLED recorder may quarantine. Here
+    -- ownership is read off `student_ref` alone, so a partner's log with a
+    -- malformed wall is still foreign and still untouchable.
+    local read, _ = reader({
+      ["z.slog"] = session_start_line({ student_ref = BOB, wall = "not-a-timestamp" }),
+    })
+    assert.is_nil(slog_ownership.select_eligible(read, { "z.slog" }, nil))
   end)
 
   it("returns nil when every file in the directory is someone else's", function()
@@ -163,7 +226,7 @@ describe("slog_ownership.select_eligible", function()
     assert.equals(1, #reads)
   end)
 
-  it("the solo case still costs exactly one read", function()
+  it("breaks a wall tie on filename DESCENDING, so the choice stays deterministic", function()
     local read, reads = reader({
       ["a.slog"] = session_start_line(),
       ["b.slog"] = session_start_line(),
@@ -171,7 +234,11 @@ describe("slog_ownership.select_eligible", function()
     })
     local selected = slog_ownership.select_eligible(read, { "a.slog", "b.slog", "c.slog" }, nil)
     assert.equals("c.slog", selected.path)
-    assert.equals(1, #reads)
+    -- Wall order costs one first-line read per candidate: which file is latest
+    -- cannot be known without looking at all of them. This replaces the old
+    -- walk-backwards-and-stop scan, which was one read in the solo case but
+    -- was alphabetical-last by construction.
+    assert.equals(3, #reads)
   end)
 
   it("an unreadable file is unattributed, so an enrolled recorder skips it", function()
