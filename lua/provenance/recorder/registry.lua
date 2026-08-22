@@ -120,6 +120,23 @@ function M.new(opts)
     return sessions[root]
   end
 
+  --- Every started session's identity outcome, for `status.lua` and the enroll
+  --- nudge. A controller that predates the identity wiring (or whose start was
+  --- given no identity store) simply contributes nothing -- "we never asked" is
+  --- not "they are not enrolled", and neither surface may turn the first into
+  --- the second.
+  --- @return table[]  { kind = "emitted"|"skipped", ... }
+  function reg.identity_outcomes()
+    local out = {}
+    for _, entry in pairs(sessions) do
+      local outcome = entry.controller and entry.controller._identity_outcome
+      if type(outcome) == "table" then
+        out[#out + 1] = outcome
+      end
+    end
+    return out
+  end
+
   --- @return table[]  { root, manifest, controller }, sorted by root ascending
   function reg.list()
     local out = {}

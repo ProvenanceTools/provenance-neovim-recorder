@@ -27,6 +27,7 @@
 --- the logic is testable without capturing `vim.notify` (CLAUDE.md: test the
 --- transform as a pure function, separately from the editor wiring).
 local student_keys = require("provenance.core.student_keys")
+local enroll_nudge = require("provenance.recorder.enroll_nudge")
 
 local M = {}
 
@@ -104,8 +105,11 @@ function M.request(opts)
       .. "  student_pubkey: "
       .. keypair.public_key_hex
       .. "\n"
-      .. "Paste that key into your institution's Provenance enrolment page. It\n"
-      .. "will return a JSON credential; import it with :ProvenanceEnrollmentImport.\n"
+      .. "Paste that key into your institution's Provenance enrolment page:\n"
+      .. "  "
+      .. enroll_nudge.ENROLL_URL
+      .. "  (:ProvenanceEnroll opens it)\n"
+      .. "It will return a JSON credential; import it with :ProvenanceEnrollmentImport.\n"
       .. "One key, one credential, every course — you only do this once.\n"
       .. "NEVER paste your identity SECRET there (:ProvenanceIdentityExport)."
   )

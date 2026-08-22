@@ -16,6 +16,7 @@ local registry_mod = require("provenance.recorder.registry")
 local secret_store = require("provenance.recorder.identity.secret_store")
 local key_cache_mod = require("provenance.recorder.identity.key_cache")
 local enrollment_cmd = require("provenance.recorder.commands.enrollment")
+local enroll_nudge_ui = require("provenance.recorder.enroll_nudge_ui")
 
 local M = {}
 
@@ -58,6 +59,12 @@ function M.setup(opts)
   --- Resolve a single anchor directory and, if active, ensure its session
   --- exists in the registry. Idempotent (registry.ensure_session already
   --- guards against double-starting the same root).
+  -- The enrollment nudge is considered at most ONCE per Neovim process. Without
+  -- this guard it would re-read its state file on every BufEnter, since that is
+  -- how often activation is re-resolved.
+  local nudge_considered = false
+  local nudge_deps = opts.enroll_nudge_deps
+
   local function resolve_and_activate(start_dir)
     local result = resolve(start_dir, resolve_opts)
     if result.status == "active" then
@@ -66,6 +73,15 @@ function M.setup(opts)
         identity_store = identity_store,
         identity_key_cache = identity_key_cache,
       })
+      -- Deferred: `ensure_session` has just returned, so the outcome exists, but
+      -- a notification fired synchronously from a BufEnter autocmd lands while
+      -- the student is mid-keystroke. `vim.schedule` puts it on the next tick.
+      if not nudge_considered then
+        nudge_considered = true
+        vim.schedule(function()
+          enroll_nudge_ui.maybe_nudge(registry, nudge_deps)
+        end)
+      end
     end
     return result
   end
@@ -266,6 +282,13 @@ function M.setup(opts)
           store = identity_store,
           key_cache = identity_key_cache,
         })
+      end,
+    },
+    ProvenanceEnroll = {
+      desc = "Provenance: open your institution's enrolment page in a browser",
+      nargs = 0,
+      run = function()
+        return enroll_nudge_ui.open_enroll_page()
       end,
     },
     ProvenanceEnrollmentImport = {
