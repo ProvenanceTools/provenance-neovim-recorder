@@ -419,4 +419,141 @@ function M.check_institution_cert_window(cert, at)
   return shapes.check_window(cert.valid_from, cert.valid_until, at)
 end
 
+-- ---------------------------------------------------------------------------
+-- The 2.1 walk
+-- ---------------------------------------------------------------------------
+
+--- Narrow a shape-parse error into the chain's error vocabulary. A local copy
+--- of the identical helper in `enrollment.lua`, for the same reason the walks
+--- are copies: the two versions' error values must be free to differ.
+local function shape_error(kind, inner)
+  return {
+    kind = kind,
+    field = inner.field,
+    reason = inner.reason,
+  }
+end
+
+--- Walk the 2.1 institution-scoped identity chain.
+---
+--- Called only by `enrollment.verify_identity_chain`, which is the ONE public
+--- entry point to identity verification and routes here on the signed
+--- `enrollment_cert.format_version`. It lives in this file, next to the 2.1
+--- types, parsers and windows it uses, rather than in the 2.0 file it used to
+--- share space with.
+---
+--- The 2.0 walk (`enrollment.lua`, `walk_course_chain`) is a deliberate
+--- COPY-PASTE of this shape, not a shared generic walker over "some signed
+--- artifact". The two versions must be able to drift: 2.0 is a frozen format
+--- contract for archived bundles and is supported forever, so a fix made here
+--- must not be able to change the bytes or the error values 2.0 produces. Two
+--- similar-looking bodies is the cost of that guarantee, and it is the cheap
+--- side of the trade.
+---
+--- Steps, in an order that is load-bearing:
+---
+---  0b. Both artifacts satisfy the 2.1 shape — before any signature work,
+---      because a canonicalizer OMITS absent keys, so an artifact missing a
+---      required field would sign and verify cleanly while carrying nothing
+---      there.
+---  1.  The credential minus `institution_sig` verifies against the ANCHOR's
+---      `institution_pubkey` — never the travelling cert's copy, so a swapped
+---      cert can never introduce a key of the attacker's choosing even if step 2
+---      were somehow bypassed.
+---  2.  **The institution anchor check — the replacement for 2.0's step 3, and
+---      mandatory for the same reason.** `credential.institution_id`, the
+---      travelling cert's `institution_id`, and the anchor's must all agree, and
+---      the travelling cert must name the anchor's `institution_pubkey`. Root
+---      legitimately certifies many institutions; without this, a holder of a
+---      genuinely root-certified key for one institution can mint a credential
+---      naming ANOTHER and ship it with their own genuine cert, and every
+---      signature verifies. One signer's credential must never be replayable
+---      under another signer's authority.
+---  3.  `session_pubkey_sig` verifies against `credential.student_pubkey` over
+---      the v2 binding payload (a distinct `purpose` tag, so 2.0 and 2.1
+---      countersignatures can never be swapped).
+---  4.  Both validity windows — NON-FATAL, returned on the success value.
+function M.walk_institution_chain(identity, session_pubkey, anchor, session_started_at)
+  if type(anchor) ~= "table" then
+    return result.err({ kind = "missing_trust_anchor", required = "institution_cert" })
+  end
+
+  -- Step 0b — shape before signatures, for both artifacts.
+  local parsed_cert = M.parse_institution_cert(identity.enrollment_cert)
+  if not parsed_cert.ok then
+    return result.err(shape_error("invalid_cert_shape", parsed_cert.error))
+  end
+  local parsed_credential = M.parse_student_credential(identity.enrollment)
+  if not parsed_credential.ok then
+    return result.err(shape_error("invalid_token_shape", parsed_credential.error))
+  end
+
+  local cert = parsed_cert.value
+  local credential = parsed_credential.value
+
+  -- Step 1 — the credential verifies against the key the ROOT vouched for.
+  --
+  -- Deliberately the ANCHOR's `institution_pubkey`, never the travelling cert's.
+  -- Step 2 forces the two to be equal anyway, but reading the key from the
+  -- already-root-verified value means a swapped travelling cert can never
+  -- introduce a key of the attacker's choosing, whatever happens downstream.
+  if not M.verify_student_credential(credential, anchor.institution_pubkey) then
+    return result.err({ kind = "invalid_institution_signature" })
+  end
+
+  -- Step 2 — THE INSTITUTION ANCHOR CHECK. The replacement for 2.0's course_id
+  -- triple-comparison, and mandatory for exactly the same reason: root certifies
+  -- many institutions, so a genuine signature by a genuinely certified key
+  -- proves only WHO signed, never WHOM they were entitled to speak for.
+  -- Comparing the id at every link is what makes replaying one signer's
+  -- credential under another's authority impossible rather than merely unlikely.
+  local pubkey_mismatch = cert.institution_pubkey ~= anchor.institution_pubkey
+  if
+    credential.institution_id ~= cert.institution_id
+    or cert.institution_id ~= anchor.institution_id
+    or pubkey_mismatch
+  then
+    return result.err({
+      kind = "institution_mismatch",
+      credential_institution_id = credential.institution_id,
+      cert_institution_id = cert.institution_id,
+      anchor_institution_id = anchor.institution_id,
+      pubkey_mismatch = pubkey_mismatch,
+    })
+  end
+
+  -- Step 3 — the student key adopted THIS session key.
+  if not shapes.is_hex(session_pubkey, 64) then
+    return result.err({ kind = "invalid_session_pubkey" })
+  end
+  local binding = {
+    institution_id = credential.institution_id,
+    student_ref = credential.student_ref,
+    session_pubkey = session_pubkey,
+  }
+  if
+    not M.verify_session_binding(
+      binding,
+      identity.session_pubkey_sig,
+      credential.student_pubkey
+    )
+  then
+    return result.err({ kind = "invalid_session_pubkey_signature" })
+  end
+
+  -- Step 4 — non-fatal windows, each against its own relevant issue time.
+  return result.ok({
+    identity_version = M.FORMAT_VERSION,
+    scope = "institution",
+    institution_id = credential.institution_id,
+    student_ref = credential.student_ref,
+    student_pubkey = credential.student_pubkey,
+    institution_pubkey = anchor.institution_pubkey,
+    cert = cert,
+    credential = credential,
+    cert_window = M.check_institution_cert_window(cert, credential.issued_at),
+    token_window = M.check_credential_window(credential, session_started_at),
+  })
+end
+
 return M
