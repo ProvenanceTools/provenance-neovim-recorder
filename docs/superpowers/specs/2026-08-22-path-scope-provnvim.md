@@ -86,6 +86,10 @@ Handle count is bounded by consulting `registry.is_watched(rel)` before opening 
 
 `expected_content_registry.lua` stops taking a path list and starts taking a resolved scope. `is_watched` stops being a set lookup and becomes a `resolve_path_role` evaluation, with the deliberate side effect that a path which *would* have been admitted but for the cap flips `cap_hit`. That is the only moment the cap is observable. A path that was never in scope does not set it — the cap did not cost us that file.
 
+Two orderings inside `is_watched`, both load-bearing and both matching the monorepo: a path **already in the map** returns true without consulting the cap at all; and a path whose role is not `reviewed` returns false **before** the cap check, so hard-excluded, ignored and attachment paths can never trip `cap_hit` spuriously.
+
+**The hazard that will not announce itself.** `is_watched` returning true does not itself admit the path — `get_or_create` is what inserts into the map, and the cap tests the map's SIZE. So gating watcher-handle creation on `is_watched` while never populating the registry in lockstep leaves the map empty, the size never reaches 512, and the cap is **decorative**: unbounded handles get opened while `cap_hit` stays false forever. That is worse than having no cap, because it also writes a false `scope_capped` disclosure into a signed manifest. Whatever admits a path to a watcher handle must admit it to the registry in the same step, and a test must drive admission past the cap and assert both that admission stops *and* that `cap_hit` flips.
+
 ### 4.3 The seal has to grow a workspace walk
 
 `commands/seal.lua` and `io/rolling_seal_writer.lua` do not walk the filesystem at all today; both read straight off `files_under_review`. A `src/` entry would seal nothing. Both gain the shared walk, in one new module used by both — two copies of a walk that must agree about hard exclusions is exactly the divergence this feature exists to avoid.
