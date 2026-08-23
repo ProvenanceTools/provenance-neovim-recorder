@@ -88,7 +88,7 @@ describe("rolling_seal_writer", function()
       workspace = workspace,
       assignment_id = "proj2",
       semester = "fa26",
-      files_under_review = { "present.java", "absent.java" },
+      scope = { track = { "present.java", "absent.java" } },
       session_privkey = PRIV,
       extension_hash = EXT_HASH,
     }
@@ -235,11 +235,11 @@ describe("rolling_seal_writer", function()
     return by_path
   end
 
-  it("drops a files_under_review entry naming a DIRECTORY, never missing", function()
+  it("drops a scope entry naming a DIRECTORY, never missing", function()
     -- fs_open SUCCEEDS on a directory on macOS, so this is a real trap.
     vim.fn.mkdir(workspace .. "/adir", "p")
 
-    local res = roll({ files_under_review = { "present.java", "adir" } })
+    local res = roll({ scope = { track = { "present.java", "adir" } } })
     assert.equals("written", res.kind)
 
     local files, by_path = decoded_manifest().submission_files, submission_files_by_path()
@@ -248,7 +248,7 @@ describe("rolling_seal_writer", function()
     assert.is_nil(by_path["adir"])
   end)
 
-  it("drops a chmod-000 files_under_review entry, never missing", function()
+  it("drops a chmod-000 scope entry, never missing", function()
     local uv = vim.uv or vim.loop
     local secret = workspace .. "/secret.java"
     write_file(secret, "class Secret {}")
@@ -264,7 +264,7 @@ describe("rolling_seal_writer", function()
       return
     end
 
-    local res = roll({ files_under_review = { "present.java", "secret.java" } })
+    local res = roll({ scope = { track = { "present.java", "secret.java" } } })
     uv.fs_chmod(secret, tonumber("644", 8))
     assert.equals("written", res.kind)
 
@@ -283,7 +283,7 @@ describe("rolling_seal_writer", function()
     -- above.)
     vim.fn.mkdir(workspace .. "/adir", "p")
 
-    local res = roll({ files_under_review = { "adir", "absent.java" } })
+    local res = roll({ scope = { track = { "adir", "absent.java" } } })
     assert.equals("written", res.kind)
 
     local files, by_path = decoded_manifest().submission_files, submission_files_by_path()
@@ -305,7 +305,7 @@ describe("rolling_seal_writer", function()
       return
     end
 
-    local res = roll({ files_under_review = { "link.java" } })
+    local res = roll({ scope = { track = { "link.java" } } })
     assert.equals("written", res.kind)
 
     local files, by_path = decoded_manifest().submission_files, submission_files_by_path()
@@ -348,7 +348,7 @@ local res = w.write_rolling_seal({
   workspace = %q,
   assignment_id = "proj2",
   semester = "fa26",
-  files_under_review = { "present.java", "pipe.java" },
+  scope = { track = { "present.java", "pipe.java" } },
   session_privkey = %q,
   extension_hash = %q,
 })
@@ -503,5 +503,103 @@ f:close()
     end)
     assert.is_true(ok)
     assert.equals("error", res.kind)
+  end)
+end)
+
+--- Invariant test 9 (Task F): the ROLLING seal uses the SAME two-loop
+--- path-scope collection as the classic seal (via the same shared
+--- `workspace_walk` / `workspace_file_read` modules), so the two seals of one
+--- session cannot disagree about a file's status. Only EXACT track entries
+--- may mint `missing`; `scope_capped` is omitted unless exactly `true`.
+describe("rolling_seal_writer path scope (Task F)", function()
+  local tempdirs = {}
+  local workspace, provenance_dir
+
+  local function new_tempdir()
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    table.insert(tempdirs, dir)
+    return dir
+  end
+
+  before_each(function()
+    workspace = new_tempdir()
+    provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    write_file(provenance_dir .. "/session-abc.slog", '{"seq":0}')
+    write_file(provenance_dir .. "/session-abc.slog.meta", '{"session_id":"x"}')
+  end)
+
+  after_each(function()
+    for _, dir in ipairs(tempdirs) do
+      vim.fn.delete(dir, "rf")
+    end
+    tempdirs = {}
+  end)
+
+  local function roll(overrides)
+    local opts = {
+      provenance_dir = provenance_dir,
+      session_id = SESSION_ID,
+      prev_session_id = nil,
+      slog_path = provenance_dir .. "/session-abc.slog",
+      workspace = workspace,
+      assignment_id = "proj2",
+      semester = "fa26",
+      scope = { track = {}, ignore = {}, attachments = {} },
+      session_privkey = PRIV,
+      extension_hash = EXT_HASH,
+    }
+    for k, v in pairs(overrides or {}) do
+      opts[k] = v
+    end
+    return writer.write_rolling_seal(opts)
+  end
+
+  it("collects rule-matched files via the shared walk, with role; an attachment is hashed too", function()
+    vim.fn.mkdir(workspace .. "/src", "p")
+    write_file(workspace .. "/src/Main.java", "class Main {}")
+    write_file(workspace .. "/README.md", "notes")
+    vim.fn.mkdir(workspace .. "/logs", "p")
+    write_file(workspace .. "/logs/run.log", "output")
+
+    local res = roll({ scope = { track = { "src/" }, ignore = {}, attachments = { "logs/" } } })
+    assert.equals("written", res.kind)
+
+    local files = vim.json.decode(read_all(res.manifest_path)).submission_files
+    local by_path = {}
+    for _, f in ipairs(files) do
+      by_path[f.path] = f
+    end
+    assert.equals("reviewed", by_path["src/Main.java"].role)
+    assert.equals(sha256.hex("class Main {}"), by_path["src/Main.java"].sha256)
+    assert.equals("attachment", by_path["logs/run.log"].role)
+    assert.is_nil(by_path["README.md"], "unscoped files are not collected at all")
+  end)
+
+  it("only an EXACT track entry mints missing; a rule entry says nothing about a file never written", function()
+    local res = roll({ scope = { track = { "*.java", "Required.java" }, ignore = {}, attachments = {} } })
+    assert.equals("written", res.kind)
+
+    local files = vim.json.decode(read_all(res.manifest_path)).submission_files
+    local missing = {}
+    for _, f in ipairs(files) do
+      if f.status == "missing" then
+        missing[#missing + 1] = f.path
+      end
+    end
+    assert.same({ "Required.java" }, missing)
+  end)
+
+  it("omits scope_capped when false, and includes it -- inside the signed bytes -- when true", function()
+    local res_false = roll({ scope_capped = false })
+    assert.equals("written", res_false.kind)
+    assert.is_nil(res_false.canonical_json:find('"scope_capped"', 1, true))
+    assert.is_nil(vim.json.decode(read_all(res_false.manifest_path)).scope_capped)
+
+    local res_true = roll({ scope_capped = true })
+    assert.equals("written", res_true.kind)
+    assert.is_truthy(res_true.canonical_json:find('"scope_capped":true', 1, true))
+    assert.is_true(vim.json.decode(read_all(res_true.manifest_path)).scope_capped)
   end)
 end)

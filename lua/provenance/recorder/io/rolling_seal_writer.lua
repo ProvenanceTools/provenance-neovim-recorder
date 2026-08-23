@@ -51,23 +51,36 @@
 --- both temps are written and fsynced, and only then are both renamed back to
 --- back. See that function for the residual single-syscall window.
 ---
---- ## Unreadable reviewed files are dropped silently — a deliberate trade-off
+--- ## Path scope (Task F) — same collection shape, no warnings channel
 ---
---- A `files_under_review` entry that exists but can't be read (a directory,
---- a permission error, a FIFO, ...) is a different fact from one that's
---- genuinely absent, and must never be recorded as `status = "missing"` —
---- see `read_submission_file`'s docstring. But unlike the classic seal
---- (`commands/seal.lua`, which has a `warnings` table returned from an
---- explicit, user-invoked `:ProvenanceSeal`), this module has NO
---- user-facing channel to report a drop through: `RollingSealResult` carries
---- no warnings field, and a rolling reseal runs silently on every
---- checkpoint with no "seal now" action to attach a banner to. Rather than
---- invent a warnings channel nobody asked for, this module drops such an
---- entry from `submission_files` SILENTLY. The accepted trade-off: a
---- student won't be told mid-session that a reviewed file briefly became
---- unreadable, but a rolling seal also never mints a false `missing` for a
---- file that's actually sitting on their disk. The classic seal's
---- `warnings.unreadable_in_scope_file` is where that fact surfaces.
+--- `opts.scope` (a ResolvedScope: {track, ignore, attachments}, from
+--- `core.manifest.scope_from_manifest`) and `opts.scope_capped` replace the
+--- old exact-path `files_under_review` list. `collect_submission_files`
+--- below runs the SAME two-loop walk-then-exact-entries shape as
+--- `commands/seal.lua`, via the SAME shared `recorder.io.workspace_walk` /
+--- `recorder.io.workspace_file_read` modules, so the classic and rolling
+--- seals of one session cannot disagree about a file's status.
+---
+--- Every drop case the classic seal WARNS about — a directory or otherwise
+--- unreadable entry, an out-of-workspace resolution, a duplicate-by-real-path
+--- exact entry, a declined in-scope symlink — is a different fact from one
+--- that's genuinely absent (ENOENT), and must never be recorded as
+--- `status = "missing"`. But unlike the classic seal (`commands/seal.lua`,
+--- which has a `warnings` table returned from an explicit, user-invoked
+--- `:ProvenanceSeal`), this module has NO user-facing channel to report a
+--- drop through: `RollingSealResult` carries no warnings field, and a
+--- rolling reseal runs silently on every checkpoint with no "seal now"
+--- action to attach a banner to. Rather than invent a warnings channel
+--- nobody asked for, this module drops every such entry from
+--- `submission_files` SILENTLY — see `collect_submission_files`'s docstring
+--- for the full accounting. The accepted trade-off: a student won't be told
+--- mid-session that a reviewed file briefly became unreadable, resolved
+--- outside the workspace, or was a duplicate of another sealed path, but a
+--- rolling seal also never mints a false `missing` for a file that's
+--- actually sitting on their disk — the safety property holds regardless of
+--- whether the drop is disclosed. The classic seal's `warnings` is where
+--- each of these facts actually surfaces to a student, at the next
+--- `:ProvenanceSeal`.
 ---
 --- ## Failure is never fatal
 ---
@@ -78,9 +91,11 @@
 --- and the session records on.
 local core_sha256 = require("provenance.core.sha256")
 local core_bundle = require("provenance.core.bundle")
-local core_json = require("provenance.core.json")
+local path_scope = require("provenance.core.path_scope")
 local rolling_manifest = require("provenance.core.rolling_manifest")
 local atomic_write = require("provenance.recorder.io.atomic_write")
+local workspace_walk = require("provenance.recorder.io.workspace_walk")
+local workspace_file_read = require("provenance.recorder.io.workspace_file_read")
 
 local M = {}
 
@@ -181,38 +196,110 @@ local function sha256_of_file(path)
   return core_sha256.hex(bytes)
 end
 
---- Read one `files_under_review` entry's on-disk state: present, genuinely
---- missing, or unreadable.
+--- Collect this session's submission_files entries: the SAME two-loop
+--- path-scope shape as `commands/seal.lua` (Task F), via the SAME shared
+--- `recorder.io.workspace_walk` / `recorder.io.workspace_file_read` modules,
+--- so the classic and rolling seals of one session cannot disagree about a
+--- file's status. See `commands/seal.lua`'s module docstring for the full
+--- walk-then-exact-entries reasoning (skip-set built from SIGHTINGS not
+--- reads, only an exact entry's ENOENT may mint `missing`, the hard-excluded-
+--- segment recheck, the by-real-path dedupe). Three differences from the
+--- classic seal, all deliberate:
 ---
---- There is no warnings channel to report a drop through here:
---- `RollingSealResult` carries no warnings field, and unlike the classic
---- seal's `:ProvenanceSeal`, a rolling reseal has no user-facing "seal now"
---- action to attach a banner to — it fires silently on every checkpoint.
---- Inventing one (e.g. threading a warnings table back through
---- `write_rolling_seal`'s return value) would be new surface nobody asked
---- for and nothing currently reads. So an "unreadable" entry (a directory,
---- a permission error, a FIFO, ...) is dropped from this rolling manifest's
---- submission_files SILENTLY (see the caller) — the accepted trade-off is
---- that a rolling seal alone won't tell a student mid-session that one of
---- their reviewed files briefly became unreadable, but it also never
---- mints a false "missing" for it. The next classic `:ProvenanceSeal` (or
---- the next rolling checkpoint, once the condition clears) is what a
---- student actually acts on, and the classic seal DOES have a warnings
---- channel (`commands/seal.lua`'s `unreadable_in_scope_file`) for exactly
---- this fact.
+---   1. `with_bytes = false` — this module only ever needs the hash; the
+---      classic seal's ZIP step is what needs the raw bytes.
+---   2. NO WARNINGS CHANNEL. `RollingSealResult` is `written | error`, and a
+---      rolling reseal fires silently on every checkpoint with no user-facing
+---      "seal now" action to attach a banner to. Every case the classic seal
+---      would flag — an unreadable scope directory, an out-of-workspace exact
+---      entry, a duplicate-by-real-path drop, a declined in-scope symlink —
+---      is dropped from `submission_files` HERE WITHOUT A TRACE. This is a
+---      deliberate, accepted trade-off, not an oversight: a student won't be
+---      told mid-session that a reviewed file briefly became unreadable or
+---      resolved outside the workspace, but the safety property that matters
+---      — never a false `missing` — holds regardless of whether the drop is
+---      disclosed. The classic seal's `warnings` (`unreadable_in_scope_file`,
+---      `out_of_workspace_path_rejected`, `duplicate_entry_dropped`,
+---      `in_scope_symlink_skipped`) is where each of these facts actually
+---      surfaces to a student, at the next `:ProvenanceSeal`.
+---   3. Order is preserved exactly as the walk and `scope.track` produce it —
+---      NEVER sorted or reordered — because `submission_files` order must
+---      stay stable across checkpoints, or the canonical bytes (and therefore
+---      the signature) churn on every roll for no reason.
 --- @param workspace string
---- @param rel_path string
---- @return table|nil  { path, status, sha256 } for present/missing;
----   nil to signal "drop this entry" for unreadable
-local function read_submission_file(workspace, rel_path)
-  local bytes, err = read_file_bytes(workspace .. "/" .. rel_path)
-  if bytes ~= nil then
-    return { path = rel_path, status = "present", sha256 = core_sha256.hex(bytes) }
+--- @param workspace_real_root string
+--- @param scope table  ResolvedScope {track, ignore, attachments}
+--- @return table  list of { path, status, sha256, role } (present/missing only)
+local function collect_submission_files(workspace, workspace_real_root, scope)
+  local walk_result = workspace_walk.walk_workspace(workspace)
+  local sighted_in_scope = {}
+  local reviewed_files = {}
+
+  -- Loop 1: the walk.
+  for _, rel in ipairs(walk_result.paths) do
+    local role = path_scope.resolve_path_role(rel, scope)
+    if role == "reviewed" or role == "attachment" then
+      sighted_in_scope[rel] = true
+      local result = workspace_file_read.read_workspace_file(workspace, workspace_real_root, rel, { with_bytes = false })
+      if result.status == "present" then
+        result.role = role
+        reviewed_files[#reviewed_files + 1] = result
+      end
+      -- out_of_workspace / unreadable: dropped silently — see this
+      -- function's docstring, point 2.
+    end
   end
-  if err == "missing" then
-    return { path = rel_path, status = "missing", sha256 = core_json.NULL }
+
+  -- Real-path cache for the dedupe below. Lazy: a roll with no exact entry
+  -- colliding with an already-walked file never calls `fs_realpath` at all.
+  local uv = vim.uv or vim.loop
+  local real_path_cache = {}
+  local function real_path_of(rel_path)
+    local cached = real_path_cache[rel_path]
+    if cached ~= nil then
+      return cached
+    end
+    local real = uv.fs_realpath(workspace .. "/" .. rel_path)
+    if real == nil then
+      real = workspace .. "/" .. rel_path
+    end
+    real_path_cache[rel_path] = real
+    return real
   end
-  return nil
+
+  -- Loop 2: EXACT track entries only — the one place allowed to mint `missing`.
+  for _, entry in ipairs(scope.track or {}) do
+    if path_scope.is_exact_entry(entry) and path_scope.resolve_path_role(entry, scope) == "reviewed" then
+      if not workspace_walk.has_hard_excluded_segment(entry) then
+        if not sighted_in_scope[entry] then
+          local result =
+            workspace_file_read.read_workspace_file(workspace, workspace_real_root, entry, { with_bytes = false })
+          if result.status == "present" then
+            local candidate_real = real_path_of(entry)
+            local duplicate = false
+            for _, f in ipairs(reviewed_files) do
+              if f.status == "present" and real_path_of(f.path) == candidate_real then
+                duplicate = true
+                break
+              end
+            end
+            if not duplicate then
+              result.role = "reviewed"
+              reviewed_files[#reviewed_files + 1] = result
+            end
+            -- duplicate: dropped silently — see this function's docstring, point 2.
+          elseif result.status == "missing" then
+            result.role = "reviewed"
+            reviewed_files[#reviewed_files + 1] = result
+          end
+          -- out_of_workspace / unreadable: dropped silently — see this
+          -- function's docstring, point 2.
+        end
+      end
+    end
+  end
+
+  return reviewed_files
 end
 
 -- ---------------------------------------------------------------------------
@@ -223,11 +310,11 @@ end
 ---
 --- Steps:
 ---   1. Hash the `.slog` and `.slog.meta` as they currently stand on disk.
----   2. Hash every `files_under_review` entry; genuinely absent ones are
----      recorded `status = "missing"`, exactly as the classic seal records
----      them. Unreadable ones (a directory, a permission error, a FIFO, ...)
----      are dropped from `submission_files` entirely — see "Unreadable
----      reviewed files are dropped silently" above.
+---   2. Collect this session's submission_files via `collect_submission_files`
+---      (the shared path-scope walk, hash-only). Genuinely absent EXACT entries
+---      are recorded `status = "missing"`, exactly as the classic seal records
+---      them; every other drop case is dropped from `submission_files` SILENTLY
+---      — see this module's "Path scope" docstring section above.
 ---   3. Build a 1.2 manifest covering this one session.
 ---   4. Canonicalize + sign with this session's own private key, via the same
 ---      `core_bundle.sign` the classic seal uses — so both shapes are produced
@@ -243,10 +330,17 @@ end
 ---                            --   sessions by session.start.data.session_id.
 ---   prev_session_id: string|nil
 ---   slog_path: string        -- absolute; its meta is `<slog_path>.meta`
----   workspace: string        -- assignment root, for resolving files_under_review
+---   workspace: string        -- assignment root, for resolving `opts.scope`
 ---   assignment_id: string
 ---   semester: string
----   files_under_review: table  -- from the verified course manifest
+---   scope: table              -- ResolvedScope {track, ignore, attachments},
+---                              --   from core.manifest.scope_from_manifest
+---   scope_capped: boolean|nil -- this session's own expected-content cap bit
+---                              --   (external_change_coordinator's cap_hit()).
+---                              --   Spread straight through: unlike the classic
+---                              --   seal, a rolling manifest covers exactly one
+---                              --   session, so there is no other session's
+---                              --   answer to OR against.
 ---   session_privkey: string  -- this session's 32-byte raw ed25519 seed
 ---   extension_hash: string   -- resolved ONCE per session by the caller; walking
 ---                            --   the source tree per checkpoint would be the
@@ -279,18 +373,21 @@ function M.write_rolling_seal(opts)
     local slog_sha256 = sha256_of_file(opts.slog_path)
     local meta_sha256 = sha256_of_file(opts.slog_path .. ".meta")
 
-    -- Step 2: on-disk state of the reviewed files. Ordered — the manifest's
-    -- submission_files order must be stable across checkpoints, otherwise the
-    -- canonical bytes churn for no reason.
+    -- Step 2: on-disk state of the reviewed/attachment files, via the shared
+    -- path-scope walk. Order is exactly what `collect_submission_files`
+    -- produces (walk order, then `scope.track` order) — NEVER sorted or
+    -- reordered here — the manifest's submission_files order must be stable
+    -- across checkpoints, otherwise the canonical bytes churn for no reason.
+    local uv = vim.uv or vim.loop
+    local workspace_real_root = uv.fs_realpath(opts.workspace)
+    if workspace_real_root == nil then
+      workspace_real_root = opts.workspace
+    end
+    local scope = opts.scope or { track = {}, ignore = {}, attachments = {} }
+    local reviewed = collect_submission_files(opts.workspace, workspace_real_root, scope)
     local submission_files = {}
-    for _, rel in ipairs(opts.files_under_review or {}) do
-      -- nil means "unreadable" -- dropped silently, see read_submission_file's
-      -- docstring for why this module has no warnings channel to report it
-      -- through.
-      local entry = read_submission_file(opts.workspace, rel)
-      if entry ~= nil then
-        submission_files[#submission_files + 1] = entry
-      end
+    for i, f in ipairs(reviewed) do
+      submission_files[i] = { path = f.path, status = f.status, sha256 = f.sha256, role = f.role }
     end
 
     -- Step 3: exactly one session, non-null id, matching the filename below.
@@ -309,6 +406,9 @@ function M.write_rolling_seal(opts)
       -- and they are pinned by cross-language conformance vectors that two
       -- other recorder implementations verify against.
       final = is_final or nil,
+      -- Spread straight through — see this session's own docstring above.
+      -- OMITTED unless exactly `true`, never `scope_capped = false`.
+      scope_capped = opts.scope_capped == true or nil,
     })
 
     -- Step 4: sign with THIS session's key.

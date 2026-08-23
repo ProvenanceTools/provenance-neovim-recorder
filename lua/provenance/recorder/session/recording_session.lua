@@ -468,7 +468,12 @@ function M.start(opts)
         workspace = workspace,
         assignment_id = manifest.assignment_id,
         semester = manifest.semester,
-        files_under_review = manifest.files_under_review,
+        scope = core_manifest.scope_from_manifest(manifest),
+        -- This session's own cap bit. `coordinator` is nil when signals are
+        -- disabled (no registry exists, so nothing can have capped) and on
+        -- the very first roll (WRITE POINT 1), which fires before the
+        -- coordinator is constructed — both correctly read as "not capped".
+        scope_capped = coordinator ~= nil and coordinator.cap_hit() or false,
         session_privkey = keypair.private_key,
         extension_hash = get_extension_hash_once(),
         -- Strictly true or absent. `final = false` is never passed down, and
