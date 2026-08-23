@@ -32,6 +32,26 @@ local function exists(path)
   return (vim.uv or vim.loop).fs_stat(path) ~= nil
 end
 
+--- This spec file's own repo root, resolved from `debug.getinfo` (same
+--- technique as `workspace_file_read_spec.lua`, in this same directory)
+--- rather than `getcwd()`, so it does not depend on the Makefile's
+--- invocation directory. Walks up from
+--- `tests/recorder/io/rolling_seal_writer_spec.lua` to the repo root: strip
+--- the filename, then `io` -> `recorder` -> `tests` -> root.
+local function resolve_repo_root()
+  local info = debug.getinfo(1, "S")
+  local source = info.source
+  assert(type(source) == "string" and source:sub(1, 1) == "@", "could not resolve spec file source path")
+  local dir = source:sub(2)
+  for _ = 1, 4 do
+    dir = dir:match("^(.*)/[^/]+$")
+    assert(dir ~= nil, "could not walk up to repo root from spec file path")
+  end
+  return dir
+end
+
+local REPO_ROOT = resolve_repo_root()
+
 describe("rolling_seal_writer", function()
   local tempdirs = {}
   local workspace, provenance_dir
@@ -194,6 +214,178 @@ describe("rolling_seal_writer", function()
     local a = roll().canonical_json
     local b = roll().canonical_json
     assert.equals(a, b)
+  end)
+
+  -- --- unreadable vs missing: never mint a false "missing" -----------------
+  --
+  -- `read_file_bytes` used to collapse every read failure -- a directory, a
+  -- permission error, a FIFO, any other errno -- to a bare nil, and
+  -- `read_submission_file` turned every one of those into
+  -- `status = "missing"`: an AFFIRMATIVE claim about a student ("this file
+  -- was named and is not there") rendered into academic-integrity
+  -- proceedings. Only ENOENT actually means that. This block proves the
+  -- fix, mirroring the equivalent block in
+  -- tests/recorder/commands/seal_spec.lua for the classic seal.
+
+  local function submission_files_by_path()
+    local by_path = {}
+    for _, f in ipairs(decoded_manifest().submission_files) do
+      by_path[f.path] = f
+    end
+    return by_path
+  end
+
+  it("drops a files_under_review entry naming a DIRECTORY, never missing", function()
+    -- fs_open SUCCEEDS on a directory on macOS, so this is a real trap.
+    vim.fn.mkdir(workspace .. "/adir", "p")
+
+    local res = roll({ files_under_review = { "present.java", "adir" } })
+    assert.equals("written", res.kind)
+
+    local files, by_path = decoded_manifest().submission_files, submission_files_by_path()
+    assert.equals(1, #files, "the directory entry must be dropped, not recorded at all")
+    assert.equals("present", by_path["present.java"].status)
+    assert.is_nil(by_path["adir"])
+  end)
+
+  it("drops a chmod-000 files_under_review entry, never missing", function()
+    local uv = vim.uv or vim.loop
+    local secret = workspace .. "/secret.java"
+    write_file(secret, "class Secret {}")
+    uv.fs_chmod(secret, tonumber("000", 8))
+
+    -- Verify the denial actually took effect before asserting; a uid that
+    -- defeats permission bits (root) makes this pending rather than false.
+    local fd = uv.fs_open(secret, "r", 438)
+    if fd ~= nil then
+      uv.fs_close(fd)
+      uv.fs_chmod(secret, tonumber("644", 8))
+      pending("running with elevated privileges that defeat permission bits")
+      return
+    end
+
+    local res = roll({ files_under_review = { "present.java", "secret.java" } })
+    uv.fs_chmod(secret, tonumber("644", 8))
+    assert.equals("written", res.kind)
+
+    local files, by_path = decoded_manifest().submission_files, submission_files_by_path()
+    assert.equals(1, #files)
+    assert.equals("present", by_path["present.java"].status)
+    assert.is_nil(by_path["secret.java"])
+  end)
+
+  it("still marks a genuinely absent entry as missing, distinct from an unreadable one", function()
+    -- The regression a careless fix causes: this legitimate case must
+    -- survive untouched even when an unreadable entry is present in the
+    -- same roll. (`absent.java` is already part of the default `roll()`
+    -- fixture -- this asserts it explicitly alongside a real unreadable
+    -- entry rather than relying on the "records ... present/missing" test
+    -- above.)
+    vim.fn.mkdir(workspace .. "/adir", "p")
+
+    local res = roll({ files_under_review = { "adir", "absent.java" } })
+    assert.equals("written", res.kind)
+
+    local files, by_path = decoded_manifest().submission_files, submission_files_by_path()
+    assert.equals(1, #files, "only the genuinely absent file is recorded")
+    assert.equals("missing", by_path["absent.java"].status)
+    assert.equals(vim.NIL, by_path["absent.java"].sha256)
+    assert.is_nil(by_path["adir"])
+  end)
+
+  it("follows an ordinary in-workspace symlink to a real file, and reports it present", function()
+    -- The case a careless fs_lstat swap would break: an in-workspace symlink
+    -- is a file the student really did submit.
+    local uv = vim.uv or vim.loop
+    local ok = pcall(function()
+      assert(uv.fs_symlink(workspace .. "/present.java", workspace .. "/link.java"))
+    end)
+    if not ok then
+      pending("symlink creation not available on this machine")
+      return
+    end
+
+    local res = roll({ files_under_review = { "link.java" } })
+    assert.equals("written", res.kind)
+
+    local files, by_path = decoded_manifest().submission_files, submission_files_by_path()
+    assert.equals(1, #files)
+    assert.equals("present", by_path["link.java"].status)
+    assert.equals(sha256.hex("class Present {}"), by_path["link.java"].sha256)
+  end)
+
+  it("does not hang on a FIFO tracked file, and drops it without emitting missing", function()
+    -- Reading a FIFO with no writer BLOCKS THE ENTIRE NEOVIM PROCESS FOREVER
+    -- (verified empirically, not theoretical), with no timeout anywhere in
+    -- this call stack. `write_rolling_seal` runs on EVERY CHECKPOINT (no
+    -- explicit seal command needed to trigger it), so the risky call must
+    -- run in a CHILD `nvim -l` process under a wall-clock jobwait timeout,
+    -- or a regression wedges the whole test run instead of failing one
+    -- test. Same technique as workspace_file_read_spec.lua's FIFO test.
+    if vim.fn.executable("mkfifo") == 0 then
+      pending("mkfifo not available on this machine")
+      return
+    end
+
+    local fifo = workspace .. "/pipe.java"
+    vim.fn.system({ "mkfifo", fifo })
+    if vim.v.shell_error ~= 0 then
+      pending("mkfifo failed on this machine")
+      return
+    end
+
+    local out_file = workspace .. "/result.txt"
+    local child_script = workspace .. "/child.lua"
+    local script = string.format(
+      [[
+package.path = %q .. "/lua/?.lua;" .. %q .. "/lua/?/init.lua;" .. package.path
+local w = require("provenance.recorder.io.rolling_seal_writer")
+local res = w.write_rolling_seal({
+  provenance_dir = %q,
+  session_id = %q,
+  prev_session_id = nil,
+  slog_path = %q,
+  workspace = %q,
+  assignment_id = "proj2",
+  semester = "fa26",
+  files_under_review = { "present.java", "pipe.java" },
+  session_privkey = %q,
+  extension_hash = %q,
+})
+local f = assert(io.open(%q, "w"))
+f:write(res.kind)
+f:close()
+]],
+      REPO_ROOT,
+      REPO_ROOT,
+      provenance_dir,
+      SESSION_ID,
+      provenance_dir .. "/session-abc.slog",
+      workspace,
+      PRIV,
+      EXT_HASH,
+      out_file
+    )
+    write_file(child_script, script)
+
+    local job = vim.fn.jobstart({ "nvim", "-l", child_script })
+    assert.is_true(job > 0, "failed to start child nvim -l process")
+
+    local waited = vim.fn.jobwait({ job }, 5000)
+    if waited[1] == -1 then
+      pcall(vim.fn.jobstop, job)
+      assert.is_true(false, "write_rolling_seal HUNG on a FIFO: did not return within 5s")
+      return
+    end
+
+    assert.is_true(vim.fn.filereadable(out_file) == 1, "child process produced no result file")
+    local lines = vim.fn.readfile(out_file)
+    assert.equals("written", lines[1])
+
+    local files, by_path = decoded_manifest().submission_files, submission_files_by_path()
+    assert.equals(1, #files)
+    assert.equals("present", by_path["present.java"].status)
+    assert.is_nil(by_path["pipe.java"])
   end)
 
   -- --- the `final` marker ---------------------------------------------------

@@ -20,7 +20,11 @@
 ---   - meta files are optional/defensive: if a `.slog.meta` can't be read,
 ---     its hash falls back to sha256("") rather than aborting.
 ---   - Missing reviewed files are recorded in submission_files with
----     status "missing" (sha256 = null) but are not added to the zip.
+---     status "missing" (sha256 = null) but are not added to the zip. A
+---     reviewed file that exists but can't be READ (a directory, a
+---     permission error, a FIFO, ...) is a different fact — it is DROPPED
+---     entirely (neither submission_files nor the zip) and reported via
+---     warnings.unreadable_in_scope_file, never recorded as "missing".
 ---   - manifest.json / manifest.sig are atomic writes (write-temp-then-
 ---     rename via recorder.io.atomic_write) so a signed, integrity-critical
 ---     file is never observed half-written.
@@ -39,21 +43,67 @@ local M = {}
 -- Helpers
 -- ---------------------------------------------------------------------------
 
---- Read a whole file's raw bytes via vim.uv. Never throws.
+--- Read a whole file's raw bytes via vim.uv. Never throws. Discriminates
+--- WHY the read failed rather than collapsing every failure to a bare nil:
+--- a caller may turn a failure into a `status = "missing"` submission-files
+--- record, which is an AFFIRMATIVE claim about a student ("this file was
+--- named and is not there") rendered into academic-integrity proceedings.
+--- Only ENOENT — the file genuinely does not exist — actually means that.
+--- Everything else (a directory, a permission error, a FIFO, a symlink
+--- loop, ...) is `"unreadable"`: the file's existence is either known-true
+--- or simply undetermined, and `"missing"` would be a false claim.
+---
+--- Only a REGULAR file is read: `fs_stat` (which FOLLOWS symlinks, so an
+--- ordinary in-workspace symlink to a real file still reads normally — do
+--- NOT switch this to `fs_lstat`, that would misreport a legitimate case)
+--- runs BEFORE `fs_open`, because opening a FIFO with no writer BLOCKS THE
+--- ENTIRE NEOVIM PROCESS FOREVER with no timeout anywhere in this call
+--- stack, whereas `fs_stat` never blocks on one. This also gives a
+--- directory (a manifest typo naming `src` instead of `src/`) a clean home
+--- before `fs_open`: `fs_open` SUCCEEDS on a directory on macOS, and the
+--- failure would otherwise land at `fs_read` as EISDIR. Verified
+--- empirically in this repo (see the task report this fix shipped with):
+--- `uv.fs_stat` / `uv.fs_open` return `nil, message, name` on failure, where
+--- `name` is the bare errno string ("ENOENT", "EACCES", ...); `fs_stat`
+--- follows symlinks and reports a FIFO's type instantly without opening it.
+---
+--- Duplicated byte-for-byte in `io/rolling_seal_writer.lua`'s own copy of
+--- this helper rather than factored into a shared module — each module
+--- already carries its own private `read_file_bytes`, and introducing a new
+--- shared file here is exactly the kind of dependency this fix is trying to
+--- avoid picking up (see this fix's commit message / task notes).
 --- @param path string
---- @return string|nil  file bytes, or nil if the file can't be read
+--- @return string|nil, string|nil  bytes on success (nil second value);
+---   else nil, "missing" (ENOENT only — from the stat, the open, or a race
+---   between them) | "unreadable" (any other failure, including a
+---   non-regular file)
 local function read_file_bytes(path)
   local uv = vim.uv or vim.loop
-  local fd = uv.fs_open(path, "r", 438) -- 438 = 0o666
-  if not fd then
-    return nil
+
+  local st, _stat_msg, stat_code = uv.fs_stat(path)
+  if st == nil then
+    if stat_code == "ENOENT" then
+      return nil, "missing"
+    end
+    return nil, "unreadable"
+  end
+  if st.type ~= "file" then
+    return nil, "unreadable"
+  end
+
+  local fd, _open_msg, open_code = uv.fs_open(path, "r", 438) -- 438 = 0o666
+  if fd == nil then
+    if open_code == "ENOENT" then
+      return nil, "missing"
+    end
+    return nil, "unreadable"
   end
   local ok, data = pcall(function()
-    local st = uv.fs_fstat(fd)
-    if not st then
+    local fst = uv.fs_fstat(fd)
+    if not fst then
       error("fstat failed")
     end
-    local chunk = uv.fs_read(fd, st.size, 0)
+    local chunk = uv.fs_read(fd, fst.size, 0)
     if chunk == nil then
       error("read failed")
     end
@@ -61,9 +111,9 @@ local function read_file_bytes(path)
   end)
   uv.fs_close(fd) -- always close, on both the success and error paths
   if not ok then
-    return nil
+    return nil, "unreadable"
   end
-  return data
+  return data, nil
 end
 
 --- Byte size of a file via vim.uv.fs_stat, or nil if it cannot be stat'd.
@@ -122,7 +172,7 @@ end
 --- @return table
 ---   { kind = "ok", bundle_path, manifest_sha256,
 ---     warnings = {chain_broken, unreadable_session, orphaned_meta, orphaned_slog,
----                 empty_session, orphaned_rolling_seal} }
+---                 empty_session, orphaned_rolling_seal, unreadable_in_scope_file} }
 ---   | { kind = "no_sessions" }
 ---   | { kind = "write_error", message = string }
 function M.seal_bundle(opts)
@@ -151,6 +201,7 @@ function M.seal_bundle(opts)
     orphaned_slog = false,
     empty_session = false,
     orphaned_rolling_seal = false,
+    unreadable_in_scope_file = false,
   }
 
   -- ORPHAN GUARD. `analysis-core`'s loader pairs `session-<uuid>.slog` with
@@ -290,10 +341,21 @@ function M.seal_bundle(opts)
   end
 
   -- Step 3: read reviewed files (workspace-relative; resolved against workspace).
+  --
+  -- `read_file_bytes` distinguishes WHY a reviewed file couldn't be read.
+  -- "missing" (ENOENT — the file genuinely is not there) is the ONE case
+  -- recorded as status = "missing"; it's an affirmative claim about the
+  -- student, so it must never be minted for a file that's actually sitting
+  -- on disk. "unreadable" (a directory, a permission error, a FIFO, ...) is
+  -- DROPPED entirely — it appears in neither submission_files nor the zip,
+  -- and is never conflated with "missing" — and reported via
+  -- warnings.unreadable_in_scope_file so staff can tell the two facts apart
+  -- (a silent drop here is what took four fix rounds to close on the
+  -- monorepo's classic seal).
   local reviewed_files = {}
   for _, rel in ipairs(files_under_review) do
     local abs = workspace .. "/" .. rel
-    local bytes = read_file_bytes(abs)
+    local bytes, err = read_file_bytes(abs)
     if bytes ~= nil then
       reviewed_files[#reviewed_files + 1] = {
         path = rel,
@@ -301,8 +363,10 @@ function M.seal_bundle(opts)
         sha256 = core_sha256.hex(bytes),
         bytes = bytes,
       }
-    else
+    elseif err == "missing" then
       reviewed_files[#reviewed_files + 1] = { path = rel, status = "missing", sha256 = core_json.NULL }
+    else
+      warnings.unreadable_in_scope_file = true
     end
   end
 

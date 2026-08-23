@@ -51,6 +51,24 @@
 --- both temps are written and fsynced, and only then are both renamed back to
 --- back. See that function for the residual single-syscall window.
 ---
+--- ## Unreadable reviewed files are dropped silently — a deliberate trade-off
+---
+--- A `files_under_review` entry that exists but can't be read (a directory,
+--- a permission error, a FIFO, ...) is a different fact from one that's
+--- genuinely absent, and must never be recorded as `status = "missing"` —
+--- see `read_submission_file`'s docstring. But unlike the classic seal
+--- (`commands/seal.lua`, which has a `warnings` table returned from an
+--- explicit, user-invoked `:ProvenanceSeal`), this module has NO
+--- user-facing channel to report a drop through: `RollingSealResult` carries
+--- no warnings field, and a rolling reseal runs silently on every
+--- checkpoint with no "seal now" action to attach a banner to. Rather than
+--- invent a warnings channel nobody asked for, this module drops such an
+--- entry from `submission_files` SILENTLY. The accepted trade-off: a
+--- student won't be told mid-session that a reviewed file briefly became
+--- unreadable, but a rolling seal also never mints a false `missing` for a
+--- file that's actually sitting on their disk. The classic seal's
+--- `warnings.unreadable_in_scope_file` is where that fact surfaces.
+---
 --- ## Failure is never fatal
 ---
 --- Recording matters more than sealing. Every failure — the directory deleted by
@@ -70,21 +88,71 @@ local M = {}
 -- Helpers
 -- ---------------------------------------------------------------------------
 
---- Read a whole file's raw bytes via vim.uv. Never raises.
+--- Read a whole file's raw bytes via vim.uv. Never raises. Discriminates WHY
+--- the read failed rather than collapsing every failure to a bare nil: a
+--- caller may turn a failure into a `status = "missing"` submission-files
+--- record, which is an AFFIRMATIVE claim about a student ("this file was
+--- named and is not there") rendered into academic-integrity proceedings.
+--- Only ENOENT — the file genuinely does not exist — actually means that.
+--- Everything else (a directory, a permission error, a FIFO, a symlink
+--- loop, ...) is `"unreadable"`: the file's existence is either known-true
+--- or simply undetermined, and `"missing"` would be a false claim.
+---
+--- Only a REGULAR file is read: `fs_stat` (which FOLLOWS symlinks, so an
+--- ordinary in-workspace symlink to a real file still reads normally — do
+--- NOT switch this to `fs_lstat`, that would misreport a legitimate case)
+--- runs BEFORE `fs_open`, because opening a FIFO with no writer BLOCKS THE
+--- ENTIRE NEOVIM PROCESS FOREVER with no timeout anywhere in this call
+--- stack — and this module runs on EVERY CHECKPOINT, so a student doing
+--- `rm Main.java && mkfifo Main.java` at a tracked path would otherwise
+--- wedge the whole editor without even needing a seal command to trigger
+--- it. `fs_stat` never blocks on a FIFO, so gating on it first is safe.
+--- This also gives a directory (a manifest typo naming `src` instead of
+--- `src/`) a clean home before `fs_open`: `fs_open` SUCCEEDS on a directory
+--- on macOS, and the failure would otherwise land at `fs_read` as EISDIR.
+--- Verified empirically in this repo (see the task report this fix shipped
+--- with): `uv.fs_stat` / `uv.fs_open` return `nil, message, name` on
+--- failure, where `name` is the bare errno string ("ENOENT", "EACCES",
+--- ...); `fs_stat` follows symlinks and reports a FIFO's type instantly
+--- without opening it.
+---
+--- Duplicated byte-for-byte in `commands/seal.lua`'s own copy of this
+--- helper rather than factored into a shared module — each module already
+--- carries its own private `read_file_bytes`, and introducing a new shared
+--- file here is exactly the kind of dependency this fix is trying to avoid
+--- picking up (see this fix's commit message / task notes).
 --- @param path string
---- @return string|nil
+--- @return string|nil, string|nil  bytes on success (nil second value);
+---   else nil, "missing" (ENOENT only — from the stat, the open, or a race
+---   between them) | "unreadable" (any other failure, including a
+---   non-regular file)
 local function read_file_bytes(path)
   local uv = vim.uv or vim.loop
-  local fd = uv.fs_open(path, "r", 438) -- 438 = 0o666
-  if not fd then
-    return nil
+
+  local st, _stat_msg, stat_code = uv.fs_stat(path)
+  if st == nil then
+    if stat_code == "ENOENT" then
+      return nil, "missing"
+    end
+    return nil, "unreadable"
+  end
+  if st.type ~= "file" then
+    return nil, "unreadable"
+  end
+
+  local fd, _open_msg, open_code = uv.fs_open(path, "r", 438) -- 438 = 0o666
+  if fd == nil then
+    if open_code == "ENOENT" then
+      return nil, "missing"
+    end
+    return nil, "unreadable"
   end
   local ok, data = pcall(function()
-    local st = uv.fs_fstat(fd)
-    if not st then
+    local fst = uv.fs_fstat(fd)
+    if not fst then
       error("fstat failed")
     end
-    local chunk = uv.fs_read(fd, st.size, 0)
+    local chunk = uv.fs_read(fd, fst.size, 0)
     if chunk == nil then
       error("read failed")
     end
@@ -92,9 +160,9 @@ local function read_file_bytes(path)
   end)
   uv.fs_close(fd)
   if not ok then
-    return nil
+    return nil, "unreadable"
   end
-  return data
+  return data, nil
 end
 
 --- sha256 of a file's bytes, or of empty bytes when it cannot be read.
@@ -113,16 +181,38 @@ local function sha256_of_file(path)
   return core_sha256.hex(bytes)
 end
 
---- Read one `files_under_review` entry's on-disk state, or mark it missing.
+--- Read one `files_under_review` entry's on-disk state: present, genuinely
+--- missing, or unreadable.
+---
+--- There is no warnings channel to report a drop through here:
+--- `RollingSealResult` carries no warnings field, and unlike the classic
+--- seal's `:ProvenanceSeal`, a rolling reseal has no user-facing "seal now"
+--- action to attach a banner to — it fires silently on every checkpoint.
+--- Inventing one (e.g. threading a warnings table back through
+--- `write_rolling_seal`'s return value) would be new surface nobody asked
+--- for and nothing currently reads. So an "unreadable" entry (a directory,
+--- a permission error, a FIFO, ...) is dropped from this rolling manifest's
+--- submission_files SILENTLY (see the caller) — the accepted trade-off is
+--- that a rolling seal alone won't tell a student mid-session that one of
+--- their reviewed files briefly became unreadable, but it also never
+--- mints a false "missing" for it. The next classic `:ProvenanceSeal` (or
+--- the next rolling checkpoint, once the condition clears) is what a
+--- student actually acts on, and the classic seal DOES have a warnings
+--- channel (`commands/seal.lua`'s `unreadable_in_scope_file`) for exactly
+--- this fact.
 --- @param workspace string
 --- @param rel_path string
---- @return table { path, status, sha256 }
+--- @return table|nil  { path, status, sha256 } for present/missing;
+---   nil to signal "drop this entry" for unreadable
 local function read_submission_file(workspace, rel_path)
-  local bytes = read_file_bytes(workspace .. "/" .. rel_path)
-  if bytes == nil then
+  local bytes, err = read_file_bytes(workspace .. "/" .. rel_path)
+  if bytes ~= nil then
+    return { path = rel_path, status = "present", sha256 = core_sha256.hex(bytes) }
+  end
+  if err == "missing" then
     return { path = rel_path, status = "missing", sha256 = core_json.NULL }
   end
-  return { path = rel_path, status = "present", sha256 = core_sha256.hex(bytes) }
+  return nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -133,8 +223,11 @@ end
 ---
 --- Steps:
 ---   1. Hash the `.slog` and `.slog.meta` as they currently stand on disk.
----   2. Hash every `files_under_review` entry; absent ones are recorded
----      `status = "missing"`, exactly as the classic seal records them.
+---   2. Hash every `files_under_review` entry; genuinely absent ones are
+---      recorded `status = "missing"`, exactly as the classic seal records
+---      them. Unreadable ones (a directory, a permission error, a FIFO, ...)
+---      are dropped from `submission_files` entirely — see "Unreadable
+---      reviewed files are dropped silently" above.
 ---   3. Build a 1.2 manifest covering this one session.
 ---   4. Canonicalize + sign with this session's own private key, via the same
 ---      `core_bundle.sign` the classic seal uses — so both shapes are produced
@@ -191,7 +284,13 @@ function M.write_rolling_seal(opts)
     -- canonical bytes churn for no reason.
     local submission_files = {}
     for _, rel in ipairs(opts.files_under_review or {}) do
-      submission_files[#submission_files + 1] = read_submission_file(opts.workspace, rel)
+      -- nil means "unreadable" -- dropped silently, see read_submission_file's
+      -- docstring for why this module has no warnings channel to report it
+      -- through.
+      local entry = read_submission_file(opts.workspace, rel)
+      if entry ~= nil then
+        submission_files[#submission_files + 1] = entry
+      end
     end
 
     -- Step 3: exactly one session, non-null id, matching the filename below.
