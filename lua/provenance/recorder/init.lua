@@ -17,6 +17,7 @@ local secret_store = require("provenance.recorder.identity.secret_store")
 local key_cache_mod = require("provenance.recorder.identity.key_cache")
 local enrollment_cmd = require("provenance.recorder.commands.enrollment")
 local enroll_nudge_ui = require("provenance.recorder.enroll_nudge_ui")
+local seal_cmd = require("provenance.recorder.commands.seal")
 
 local M = {}
 
@@ -171,6 +172,27 @@ function M.setup(opts)
         )
       else
         vim.notify("Provenance: sealed submission bundle -> " .. result.bundle_path, vim.log.levels.INFO)
+      end
+      -- A dropped artifact must never read as "nothing was wrong". SEPARATE
+      -- from the branch above: this is not evidence of tampering (the chain
+      -- may be perfectly intact) — it's either an incomplete session
+      -- recording artifact left out so the bundle stays openable, or a
+      -- workspace source file the seal could not read. The overwhelmingly
+      -- likely cause of the latter is a staff typo in files_under_review
+      -- (`src` instead of `src/`), not anything the student did — hence
+      -- "this is not a finding about your work", and "nothing was removed
+      -- from disk" because the student's first fear is that the tool deleted
+      -- their work. Do NOT fold this into the chain_broken branch above:
+      -- its "sealed WITH WARNINGS (hash chain broken)" copy would be
+      -- factually false here, since the chain is intact.
+      if seal_cmd.seal_dropped_artifacts(result.warnings) then
+        vim.notify(
+          "Provenance: bundle produced. Some files could not be included — either session "
+            .. "recording artifacts left out so the bundle can be opened, or workspace files that "
+            .. "could not be read at seal time. Nothing was removed from disk, and this is not a "
+            .. "finding about your work. Mention it to course staff.",
+          vim.log.levels.WARN
+        )
       end
     elseif result.kind == "no_sessions" then
       vim.notify("Provenance: nothing to seal (no recorded sessions).", vim.log.levels.WARN)

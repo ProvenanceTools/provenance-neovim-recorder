@@ -892,3 +892,50 @@ f:close()
     assert.is_nil(by_path["pipe.txt"])
   end)
 end)
+
+--- M.seal_dropped_artifacts — pure predicate, port of the monorepo's
+--- `sealDroppedArtifacts` (packages/recorder/src/commands/seal.ts). Exercised
+--- directly against hand-built `warnings` tables rather than through a real
+--- seal_bundle run: the flags it reads are already covered end-to-end by the
+--- describes above (the orphan guards, the rolling-seal guard, and the
+--- unreadable-file tests), so this only needs to pin the BOOLEAN COMBINATION.
+describe("seal.seal_dropped_artifacts", function()
+  local ALL_CLEAR = {
+    chain_broken = false,
+    unreadable_session = false,
+    orphaned_meta = false,
+    orphaned_slog = false,
+    empty_session = false,
+    orphaned_rolling_seal = false,
+    unreadable_in_scope_file = false,
+  }
+
+  it("is false when every warning is clear", function()
+    assert.is_false(seal.seal_dropped_artifacts(ALL_CLEAR))
+  end)
+
+  it("is false for a nil warnings table (never throws)", function()
+    assert.is_false(seal.seal_dropped_artifacts(nil))
+  end)
+
+  for _, flag in ipairs({
+    "orphaned_meta",
+    "orphaned_slog",
+    "empty_session",
+    "orphaned_rolling_seal",
+    "unreadable_in_scope_file",
+  }) do
+    it("is true when only '" .. flag .. "' is set", function()
+      local warnings = vim.deepcopy(ALL_CLEAR)
+      warnings[flag] = true
+      assert.is_true(seal.seal_dropped_artifacts(warnings))
+    end)
+  end
+
+  it("is NOT driven by chain_broken or unreadable_session alone — those get their own notice", function()
+    local warnings = vim.deepcopy(ALL_CLEAR)
+    warnings.chain_broken = true
+    warnings.unreadable_session = true
+    assert.is_false(seal.seal_dropped_artifacts(warnings))
+  end)
+end)

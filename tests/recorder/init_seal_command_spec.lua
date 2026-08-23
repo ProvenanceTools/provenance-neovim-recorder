@@ -120,6 +120,137 @@ describe("recorder.setup :ProvenanceSeal live command", function()
     assert.is_not_nil(string.find(calls[1].message, "/tmp/hw3-bundle.zip", 1, true))
   end)
 
+  it("active session: a fully clean seal produces the INFO message and NO dropped-artifact warning", function()
+    local fake_controller = {
+      seal = function()
+        return {
+          kind = "ok",
+          bundle_path = "/tmp/hw3-bundle.zip",
+          warnings = {
+            chain_broken = false,
+            unreadable_session = false,
+            orphaned_meta = false,
+            orphaned_slog = false,
+            empty_session = false,
+            orphaned_rolling_seal = false,
+            unreadable_in_scope_file = false,
+          },
+        }
+      end,
+      stop = function() end,
+    }
+
+    handle = recorder.setup({
+      workspace = "/tmp/ws-a",
+      resolve = function()
+        return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
+      end,
+      start_recording = make_start_recording(fake_controller),
+    })
+
+    local calls, restore = capture_notify()
+    restore_notify = restore
+
+    vim.cmd("ProvenanceSeal")
+
+    assert.equals(1, #calls)
+    assert.equals(vim.log.levels.INFO, calls[1].level)
+  end)
+
+  for _, flag in ipairs({
+    "orphaned_meta",
+    "orphaned_slog",
+    "empty_session",
+    "orphaned_rolling_seal",
+    "unreadable_in_scope_file",
+  }) do
+    it(
+      "active session: warnings."
+        .. flag
+        .. " alone produces a SECOND WARN notification containing 'could not be included'",
+      function()
+        local warnings = {
+          chain_broken = false,
+          unreadable_session = false,
+          orphaned_meta = false,
+          orphaned_slog = false,
+          empty_session = false,
+          orphaned_rolling_seal = false,
+          unreadable_in_scope_file = false,
+        }
+        warnings[flag] = true
+
+        local fake_controller = {
+          seal = function()
+            return { kind = "ok", bundle_path = "/tmp/hw3-bundle.zip", warnings = warnings }
+          end,
+          stop = function() end,
+        }
+
+        handle = recorder.setup({
+          workspace = "/tmp/ws-a",
+          resolve = function()
+            return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
+          end,
+          start_recording = make_start_recording(fake_controller),
+        })
+
+        local calls, restore = capture_notify()
+        restore_notify = restore
+
+        vim.cmd("ProvenanceSeal")
+
+        assert.equals(2, #calls)
+        -- First: the plain INFO success notice (the chain is intact, so this
+        -- must NOT be the "WITH WARNINGS (hash chain broken)" branch).
+        assert.equals(vim.log.levels.INFO, calls[1].level)
+        assert.is_nil(string.find(calls[1].message, "WARNINGS", 1, true))
+        -- Second: the SEPARATE dropped-artifact disclosure, at WARN.
+        assert.equals(vim.log.levels.WARN, calls[2].level)
+        assert.is_not_nil(string.find(calls[2].message, "could not be included", 1, true))
+        assert.is_not_nil(string.find(calls[2].message, "Nothing was removed from disk", 1, true))
+        assert.is_not_nil(string.find(calls[2].message, "not a finding about your work", 1, true))
+      end
+    )
+  end
+
+  it(
+    "active session: chain_broken fires its OWN separate WARN message, unchanged, alongside the "
+      .. "dropped-artifact notice when both warnings are set",
+    function()
+      local fake_controller = {
+        seal = function()
+          return {
+            kind = "ok",
+            bundle_path = "/tmp/hw3-bundle.zip",
+            warnings = { chain_broken = true, unreadable_in_scope_file = true },
+          }
+        end,
+        stop = function() end,
+      }
+
+      handle = recorder.setup({
+        workspace = "/tmp/ws-a",
+        resolve = function()
+          return { status = "active", root = "/tmp/ws-a", manifest = { assignment_id = "hw3" } }
+        end,
+        start_recording = make_start_recording(fake_controller),
+      })
+
+      local calls, restore = capture_notify()
+      restore_notify = restore
+
+      vim.cmd("ProvenanceSeal")
+
+      assert.equals(2, #calls)
+      assert.equals(vim.log.levels.WARN, calls[1].level)
+      assert.is_not_nil(string.find(calls[1].message, "WARNINGS (hash chain broken)", 1, true))
+      assert.is_not_nil(string.find(calls[1].message, "/tmp/hw3-bundle.zip", 1, true))
+      assert.equals(vim.log.levels.WARN, calls[2].level)
+      assert.is_not_nil(string.find(calls[2].message, "could not be included", 1, true))
+    end
+  )
+
   it("active session: no_sessions result notifies WARN 'nothing to seal'", function()
     local fake_controller = {
       seal = function()

@@ -40,6 +40,43 @@ local zip_writer = require("provenance.recorder.io.zip_writer")
 local M = {}
 
 -- ---------------------------------------------------------------------------
+-- seal_dropped_artifacts
+-- ---------------------------------------------------------------------------
+
+--- True iff `seal_bundle`'s `warnings` reports that ANYTHING was left out of
+--- the bundle: an orphaned/empty session artifact dropped so the bundle stays
+--- openable, or a workspace source file that could not be read at seal time.
+--- Port of the monorepo's `sealDroppedArtifacts` (`packages/recorder/src/commands/seal.ts`).
+---
+--- A dropped artifact must never read as "nothing was wrong" — see this
+--- module's own warnings, and `init.lua`'s `notify_seal_result`, which gates a
+--- SEPARATE "some files could not be included" notice on this predicate. Kept
+--- deliberately independent of `chain_broken`: that flag means the recording
+--- itself looks tampered, which is a different (and worse) fact than "a file
+--- was left out of the evidence bundle" — the two must never share one notice.
+---
+--- Does NOT include `unreadable_session` or `chain_broken`: those describe a
+--- problem WITH a packed session's contents, not a session/file being dropped
+--- from the bundle outright, and `chain_broken` already gets its own notice.
+---
+--- provnvim has no out-of-workspace or duplicate-drop case yet (those arrive
+--- with a later task, alongside `unreadableScopeDirectory` /
+--- `duplicateEntryDropped` on the monorepo side) — only the five flags below
+--- exist here today.
+--- @param warnings table  `seal_bundle`'s `result.warnings`
+--- @return boolean
+function M.seal_dropped_artifacts(warnings)
+  if warnings == nil then
+    return false
+  end
+  return warnings.orphaned_meta == true
+    or warnings.orphaned_slog == true
+    or warnings.empty_session == true
+    or warnings.orphaned_rolling_seal == true
+    or warnings.unreadable_in_scope_file == true
+end
+
+-- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
 
