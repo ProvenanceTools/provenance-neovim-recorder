@@ -178,8 +178,9 @@ end
 ---   assignment_id, semester, extension_hash,
 ---   session_id, prev_session_id (string|nil),
 ---   slog_sha256, meta_sha256,
----   submission_files = { { path, status, sha256 }, ... },
----   final = boolean|nil   -- OMITTED unless exactly `true`
+---   submission_files = { { path, status, sha256, role }, ... },
+---   final = boolean|nil          -- OMITTED unless exactly `true`
+---   scope_capped = boolean|nil   -- OMITTED unless exactly `true`
 --- }
 --- @return table manifest_value, ready for bundle.to_canonical()/bundle.sign()
 function M.build(input)
@@ -196,11 +197,17 @@ function M.build(input)
         meta_sha256 = input.meta_sha256,
       },
     },
+    -- Each entry's `role` (when present) rides through unchanged: bundle.build
+    -- reads it off the per-file input regardless of caller.
     submission_files = input.submission_files or {},
     -- Passed through verbatim: bundle.build emits the key only when this is
     -- exactly `true`, so a non-final roll is byte-identical to a pre-`final`
     -- 1.2 manifest.
     final = input.final,
+    -- Same rule as `final`: bundle.build emits `scope_capped` only when this
+    -- is exactly `true`, so a roll that never hit the cap is byte-identical
+    -- to one built before this field existed.
+    scope_capped = input.scope_capped,
   })
 end
 

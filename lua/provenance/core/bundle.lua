@@ -48,6 +48,18 @@ local SUBMISSION_FILE_VERSIONS = { ["1.1"] = true, ["1.2"] = true }
 --- 1.2 emitted before the field existed — three implementations pin those
 --- bytes. See core/rolling_manifest.lua for why absence, rather than `false`,
 --- is how a seal says "not final".
+---
+--- `submission_files[i].role` (`'reviewed' | 'attachment'`) is emitted ONLY
+--- when the input entry carries one; otherwise the key is OMITTED, never
+--- defaulted to `'reviewed'`. Absence is what every 1.1/1.2 bundle sealed
+--- before path scope means, so this is additive and does not bump
+--- `format_version`. See log-core's `bundle.ts` `SubmissionFileEntry.role`.
+---
+--- `scope_capped` (top-level) is emitted ONLY when `input.scope_capped` is
+--- exactly `true` — same rule and same reason as `final`: the canonical bytes
+--- are the signed message, so a bundle that never hit the cap must stay
+--- byte-identical to one built before this field existed. Never written as
+--- `false`. See log-core's `bundle.ts` `BundleManifest.scope_capped`.
 --- @param input table
 --- @return table  manifest_value, ready for to_canonical()/sign()
 function M.build(input)
@@ -80,6 +92,11 @@ function M.build(input)
         status = f.status,
         sha256 = (f.status == "missing" or is_null(f.sha256)) and json.NULL or f.sha256,
       }
+      -- OMIT the key entirely when the input carries no role. Never default
+      -- to "reviewed" and never emit json.NULL — absence is the meaning.
+      if not is_null(f.role) then
+        m.submission_files[i].role = f.role
+      end
     end
   end
 
@@ -87,6 +104,14 @@ function M.build(input)
   -- 0 — leaves the key OFF. Never `final = false`.
   if input.final == true then
     m.final = true
+  end
+
+  -- Strictly `== true`, same rule as `final` above. Anything else — nil,
+  -- false, json.NULL, a truthy string — leaves the key OFF. Never
+  -- `scope_capped = false`: absent and false canonicalize to different bytes
+  -- and this manifest is signed.
+  if input.scope_capped == true then
+    m.scope_capped = true
   end
 
   return m
@@ -182,6 +207,12 @@ function M.validate_shape(value)
             return result.err({ kind = "invalid_field", field = "sha256" })
           end
         end
+        -- `role`. Optional; absence reads as "reviewed" (every 1.1/1.2 bundle
+        -- sealed before path scope existed). When present it must be exactly
+        -- one of the two known values.
+        if not is_null(f.role) and f.role ~= "reviewed" and f.role ~= "attachment" then
+          return result.err({ kind = "invalid_field", field = "role" })
+        end
       end
     end
 
@@ -195,6 +226,14 @@ function M.validate_shape(value)
     -- grants nothing. Readers ignore it outside 1.2.
     if not is_null(value.final) and type(value.final) ~= "boolean" then
       return result.err({ kind = "invalid_field", field = "final" })
+    end
+
+    -- `scope_capped`. Optional everywhere; absence means "this recorder does
+    -- not report" (every bundle sealed before path scope existed), which is
+    -- not a finding. When present it must be a real boolean for the same
+    -- reason `final` must: a reader must never be steered by a truthy string.
+    if not is_null(value.scope_capped) and type(value.scope_capped) ~= "boolean" then
+      return result.err({ kind = "invalid_field", field = "scope_capped" })
     end
 
     return result.ok(value)
