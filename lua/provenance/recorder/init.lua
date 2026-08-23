@@ -177,19 +177,26 @@ function M.setup(opts)
       -- from the branch above: this is not evidence of tampering (the chain
       -- may be perfectly intact) — it's either an incomplete session
       -- recording artifact left out so the bundle stays openable, or a
-      -- workspace source file the seal could not read. The overwhelmingly
-      -- likely cause of the latter is a staff typo in files_under_review
-      -- (`src` instead of `src/`), not anything the student did — hence
-      -- "this is not a finding about your work", and "nothing was removed
-      -- from disk" because the student's first fear is that the tool deleted
-      -- their work. Do NOT fold this into the chain_broken branch above:
-      -- its "sealed WITH WARNINGS (hash chain broken)" copy would be
+      -- workspace file the path-scope seal (Task F) could not include: one
+      -- that could not be read, that resolved outside this workspace folder
+      -- (an out-of-workspace symlink target), or that was a duplicate of
+      -- another file already sealed under a different spelling. The
+      -- overwhelmingly likely cause of any of those is a staff typo in the
+      -- course manifest's scope (`src` instead of `src/`) or an ordinary
+      -- symlink into a shared directory, not anything the student did —
+      -- hence "this is not a finding about your work", and "nothing was
+      -- removed from disk" because the student's first fear is that the
+      -- tool deleted their work. Mirrors the monorepo's widened copy
+      -- (`packages/recorder/src/extension.ts:278`), plus provnvim's own
+      -- added final clause. Do NOT fold this into the chain_broken branch
+      -- above: its "sealed WITH WARNINGS (hash chain broken)" copy would be
       -- factually false here, since the chain is intact.
       if seal_cmd.seal_dropped_artifacts(result.warnings) then
         vim.notify(
           "Provenance: bundle produced. Some files could not be included — either session "
             .. "recording artifacts left out so the bundle can be opened, or workspace files that "
-            .. "could not be read at seal time. Nothing was removed from disk, and this is not a "
+            .. "could not be read, resolved outside this workspace folder, or were duplicates of "
+            .. "another sealed file at seal time. Nothing was removed from disk, and this is not a "
             .. "finding about your work. Mention it to course staff.",
           vim.log.levels.WARN
         )

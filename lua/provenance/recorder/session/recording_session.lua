@@ -763,7 +763,12 @@ function M.start(opts)
       provenance_dir = provenance_dir,
       assignment_id = manifest.assignment_id,
       semester = manifest.semester,
-      files_under_review = manifest.files_under_review,
+      scope = core_manifest.scope_from_manifest(manifest),
+      -- This session's own cap bit; seal_bundle ORs it against every other
+      -- packed session's own rolling seal (read_rolled_scope_capped) before
+      -- it reaches the manifest. `coordinator` is nil when signals are
+      -- disabled — no registry exists, so nothing can have capped.
+      scope_capped = coordinator ~= nil and coordinator.cap_hit() or false,
       session_privkey = keypair.private_key,
       session_pubkey_hex = keypair.public_key_hex,
       now = seal_opts.now or default_iso_now,

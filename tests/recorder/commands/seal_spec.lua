@@ -160,7 +160,7 @@ describe("seal.seal_bundle", function()
       provenance_dir = workspace .. "/.provenance",
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = {},
+      scope = { track = {} },
       session_privkey = ("\0"):rep(32),
       session_pubkey_hex = ("00"):rep(32),
       now = function() return "2026-05-19T14:30:00.000Z" end,
@@ -182,7 +182,7 @@ describe("seal.seal_bundle", function()
       provenance_dir = provenance_dir,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = {},
+      scope = { track = {} },
       session_privkey = ("\0"):rep(32),
       session_pubkey_hex = ("00"):rep(32),
       now = function() return "2026-05-19T14:30:00.000Z" end,
@@ -211,7 +211,7 @@ describe("seal.seal_bundle", function()
       provenance_dir = provenance_dir,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = { "src/main.py" },
+      scope = { track = { "src/main.py" } },
       session_privkey = fixture.kp.private_key,
       session_pubkey_hex = fixture.kp.public_key_hex,
       now = function() return "2026-05-19T14:30:00.000Z" end,
@@ -264,7 +264,7 @@ describe("seal.seal_bundle", function()
       provenance_dir = provenance_dir,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = { "src/main.py" },
+      scope = { track = { "src/main.py" } },
       session_privkey = fixture.kp.private_key,
       session_pubkey_hex = fixture.kp.public_key_hex,
       now = function() return "2026-05-19T14:30:00.000Z" end,
@@ -312,7 +312,7 @@ describe("seal.seal_bundle", function()
       provenance_dir = provenance_dir,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = {},
+      scope = { track = {} },
       session_privkey = fixture.kp.private_key,
       session_pubkey_hex = fixture.kp.public_key_hex,
       now = function() return "2026-05-19T14:30:00.000Z" end,
@@ -354,7 +354,7 @@ describe("seal.seal_bundle orphan guard", function()
       provenance_dir = provenance_dir,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = {},
+      scope = { track = {} },
       session_privkey = fixture.kp.private_key,
       session_pubkey_hex = fixture.kp.public_key_hex,
       compute_extension_hash = function() return ("cd"):rep(32) end,
@@ -470,7 +470,7 @@ describe("seal.seal_bundle orphan guard", function()
       provenance_dir = provenance_dir,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = {},
+      scope = { track = {} },
       session_privkey = ("\0"):rep(32),
       session_pubkey_hex = ("00"):rep(32),
       now = function() return "2026-05-19T14:30:00.000Z" end,
@@ -542,7 +542,7 @@ describe("seal.seal_bundle rolling-seal orphan guard", function()
       workspace = workspace,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = {},
+      scope = { track = {} },
       session_privkey = fx.kp.private_key,
       extension_hash = ("cd"):rep(32),
     })
@@ -555,7 +555,7 @@ describe("seal.seal_bundle rolling-seal orphan guard", function()
       provenance_dir = provenance_dir,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = {},
+      scope = { track = {} },
       session_privkey = fixture.kp.private_key,
       session_pubkey_hex = fixture.kp.public_key_hex,
       compute_extension_hash = function() return ("cd"):rep(32) end,
@@ -708,7 +708,7 @@ describe("seal.seal_bundle never reports an unreadable file as missing", functio
       provenance_dir = provenance_dir,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = { "src" },
+      scope = { track = { "src" } },
       session_privkey = fixture.kp.private_key,
       session_pubkey_hex = fixture.kp.public_key_hex,
       now = function() return "2026-05-19T14:30:10.000Z" end,
@@ -744,7 +744,7 @@ describe("seal.seal_bundle never reports an unreadable file as missing", functio
       provenance_dir = provenance_dir,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = { "secret.txt" },
+      scope = { track = { "secret.txt" } },
       session_privkey = fixture.kp.private_key,
       session_pubkey_hex = fixture.kp.public_key_hex,
       now = function() return "2026-05-19T14:30:11.000Z" end,
@@ -770,7 +770,7 @@ describe("seal.seal_bundle never reports an unreadable file as missing", functio
       provenance_dir = provenance_dir,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = { "src", "NotThere.java" },
+      scope = { track = { "src", "NotThere.java" } },
       session_privkey = fixture.kp.private_key,
       session_pubkey_hex = fixture.kp.public_key_hex,
       now = function() return "2026-05-19T14:30:12.000Z" end,
@@ -808,7 +808,7 @@ describe("seal.seal_bundle never reports an unreadable file as missing", functio
       provenance_dir = provenance_dir,
       assignment_id = "hw3",
       semester = "fa25",
-      files_under_review = { "link.java" },
+      scope = { track = { "link.java" } },
       session_privkey = fixture.kp.private_key,
       session_pubkey_hex = fixture.kp.public_key_hex,
       now = function() return "2026-05-19T14:30:13.000Z" end,
@@ -854,7 +854,7 @@ local res = s.seal_bundle({
   provenance_dir = %q,
   assignment_id = "hw3",
   semester = "fa25",
-  files_under_review = { "pipe.txt" },
+  scope = { track = { "pipe.txt" } },
   session_privkey = %q,
   session_pubkey_hex = %q,
   now = function() return "2026-05-19T14:30:14.000Z" end,
@@ -908,6 +908,10 @@ describe("seal.seal_dropped_artifacts", function()
     empty_session = false,
     orphaned_rolling_seal = false,
     unreadable_in_scope_file = false,
+    unreadable_scope_directory = false,
+    out_of_workspace_path_rejected = false,
+    duplicate_entry_dropped = false,
+    in_scope_symlink_skipped = false,
   }
 
   it("is false when every warning is clear", function()
@@ -924,6 +928,10 @@ describe("seal.seal_dropped_artifacts", function()
     "empty_session",
     "orphaned_rolling_seal",
     "unreadable_in_scope_file",
+    "unreadable_scope_directory",
+    "out_of_workspace_path_rejected",
+    "duplicate_entry_dropped",
+    "in_scope_symlink_skipped",
   }) do
     it("is true when only '" .. flag .. "' is set", function()
       local warnings = vim.deepcopy(ALL_CLEAR)
@@ -937,5 +945,534 @@ describe("seal.seal_dropped_artifacts", function()
     warnings.chain_broken = true
     warnings.unreadable_session = true
     assert.is_false(seal.seal_dropped_artifacts(warnings))
+  end)
+end)
+
+--- PATH SCOPE AT SEAL TIME (Task F) — regression tests for the five
+--- invariants CLAUDE.md and the task brief call out. Each of these must FAIL
+--- against the pre-Task-F `seal_bundle` (the one that read an exact
+--- `files_under_review` list and had no walk, no rule matching, and no
+--- hard-exclusion recheck in its own exact-entry loop).
+describe("seal.seal_bundle path scope (Task F)", function()
+  local tempdirs = {}
+
+  after_each(function()
+    for _, dir in ipairs(tempdirs) do
+      vim.fn.delete(dir, "rf")
+    end
+    tempdirs = {}
+  end)
+
+  local function new_tempdir()
+    local dir = make_tempdir()
+    table.insert(tempdirs, dir)
+    return dir
+  end
+
+  local function setup()
+    local root = new_tempdir()
+    local workspace = root .. "/workspace"
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    return workspace, provenance_dir, build_session_fixture(provenance_dir)
+  end
+
+  local function submission_files_of(provenance_dir)
+    local decoded = vim.json.decode(read_all(provenance_dir .. "/manifest.json"))
+    local by_path = {}
+    for _, f in ipairs(decoded.submission_files) do
+      by_path[f.path] = f
+    end
+    return decoded.submission_files, by_path
+  end
+
+  -- Invariant test 1: walks the workspace and seals every rule-matched file
+  -- with its role; an attachment's bytes are actually IN the zip (the
+  -- property that DEFINES an attachment); ignored and unscoped files are in
+  -- the bundle not at all.
+  it("walks the workspace and seals every rule-matched file with its role; an attachment's bytes are in the zip; ignored/unscoped files are absent", function()
+    if not unzip_available() then
+      pending("unzip not available on this machine")
+      return
+    end
+    local workspace, provenance_dir, fixture = setup()
+    vim.fn.mkdir(workspace .. "/src", "p")
+    vim.fn.mkdir(workspace .. "/logs", "p")
+    write_raw_file(workspace .. "/src/Main.java", "class Main {}")
+    write_raw_file(workspace .. "/src/A.class", "BINARY")
+    write_raw_file(workspace .. "/logs/run.log", "output")
+    write_raw_file(workspace .. "/README.md", "notes")
+
+    local result = seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      scope = { track = { "src/" }, ignore = { "*.class" }, attachments = { "logs/" } },
+      session_privkey = fixture.kp.private_key,
+      session_pubkey_hex = fixture.kp.public_key_hex,
+      now = function() return "2026-05-19T14:35:00.000Z" end,
+    })
+
+    assert.equals("ok", result.kind)
+    local _, by_path = submission_files_of(provenance_dir)
+    assert.equals("reviewed", by_path["src/Main.java"].role)
+    assert.equals("attachment", by_path["logs/run.log"].role)
+    -- ignored (matches `*.class`) and unscoped (matches nothing) are in the
+    -- bundle NOT AT ALL — no submission_files entry, present or missing.
+    assert.is_nil(by_path["src/A.class"])
+    assert.is_nil(by_path["README.md"])
+
+    -- The property that DEFINES an attachment: its bytes are actually sealed
+    -- into the ZIP, not just named in the manifest as a role label.
+    local list_out = vim.fn.system({ "unzip", "-l", result.bundle_path })
+    assert.equals(0, vim.v.shell_error)
+    assert.is_truthy(list_out:find("logs/run.log", 1, true))
+    local content = vim.fn.system({ "unzip", "-p", result.bundle_path, "logs/run.log" })
+    assert.equals("output", content)
+  end)
+
+  -- Invariant test 2: only an EXACT track entry may mint `missing`. A rule
+  -- entry asserts nothing about any particular file's existence, so it must
+  -- never produce a per-file false accusation.
+  it("an absent EXACT entry is missing; a rule entry says nothing about a file the student never wrote", function()
+    local workspace, provenance_dir, fixture = setup()
+    write_raw_file(workspace .. "/Present.java", "class Present {}")
+    -- Required.java is deliberately never created.
+
+    local result = seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      scope = { track = { "*.java", "Required.java" } },
+      session_privkey = fixture.kp.private_key,
+      session_pubkey_hex = fixture.kp.public_key_hex,
+      now = function() return "2026-05-19T14:36:00.000Z" end,
+    })
+
+    assert.equals("ok", result.kind)
+    local files, by_path = submission_files_of(provenance_dir)
+    local missing = {}
+    for _, f in ipairs(files) do
+      if f.status == "missing" then
+        missing[#missing + 1] = f.path
+      end
+    end
+    assert.same({ "Required.java" }, missing)
+    assert.equals("present", by_path["Present.java"].status)
+  end)
+
+  -- Invariant test 3: `scope_capped` is emitted only when true. An absent
+  -- key and a `false` value canonicalize -- and therefore SIGN -- differently,
+  -- so this asserts on the raw canonical STRING, not the decoded table (a
+  -- decoder can hide the difference between "key absent" and "key false").
+  it("scope_capped=true appears in the signed bytes; scope_capped=false canonicalizes with NO scope_capped key", function()
+    local workspace, provenance_dir, fixture = setup()
+
+    local function seal_with(capped)
+      return seal.seal_bundle({
+        workspace = workspace,
+        provenance_dir = provenance_dir,
+        assignment_id = "hw3",
+        semester = "fa25",
+        scope = { track = {} },
+        scope_capped = capped,
+        session_privkey = fixture.kp.private_key,
+        session_pubkey_hex = fixture.kp.public_key_hex,
+        now = function() return "2026-05-19T14:37:00.000Z" end,
+      })
+    end
+
+    local capped_result = seal_with(true)
+    assert.equals("ok", capped_result.kind)
+    local capped_text = read_all(provenance_dir .. "/manifest.json")
+    assert.is_truthy(capped_text:find('"scope_capped":true', 1, true))
+
+    local uncapped_result = seal_with(false)
+    assert.equals("ok", uncapped_result.kind)
+    local uncapped_text = read_all(provenance_dir .. "/manifest.json")
+    assert.is_nil(
+      uncapped_text:find('"scope_capped"', 1, true),
+      "an absent key and `false` canonicalize to different signed bytes -- the key must be OMITTED, never written false"
+    )
+  end)
+
+  -- Invariant test 4a: never seals a hard-excluded path however greedy the
+  -- manifest, including a NESTED sibling-assignment `.provenance/` and a
+  -- submodule `.git/` -- exercised through the WALK's own pruning via a
+  -- match-everything rule (`"*"` is a suffix rule matching every path, not
+  -- an exact entry).
+  it("never seals a hard-excluded path however greedy the manifest, including nested .provenance/ and .git/", function()
+    local workspace, provenance_dir, fixture = setup()
+    vim.fn.mkdir(workspace .. "/hw3/.provenance", "p")
+    write_raw_file(workspace .. "/hw3/.provenance/manifest.json", "SECRET SIBLING MANIFEST")
+    vim.fn.mkdir(workspace .. "/vendor/lib/.git", "p")
+    write_raw_file(workspace .. "/vendor/lib/.git/config", "SECRET SUBMODULE CONFIG")
+    write_raw_file(workspace .. "/hw3.txt", "ordinary submission")
+
+    local result = seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      scope = { track = { "*" } },
+      session_privkey = fixture.kp.private_key,
+      session_pubkey_hex = fixture.kp.public_key_hex,
+      now = function() return "2026-05-19T14:38:00.000Z" end,
+    })
+
+    assert.equals("ok", result.kind)
+    local files = submission_files_of(provenance_dir)
+    assert.is_true(#files > 0, "the ordinary file must still be sealed")
+    for _, f in ipairs(files) do
+      assert.is_nil(f.path:find(".provenance", 1, true), "must never seal a path under .provenance/: " .. f.path)
+      assert.is_nil(f.path:find(".git", 1, true), "must never seal a path under .git/: " .. f.path)
+    end
+  end)
+
+  -- Invariant test 4b: the exact-entry loop bypasses the walk's own pruning
+  -- entirely (it reads a manifest-supplied path directly by string), so it
+  -- must apply `has_hard_excluded_segment` itself. This proves that second,
+  -- independent check: naming a nested hard-excluded path EXACTLY must
+  -- still never seal it, even though an exact entry would otherwise win.
+  it("the exact-entry loop rechecks hard-excluded segments itself -- an EXACT entry naming a nested .provenance/ or .git/ path is never sealed", function()
+    local workspace, provenance_dir, fixture = setup()
+    vim.fn.mkdir(workspace .. "/hw3/.provenance", "p")
+    write_raw_file(workspace .. "/hw3/.provenance/manifest.json", "SECRET SIBLING MANIFEST")
+    vim.fn.mkdir(workspace .. "/vendor/lib/.git", "p")
+    write_raw_file(workspace .. "/vendor/lib/.git/config", "SECRET SUBMODULE CONFIG")
+
+    local result = seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      scope = { track = { "hw3/.provenance/manifest.json", "vendor/lib/.git/config" } },
+      session_privkey = fixture.kp.private_key,
+      session_pubkey_hex = fixture.kp.public_key_hex,
+      now = function() return "2026-05-19T14:39:00.000Z" end,
+    })
+
+    assert.equals("ok", result.kind)
+    local files = submission_files_of(provenance_dir)
+    assert.equals(
+      0,
+      #files,
+      "an EXACT entry naming a nested hard-excluded path must never be sealed, present OR missing"
+    )
+  end)
+
+  -- Invariant test 5: a walk-discovered (RULE-matched, not exact) file that
+  -- cannot be read is DROPPED, not missing, and sets unreadable_in_scope_file.
+  it("a walk-discovered RULE-matched file that cannot be read is DROPPED, not missing", function()
+    local workspace, provenance_dir, fixture = setup()
+    local secret = workspace .. "/secret.txt"
+    write_raw_file(secret, "top secret")
+    local uv = vim.uv or vim.loop
+    uv.fs_chmod(secret, tonumber("000", 8))
+
+    -- Verify the denial actually took effect before asserting; a uid that
+    -- defeats permission bits (root) makes this pending rather than false.
+    local fd = uv.fs_open(secret, "r", 438)
+    if fd ~= nil then
+      uv.fs_close(fd)
+      uv.fs_chmod(secret, tonumber("644", 8))
+      pending("running with elevated privileges that defeat permission bits")
+      return
+    end
+
+    local result = seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      scope = { track = { "*.txt" } }, -- RULE entry, not exact
+      session_privkey = fixture.kp.private_key,
+      session_pubkey_hex = fixture.kp.public_key_hex,
+      now = function() return "2026-05-19T14:40:00.000Z" end,
+    })
+    uv.fs_chmod(secret, tonumber("644", 8))
+
+    assert.equals("ok", result.kind)
+    assert.is_true(result.warnings.unreadable_in_scope_file)
+    local files, by_path = submission_files_of(provenance_dir)
+    assert.equals(0, #files)
+    assert.is_nil(by_path["secret.txt"])
+  end)
+
+  -- Invariant test 6 (invariant 1's central regression): an EXACT entry the
+  -- walk SIGHTED, but whose own read then fails (here: the file genuinely
+  -- vanishes between the walk listing it and its read -- the real production
+  -- race this invariant exists for), must be DROPPED, never `missing`. The
+  -- skip-set the exact-entry loop consults must be built from the walk's
+  -- SIGHTING, not from a successful read: if it were built from successful
+  -- reads only, this file would fall through to the exact-entry loop and
+  -- mint a false `missing` for a file that WAS on disk when the walk saw it.
+  --
+  -- `workspace_file_read.read_workspace_file` is a shared, already-committed
+  -- pure I/O module; this test monkeypatches its single entry point for the
+  -- duration of one call to delete the file at the exact instant the FIRST
+  -- read for it happens (simulating the real vanish-between-listing-and-
+  -- reading race deterministically), then restores it. Every read that
+  -- follows is 100% real I/O against the now-genuinely-absent file.
+  it("an EXACT entry the walk sighted but which vanished before its own read is DROPPED, never missing", function()
+    local workspace, provenance_dir, fixture = setup()
+    local target = workspace .. "/Ghost.java"
+    write_raw_file(target, "class Ghost {}") -- exists at walk time
+
+    local wfr = require("provenance.recorder.io.workspace_file_read")
+    local real_read = wfr.read_workspace_file
+    local calls_for_ghost = 0
+    local deleted = false
+    wfr.read_workspace_file = function(root, real_root, rel_path, opts)
+      if rel_path == "Ghost.java" then
+        calls_for_ghost = calls_for_ghost + 1
+        if not deleted then
+          deleted = true
+          vim.fn.delete(target)
+        end
+      end
+      return real_read(root, real_root, rel_path, opts)
+    end
+
+    local ok, result = pcall(seal.seal_bundle, {
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      scope = { track = { "Ghost.java" } }, -- EXACT entry, also sighted by the walk
+      session_privkey = fixture.kp.private_key,
+      session_pubkey_hex = fixture.kp.public_key_hex,
+      now = function() return "2026-05-19T14:41:00.000Z" end,
+    })
+    wfr.read_workspace_file = real_read
+
+    assert.is_true(ok, tostring(result))
+    assert.is_true(deleted, "the fixture's own hook never fired -- the race was never exercised")
+    assert.equals(
+      1,
+      calls_for_ghost,
+      "the exact-entry loop must NEVER re-read a path the walk already sighted, regardless of what that read returned"
+    )
+
+    assert.equals("ok", result.kind)
+    local files = submission_files_of(provenance_dir)
+    assert.equals(
+      0,
+      #files,
+      "a walk-sighted file that vanished before its own read must be dropped, never recorded as missing"
+    )
+    assert.is_true(result.warnings.unreadable_in_scope_file)
+  end)
+
+  -- Invariant test 7: a tracked file symlinked OUTSIDE the workspace is
+  -- DROPPED and disclosed via its OWN flag, never `missing` -- the
+  -- overwhelmingly common cause is a student's own
+  -- `ln -s ~/shared/data.csv data.csv`, not an attack.
+  it("a tracked file symlinked OUTSIDE the workspace is DROPPED and disclosed, never missing", function()
+    local workspace, provenance_dir, fixture = setup()
+    local outside_root = new_tempdir()
+    local outside_target = outside_root .. "/secret.csv"
+    write_raw_file(outside_target, "outside data")
+
+    local uv = vim.uv or vim.loop
+    local ok = pcall(function()
+      assert(uv.fs_symlink(outside_target, workspace .. "/data.csv"))
+    end)
+    if not ok then
+      pending("symlink creation not available on this machine")
+      return
+    end
+
+    local result = seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      scope = { track = { "data.csv" } },
+      session_privkey = fixture.kp.private_key,
+      session_pubkey_hex = fixture.kp.public_key_hex,
+      now = function() return "2026-05-19T14:42:00.000Z" end,
+    })
+
+    assert.equals("ok", result.kind)
+    local files = submission_files_of(provenance_dir)
+    local missing_count = 0
+    for _, f in ipairs(files) do
+      if f.status == "missing" then
+        missing_count = missing_count + 1
+      end
+    end
+    assert.equals(0, missing_count, "an out-of-workspace symlink target must produce ZERO missing records")
+    assert.is_true(result.warnings.out_of_workspace_path_rejected)
+    -- The two facts must stay distinct: this was refused because of WHERE it
+    -- points, not because it could not be read.
+    assert.is_false(result.warnings.unreadable_in_scope_file)
+  end)
+end)
+
+--- SCOPE_CAPPED ORS ACROSS PACKED SESSIONS (Task F).
+---
+--- `scope_capped` on the classic manifest is a whole-bundle fact: the live
+--- session's own registry answers only for itself, and every OTHER packed
+--- session answers through its own rolling seal. Three sub-rules, all exact.
+describe("seal.seal_bundle scope_capped ORs across packed sessions", function()
+  local tempdirs = {}
+  local rolling_seal_writer = require("provenance.recorder.io.rolling_seal_writer")
+  local rolling_manifest = require("provenance.core.rolling_manifest")
+
+  after_each(function()
+    for _, dir in ipairs(tempdirs) do
+      vim.fn.delete(dir, "rf")
+    end
+    tempdirs = {}
+  end)
+
+  local function new_tempdir()
+    local dir = make_tempdir()
+    table.insert(tempdirs, dir)
+    return dir
+  end
+
+  local function setup()
+    local root = new_tempdir()
+    local workspace = root .. "/workspace"
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    return workspace, provenance_dir
+  end
+
+  it("a packed session whose OWN rolling seal reports scope_capped=true caps the whole bundle, even when the live session did not cap", function()
+    local workspace, provenance_dir = setup()
+    local live = build_session_fixture(provenance_dir, {
+      logical_id = "11111111-1111-4111-8111-111111111111",
+      file_uuid = "11111111-1111-4111-8111-111111111111",
+    })
+    local other = build_session_fixture(provenance_dir, {
+      logical_id = "22222222-2222-4222-8222-222222222222",
+      file_uuid = "22222222-2222-4222-8222-222222222222",
+    })
+
+    local roll_res = rolling_seal_writer.write_rolling_seal({
+      provenance_dir = provenance_dir,
+      session_id = other.session_id,
+      prev_session_id = nil,
+      slog_path = other.slog_path,
+      workspace = workspace,
+      assignment_id = "hw3",
+      semester = "fa25",
+      scope = { track = {} },
+      scope_capped = true,
+      session_privkey = other.kp.private_key,
+      extension_hash = ("cd"):rep(32),
+    })
+    assert.equals("written", roll_res.kind)
+
+    local result = seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      scope = { track = {} },
+      scope_capped = false, -- the LIVE session did not cap
+      session_privkey = live.kp.private_key,
+      session_pubkey_hex = live.kp.public_key_hex,
+      compute_extension_hash = function() return ("cd"):rep(32) end,
+      now = function() return "2026-05-19T14:43:00.000Z" end,
+    })
+
+    assert.equals("ok", result.kind)
+    local text = read_all(provenance_dir .. "/manifest.json")
+    assert.is_truthy(text:find('"scope_capped":true', 1, true))
+  end)
+
+  it("a packed session with NO rolling seal contributes an ABSENT report -- the key stays omitted when nothing else capped", function()
+    local workspace, provenance_dir = setup()
+    local live = build_session_fixture(provenance_dir, {
+      logical_id = "33333333-3333-4333-8333-333333333333",
+      file_uuid = "33333333-3333-4333-8333-333333333333",
+    })
+    -- A second packed session with NO rolling seal at all.
+    build_session_fixture(provenance_dir, {
+      logical_id = "44444444-4444-4444-8444-444444444444",
+      file_uuid = "44444444-4444-4444-8444-444444444444",
+    })
+
+    local result = seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      scope = { track = {} },
+      scope_capped = false,
+      session_privkey = live.kp.private_key,
+      session_pubkey_hex = live.kp.public_key_hex,
+      compute_extension_hash = function() return ("cd"):rep(32) end,
+      now = function() return "2026-05-19T14:44:00.000Z" end,
+    })
+
+    assert.equals("ok", result.kind)
+    local text = read_all(provenance_dir .. "/manifest.json")
+    assert.is_nil(text:find('"scope_capped"', 1, true))
+  end)
+
+  it("a MALFORMED rolling seal never mints true, and an ORPHANED (unpacked) seal is never consulted", function()
+    local workspace, provenance_dir = setup()
+    local live = build_session_fixture(provenance_dir, {
+      logical_id = "55555555-5555-4555-8555-555555555555",
+      file_uuid = "55555555-5555-4555-8555-555555555555",
+    })
+    local other = build_session_fixture(provenance_dir, {
+      logical_id = "66666666-6666-4666-8666-666666666666",
+      file_uuid = "66666666-6666-4666-8666-666666666666",
+    })
+
+    -- A MALFORMED rolling seal for a PACKED session: garbage in place of
+    -- valid JSON. Must never mint `true`.
+    local malformed_names = rolling_manifest.filenames(other.session_id)
+    write_raw_file(provenance_dir .. "/" .. malformed_names.json, "{not valid json at all")
+    write_raw_file(provenance_dir .. "/" .. malformed_names.sig, ("ab"):rep(64))
+
+    -- A well-formed, validly-signed rolling seal claiming scope_capped=true,
+    -- but for a session id THIS BUNDLE DOES NOT PACK. Must never be
+    -- consulted -- it describes a recording this bundle makes no claim about.
+    local orphan_id = "77777777-7777-4777-8777-777777777777"
+    local orphan_names = rolling_manifest.filenames(orphan_id)
+    local orphan_manifest_value = rolling_manifest.build({
+      assignment_id = "hw3",
+      semester = "fa25",
+      extension_hash = ("cd"):rep(32),
+      session_id = orphan_id,
+      prev_session_id = nil,
+      slog_sha256 = ("00"):rep(32),
+      meta_sha256 = ("00"):rep(32),
+      submission_files = {},
+      scope_capped = true,
+    })
+    local orphan_kp = session_keys.generate()
+    local orphan_signed = core_bundle.sign(orphan_manifest_value, orphan_kp.private_key)
+    write_raw_file(provenance_dir .. "/" .. orphan_names.json, orphan_signed.canonical_json)
+    write_raw_file(provenance_dir .. "/" .. orphan_names.sig, orphan_signed.signature_hex)
+
+    local result = seal.seal_bundle({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      assignment_id = "hw3",
+      semester = "fa25",
+      scope = { track = {} },
+      scope_capped = false,
+      session_privkey = live.kp.private_key,
+      session_pubkey_hex = live.kp.public_key_hex,
+      compute_extension_hash = function() return ("cd"):rep(32) end,
+      now = function() return "2026-05-19T14:45:00.000Z" end,
+    })
+
+    assert.equals("ok", result.kind)
+    local text = read_all(provenance_dir .. "/manifest.json")
+    assert.is_nil(
+      text:find('"scope_capped"', 1, true),
+      "neither the malformed packed seal nor the orphaned (unpacked) seal may mint scope_capped=true"
+    )
   end)
 end)
