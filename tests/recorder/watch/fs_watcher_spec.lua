@@ -563,9 +563,20 @@ describe("fs_watcher", function()
     -- while a settle wait here made every sampled round trip resolve in
     -- under 10ms even under that same load). Same category of race as the
     -- fs_poll baseline race documented on the sibling integration test
-    -- above; this is the fs_event analogue of it. TEST-ONLY synchronization
-    -- concern: fs_watcher.start() itself makes no readiness promise, and
-    -- doesn't need to.
+    -- above; this is the fs_event analogue of it.
+    --
+    -- TEST-ONLY synchronization concern. The FOREVER above is true of one
+    -- fs_event HANDLE in isolation, NOT of the recorder. In production
+    -- start() does a one-time initial workspace walk, and every callback
+    -- re-scans its directory and diffs against last-known children rather
+    -- than trusting the callback's own filename/events (which macOS reports
+    -- unreliably anyway). So a file missed during the registration window is
+    -- picked up by the NEXT event in that directory — delayed, not lost.
+    -- This test is the only context where FOREVER is actually reachable,
+    -- because it is the only one that creates a single file and then does
+    -- nothing else. That is why fs_watcher.start() makes no readiness
+    -- promise and does not need one: do NOT add a readiness handshake to
+    -- production on the strength of this comment.
     vim.wait(300)
 
     -- A GENUINELY NEW file, created after the watcher started — the
