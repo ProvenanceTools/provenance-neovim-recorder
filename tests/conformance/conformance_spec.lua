@@ -180,6 +180,7 @@ end)
 
 local course_cert = require("provenance.core.course_cert")
 local capture_policy = require("provenance.core.capture_policy")
+local path_scope = require("provenance.core.path_scope")
 
 -- Bring a raw vim.json.decode result into the value model core/manifest.lua
 -- speaks (arrays tagged, nulls as json.NULL). The vector files store manifests
@@ -402,7 +403,60 @@ describe("conformance: manifest-v2.json (the trust chain, program spec §3)", fu
     assert.equals(fx.valid_2_0.canonical_json, manifest.signed_payload(parsed.value))
     assert.is_false(fx.valid_2_0.canonical_json:find("course_cert", 1, true) ~= nil)
     assert.is_false(fx.valid_2_0.canonical_json:find('"sig"', 1, true) ~= nil)
+    -- The signed payload now carries THREE arrays (files_under_review, ignore,
+    -- attachments); a port that helpfully sorted any of them would produce
+    -- different bytes and a dead signature here.
+    assert.is_not_nil(fx.valid_2_0.canonical_json:find('"ignore":["target/","src/Scratch.java","*.class"]', 1, true))
+    assert.is_not_nil(fx.valid_2_0.canonical_json:find('"attachments":["logs/","design.pdf","*.log"]', 1, true))
+    -- And its `sig` verifies over exactly those bytes, under the course key
+    -- the fixture's own course_cert names.
+    assert.is_true(manifest.verify(parsed.value, fx.valid_2_0.manifest.course_cert.course_pubkey))
   end)
+
+  it("scope_lists: the parsed manifest's THREE scope lists equal the fixture's, form for form", function()
+    local case = fx.scope_lists
+    local parsed = manifest.parse(vim.json.encode(fx.valid_2_0.manifest))
+    assert.is_true(parsed.ok)
+
+    local function to_plain(arr)
+      local out = {}
+      for i = 1, #arr do
+        out[i] = arr[i]
+      end
+      return out
+    end
+
+    assert.same(case.files_under_review, to_plain(parsed.value.files_under_review))
+    assert.same(case.ignore, to_plain(parsed.value.ignore))
+    assert.same(case.attachments, to_plain(parsed.value.attachments))
+
+    -- entry_forms names which entry is which of the three legal forms.
+    assert.equals(case.entry_forms.directory_prefix, "src/")
+    assert.is_false(path_scope.is_exact_entry(case.entry_forms.directory_prefix))
+    assert.is_true(path_scope.is_exact_entry(case.entry_forms.exact_path))
+    assert.is_false(path_scope.is_exact_entry(case.entry_forms.suffix))
+  end)
+
+  it("scope_rejects: every negative case is refused by parse(), and the fixture is not truncated", function()
+    -- Asserted up front so a truncated fixture cannot silently make the loop
+    -- below vacuous.
+    assert.equals(5, #fx.scope_rejects)
+    for _, case in ipairs(fx.scope_rejects) do
+      local parsed = manifest.parse(case.manifest_json)
+      assert.equals(case.expected.parses, parsed.ok, case.name .. ": " .. case.note)
+    end
+  end)
+
+  it(
+    "MANDATORY precedence: src/Scratch.java is matched by BOTH the reviewed \"src/\" prefix and the "
+      .. 'reviewed "*.java" suffix, and is still ignored — ignore outranks files_under_review',
+    function()
+      local parsed = manifest.parse(vim.json.encode(fx.valid_2_0.manifest))
+      assert.is_true(parsed.ok)
+      local scope = manifest.scope_from_manifest(parsed.value)
+      assert.equals("ignored", path_scope.resolve_path_role("src/Scratch.java", scope))
+    end
+  )
 
   it("MANDATORY unknown_keys_ignored: unknown top-level keys are ignored and do not move the signed bytes", function()
     local case = fx.unknown_keys_ignored
@@ -415,7 +469,16 @@ describe("conformance: manifest-v2.json (the trust chain, program spec §3)", fu
   it("2.0 requires the full field set: dropping any one of them is a parse error", function()
     -- A fixed signed key set is what lets three hand-written canonicalizers
     -- agree without a "which optionals were present" rule.
-    for _, field in ipairs({ "course_id", "collaboration", "submission", "scope", "policy", "course_cert" }) do
+    for _, field in ipairs({
+      "course_id",
+      "ignore",
+      "attachments",
+      "collaboration",
+      "submission",
+      "scope",
+      "policy",
+      "course_cert",
+    }) do
       local decoded = vim.json.decode(vim.json.encode(fx.valid_2_0.manifest))
       decoded[field] = nil
       local parsed = manifest.parse(vim.json.encode(decoded))

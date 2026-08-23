@@ -77,9 +77,10 @@ describe("policy_gate.effective_policy", function()
 end)
 
 --- An ARCHIVED, REAL signed manifest whose policy still carries both retired
---- keys — the exact bytes the shared dev manifest had before it was re-issued
---- without them. Kept as its own fixture precisely so re-issuing the live one
---- could not quietly delete this regression.
+--- keys — the same `policy.capture.doc_open_close` / `inline_content` bytes
+--- the shared dev manifest had before it was re-issued without them. Kept as
+--- its own fixture precisely so re-issuing the live one could not quietly
+--- delete this regression.
 ---
 --- It is the strongest available inertness case, because the retired keys sit
 --- INSIDE the course-signed payload: the signature covers them verbatim, so the
@@ -90,6 +91,22 @@ end)
 --- This matters more in this port than in the others: validate_signed_subtree
 --- walks the policy sub-tree, so an over-strict "unknown capture key" rule here
 --- would reject a manifest the other two recorders accept.
+---
+--- RE-SIGNED once, 2026-08-22, when `ignore`/`attachments` became REQUIRED at
+--- 2.0 (program spec / docs/superpowers/specs/2026-08-22-path-scope-design.md
+--- §3): the original bytes predated those two keys entirely, so under the new
+--- required-field rule they stopped parsing as a 2.0 manifest at all — which
+--- would have silently deleted this fixture's entire reason for existing (the
+--- retired-CAPTURE-key inertness claim) rather than testing it. The DEV course
+--- key (`.notes/dev-keypair.json` in the monorepo — deliberately public/
+--- insecure, never a real secret) re-signed the SAME payload with
+--- `ignore: []` and `attachments: []` added and every other field, retired
+--- capture keys included, byte-for-byte unchanged. This is not the same kind
+--- of "never re-sign" a real archived student submission gets: there is no
+--- offline course key here to lose access to, and the fixture's claim was
+--- always about `policy`, not about `ignore`/`attachments` predating this
+--- port. The "must never be re-signed" guard below is re-worded accordingly:
+--- it still guards against a future edit quietly dropping the retired keys.
 describe("policy_gate retired keys inside a real signed policy", function()
   local core_manifest = require("provenance.core.manifest")
   local trust_keys = require("provenance.trust_keys")
@@ -105,9 +122,13 @@ describe("policy_gate retired keys inside a real signed policy", function()
   )
 
   it("the archived fixture really does carry both retired keys in its signed policy", function()
-    -- Guards the tests below from silently going vacuous. This fixture is
-    -- FROZEN: it must never be re-signed, because its whole value is being a
-    -- genuine signed artifact from before the keys were retired.
+    -- Guards the tests below from silently going vacuous. This fixture's
+    -- `policy` block is FROZEN: it must never be re-signed with the retired
+    -- keys removed, because its whole value is testing that a genuine signed
+    -- policy predating their retirement still resolves as inert. (It WAS
+    -- re-signed once, 2026-08-22, to add the newly-required `ignore`/
+    -- `attachments` keys with the DEV course key — see the describe block's
+    -- docstring above.)
     local raw = vim.json.decode(text)
     assert.is_false(raw.policy.capture.doc_open_close == nil)
     assert.is_false(raw.policy.capture.inline_content == nil)

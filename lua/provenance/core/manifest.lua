@@ -17,8 +17,8 @@
 --- Signed payload:
 ---
 ---   canonicalize({format_version, course_id, assignment_id, semester,
----                 issued_at, files_under_review, collaboration, submission,
----                 scope, policy})
+---                 issued_at, files_under_review, ignore, attachments,
+---                 collaboration, submission, scope, policy})
 ---
 --- `signed_payload` excludes `sig` in both versions, and excludes `course_cert`
 --- in 2.0 — the course does not sign its own certificate.
@@ -46,6 +46,7 @@ local json = require("provenance.core.json")
 local result = require("provenance.core.result")
 local ed25519 = require("provenance.core.ed25519")
 local course_cert = require("provenance.core.course_cert")
+local path_scope = require("provenance.core.path_scope")
 
 local M = {}
 
@@ -150,6 +151,34 @@ local function validate_signed_subtree(value, path)
   return result.ok(true)
 end
 
+--- Validate one path-scope list. Used for all THREE lists at 2.0 — `ignore`,
+--- `attachments`, and (at 2.0 only) `files_under_review`, whose entries must
+--- also satisfy the entry grammar there. Port of log-core's `checkScopeList`.
+---
+--- **At 1.x this is NOT called at all** (see the module docstring): 1.x
+--- parsing must never reject, and a 1.x manifest's entries carry exact-path
+--- meaning regardless of how they are spelled — an entry ending in `/` there
+--- means a file literally named that, not a directory prefix.
+--- @param value unknown
+--- @param field string
+--- @return table|nil  {reason, field} on failure, nil if `value` is legal
+local function check_scope_list(value, field)
+  if type(value) ~= "table" or not json.is_array(value) then
+    return { reason = "must be an array", field = field }
+  end
+  for i = 1, #value do
+    local entry = value[i]
+    if type(entry) ~= "string" then
+      return { reason = "all elements must be strings", field = field }
+    end
+    local problem = path_scope.validate_scope_entry(entry)
+    if problem ~= nil then
+      return { reason = string.format('"%s": %s', entry, problem.detail), field = field }
+    end
+  end
+  return nil
+end
+
 --- Resolve a manifest's format version.
 ---
 --- **A missing `format_version` means "1.0".** 1.x manifests have no such
@@ -252,6 +281,26 @@ function M.parse_value(obj)
     return result.err({ reason = "invalid", field = "course_id" })
   end
 
+  -- `ignore` and `attachments`: REQUIRED at 2.0. `[]` is the explicit "I do
+  -- not use this" spelling; absence is a rejection. Requiring the full set
+  -- keeps the signed key set fixed, which is what lets the Kotlin and Lua
+  -- ports canonicalize identically without reproducing a "which optional
+  -- keys were present" rule.
+  local ignore_problem = check_scope_list(obj.ignore, "ignore")
+  if ignore_problem ~= nil then
+    return result.err(ignore_problem)
+  end
+  local attachments_problem = check_scope_list(obj.attachments, "attachments")
+  if attachments_problem ~= nil then
+    return result.err(attachments_problem)
+  end
+  -- files_under_review already passed the array/string check in the shared
+  -- section above; at 2.0 its entries must also satisfy the entry grammar.
+  local track_problem = check_scope_list(files, "files_under_review")
+  if track_problem ~= nil then
+    return result.err(track_problem)
+  end
+
   local enums = {
     { field = "collaboration", allowed = COLLABORATION_VALUES },
     { field = "submission", allowed = SUBMISSION_VALUES },
@@ -285,6 +334,10 @@ function M.parse_value(obj)
   end
 
   parsed.course_id = obj.course_id
+  -- Already json.array-tagged by normalize() (same convention as
+  -- files_under_review above).
+  parsed.ignore = obj.ignore
+  parsed.attachments = obj.attachments
   parsed.collaboration = obj.collaboration
   parsed.submission = obj.submission
   parsed.scope = obj.scope
@@ -327,6 +380,8 @@ function M.signed_payload(m)
       semester = m.semester,
       issued_at = m.issued_at,
       files_under_review = json.array(m.files_under_review),
+      ignore = json.array(m.ignore),
+      attachments = json.array(m.attachments),
       collaboration = m.collaboration,
       submission = m.submission,
       scope = m.scope,
@@ -480,6 +535,23 @@ function M.verify_chain(m, root_pubkey_hex)
     cert = cert,
     window = course_cert.check_window(cert, checked.issued_at),
   })
+end
+
+--- The three scope lists as a `path_scope.resolve_path_role`-shaped scope
+--- table: `{track, ignore, attachments}`. Port of log-core's
+--- `scopeFromManifest`, and the ONLY way a consumer should build one.
+---
+--- A 1.x manifest has neither `ignore` nor `attachments` — both default to
+--- empty, which resolves every path exactly as 1.x always behaved (every
+--- `files_under_review` entry `"reviewed"`, everything else `"unscoped"`).
+--- @param m table  a Manifest (typically the .value of a successful parse())
+--- @return table {track: string[], ignore: string[], attachments: string[]}
+function M.scope_from_manifest(m)
+  return {
+    track = m.files_under_review,
+    ignore = m.ignore or {},
+    attachments = m.attachments or {},
+  }
 end
 
 return M
