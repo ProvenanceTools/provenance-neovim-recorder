@@ -552,14 +552,34 @@ describe("fs_watcher", function()
       poll_interval_ms = 100, -- fast poll to keep the test snappy
     }))
 
+    -- vim.uv's fs_event registers its watch with the OS (kqueue/FSEvents on
+    -- macOS) via an ASYNC path, not a synchronous one — start() returning
+    -- is not proof the OS has actually begun watching yet. A write landing
+    -- before that registration truly lands is invisible to this watch
+    -- FOREVER, not merely delayed (confirmed empirically: instrumented runs
+    -- under `make test`'s full-suite load — every spec file spawned as a
+    -- parallel headless nvim subprocess, uncapped — showed this assertion
+    -- exhausting a 45s budget with the predicate never once turning true,
+    -- while a settle wait here made every sampled round trip resolve in
+    -- under 10ms even under that same load). Same category of race as the
+    -- fs_poll baseline race documented on the sibling integration test
+    -- above; this is the fs_event analogue of it. TEST-ONLY synchronization
+    -- concern: fs_watcher.start() itself makes no readiness promise, and
+    -- doesn't need to.
+    vim.wait(300)
+
     -- A GENUINELY NEW file, created after the watcher started — the
     -- directory fs_event handle must discover it, admit it to the
     -- registry, and emit exactly one create.
     write_file(dir .. "/src/New.java", "class New {}\n")
 
-    local ok = vim.wait(3000, function() return #events > 0 end, 50)
+    -- Poll-until-deadline, not a fixed sleep — the predicate short-circuits
+    -- as soon as the event lands, so this costs nothing when idle. 5s is
+    -- generous margin over the sub-10ms deliveries measured above once the
+    -- settle wait removes the registration race.
+    local ok = vim.wait(5000, function() return #events > 0 end, 50)
 
-    assert.is_true(ok, "expected the fs_event-discovered file to emit within 3s")
+    assert.is_true(ok, "expected the fs_event-discovered file to emit within 5s")
     assert.equals(1, #events)
     assert.equals("fs.external_change", events[1].kind)
     assert.equals("create", events[1].data.operation)
@@ -617,6 +637,14 @@ describe("fs_watcher", function()
         poll_interval_ms = 100,
       }))
 
+      -- start() opens the ancestor pursuit fs_event handle (on the
+      -- workspace root, since "src" doesn't exist yet) — same async OS
+      -- registration race as the sibling INTEGRATION test above: a change
+      -- landing before that registration truly takes effect is invisible
+      -- to this watch forever, not merely delayed. See that test's own
+      -- comment for the empirical evidence.
+      vim.wait(300)
+
       vim.fn.mkdir(dir .. "/src", "p")
       write_file(dir .. "/src/Main.java", "class Main {}\n")
 
@@ -625,11 +653,12 @@ describe("fs_watcher", function()
       -- own visit_dir call does a fresh scandir of "src" as its first act,
       -- so it picks up Main.java even if the write landed before promotion
       -- noticed the directory — splitting the wait would only make the
-      -- test more sensitive to relative timing, not less. Wider than the
-      -- sibling fs_poll integration test's 3s budget: this path needs TWO
-      -- real fs_event round trips under load (src/ appearing, then
-      -- Main.java appearing inside it), not one.
-      local ok = vim.wait(6000, function() return #events > 0 end, 50)
+      -- test more sensitive to relative timing, not less. Poll-until-
+      -- deadline, not a fixed sleep — costs nothing when idle. 8s keeps
+      -- the sibling tests' 2x-of-single-round-trip relationship now that
+      -- the registration race (the actual full-suite flake cause, not
+      -- generic slowness) is handled by the settle wait above.
+      local ok = vim.wait(8000, function() return #events > 0 end, 50)
 
       assert.is_true(ok, "expected src/Main.java to be discovered after src/ was created mid-session")
       assert.equals(1, #events)
@@ -656,10 +685,17 @@ describe("fs_watcher", function()
         poll_interval_ms = 100,
       }))
 
+      -- Same async watch-registration race as the sibling pursuit tests
+      -- above — see the INTEGRATION test's comment for the empirical
+      -- evidence this is a real (test-only) race, not generic slowness.
+      vim.wait(300)
+
       vim.fn.mkdir(dir .. "/a/b/c", "p")
       write_file(dir .. "/a/b/c/Deep.java", "class Deep {}\n")
 
-      local ok = vim.wait(3000, function() return #events > 0 end, 50)
+      -- Poll-until-deadline; short-circuits immediately once the event
+      -- lands, so this costs nothing when idle.
+      local ok = vim.wait(5000, function() return #events > 0 end, 50)
 
       assert.is_true(ok, "expected promotion through a/b/c despite the batched mkdir -p")
       assert.equals(1, #events)
@@ -681,24 +717,34 @@ describe("fs_watcher", function()
         poll_interval_ms = 100,
       }))
 
+      -- Same async watch-registration race as the sibling pursuit tests
+      -- above — see the INTEGRATION test's comment for the empirical
+      -- evidence this is a real (test-only) race, not generic slowness.
+      vim.wait(300)
+
       vim.fn.mkdir(dir .. "/src", "p")
       write_file(dir .. "/src/First.java", "class First {}\n")
 
-      local ok1 = vim.wait(3000, function() return #created_paths(events) >= 1 end, 50)
+      -- Poll-until-deadline; short-circuits immediately once the event
+      -- lands, so this costs nothing when idle.
+      local ok1 = vim.wait(5000, function() return #created_paths(events) >= 1 end, 50)
       assert.is_true(ok1, "sanity: the initial promotion + create fired")
       assert.same({ "src/First.java" }, created_paths(events))
 
       -- rm -rf src && recreate, e.g. `git checkout src` or a build step
       -- that wipes and regenerates -- a different file this time, so the
       -- assertion below cannot be satisfied by the (harmless, still-alive)
-      -- fs_poll handle left over from the first file alone.
+      -- fs_poll handle left over from the first file alone. This also
+      -- doubles as the settle for the FRESH fs_event handle pursue()
+      -- opens on "src" when it re-promotes below (same registration race
+      -- as above) — 600ms covers both purposes.
       vim.fn.delete(dir .. "/src", "rf")
-      vim.wait(300) -- let the deletion settle / be observed
+      vim.wait(600)
 
       vim.fn.mkdir(dir .. "/src", "p")
       write_file(dir .. "/src/Second.java", "class Second {}\n")
 
-      local ok2 = vim.wait(3000, function()
+      local ok2 = vim.wait(5000, function()
         for _, p in ipairs(created_paths(events)) do
           if p == "src/Second.java" then
             return true
