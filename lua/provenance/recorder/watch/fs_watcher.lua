@@ -70,6 +70,40 @@
 ---     alone would make `src/Main.java` LESS reliably watched than
 ---     `Main.java` named exactly in the same manifest.
 ---
+--- ## A folder root that does not exist yet at session start (path-scope
+--- ## design spec D3)
+---
+--- A snapshot that never discovers a directory the student creates later is
+--- an R2 false-accusation-by-omission shape: "I wrote it in a new file" is
+--- ordinary, innocent behaviour, and a course writing `src/` for a from-
+--- scratch assignment is the ordinary case, not the exotic one. When a
+--- folder entry's directory (`src/`, or an intermediate segment of a deeper
+--- one like `a/b/c/`) is absent at `start()`, this module walks UP to the
+--- nearest EXISTING ancestor — bounded by the workspace root, never above
+--- it — and opens a non-recursive `fs_event` "pursuit" handle there
+--- (`pursue()` below). On every notification it re-checks whether the
+--- target now exists and, if not, whether the next path segment toward it
+--- does, cascading its own watch one level deeper and recursing
+--- synchronously as far as already-created segments allow — this handles a
+--- batched `mkdir -p a/b/c` regardless of whether the OS surfaces that as
+--- one notification or several, and in whatever order. The moment the
+--- target itself exists, it gets exactly the same `visit_dir(..., true)`
+--- treatment any other directory that appears mid-session already gets —
+--- its files are genuinely NEW, so they are reported as creates, not seeded
+--- silently.
+---
+--- RETENTION, stated explicitly: every pursuit handle opened along the way
+--- is kept for the rest of the session, never closed once superseded by a
+--- deeper one or by the target's own promotion. A directory on the path can
+--- be deleted and recreated (`rm -rf src && git checkout src`, or a build
+--- step that wipes and regenerates) — closing a pursuit handle early would
+--- permanently lose detection for the rest of the session the next time
+--- that happens, which is the exact silent-gap failure this mechanism
+--- exists to close. The cost is handle count growing with promotion depth
+--- (one extra `fs_event` handle per path segment actually walked), bounded
+--- by the target's own path depth, not by workspace size — worth it given
+--- the alternative is a session that silently stops noticing.
+---
 --- ## The editor's watcher is a coarse pre-filter ONLY (non-negotiable —
 --- ## path-scope design spec §4.2)
 ---
@@ -453,27 +487,38 @@ function M.start(opts)
       if entry:sub(1, 1) == "*" then
         has_suffix_rule = true
       else
-        -- Folder form, e.g. "src/" -> directory rel path "src".
-        folder_roots[#folder_roots + 1] = entry:sub(1, -2)
+        -- Folder form, e.g. "src/" -> directory rel path "src". A root that
+        -- is itself hard-excluded (".provenance/", ".git/", or nested under
+        -- either) never becomes a walk root or a pursuit target — same rule
+        -- workspace_walk / resolve_path_role apply everywhere else in this
+        -- module. (A manifest naming such a root is nonsensical, but this
+        -- module does not trust that upstream validation always ran.)
+        local root = entry:sub(1, -2)
+        if not (
+          workspace_walk.has_hard_excluded_segment(root)
+          or path_scope.is_hard_excluded(root .. "/")
+        ) then
+          folder_roots[#folder_roots + 1] = root
+        end
       end
     end
   end
 
   if has_rule_entry then
-    -- A suffix rule matches at any depth, so it needs the WHOLE tree; a
-    -- folder-only scope only needs the folders it names.
-    local walk_roots
-    if has_suffix_rule then
-      walk_roots = { "" }
-    else
-      walk_roots = folder_roots
-    end
-
     -- rel dir path -> { known = { name -> true } }. Also doubles as the
     -- de-dup guard against re-visiting the same directory twice (e.g. two
     -- overlapping folder entries, or a directory reached via recursion
-    -- after already being a walk root).
+    -- after already being a walk root). `pursue()` below deliberately
+    -- clears entries out of this table when it re-promotes a directory
+    -- that was deleted and recreated — see its own comment.
     local dirs = {}
+
+    -- rel dir path -> true: every directory that already has (or is in the
+    -- process of getting) a pursuit `fs_event` handle from `pursue()`
+    -- below — guards against opening a second one for the same directory
+    -- when a deeper pursuit re-derives the same ancestor, or when a later
+    -- notification re-enters `pursue` for a level already being watched.
+    local pursuit_watched = {}
 
     --- Silently admit a pre-existing file found by the initial workspace
     --- walk: registers it with the registry (subject to the cap) and opens
@@ -620,14 +665,17 @@ function M.start(opts)
 
       local scan = uv.fs_scandir(dir_abs)
       if not scan then
-        -- Directory unreadable, or (for a rule root, e.g. a `src/` the
-        -- student has not created yet) doesn't exist. The directory handle
-        -- above still gets a chance to observe it coming into existence
-        -- later at the PARENT level for a subdirectory; for a walk ROOT
-        -- that does not exist yet, there is no parent watcher reaching this
-        -- far, so — a known limitation, not attempted here — that root's
-        -- appearance is not itself discovered. See this module's own
-        -- report for a fuller account.
+        -- Directory unreadable, or a genuinely tight race: `dir_abs` was
+        -- just confirmed to exist (either by the parent walk's own scandir
+        -- entry, or by `pursue()`'s own stat check immediately before
+        -- calling here) and vanished again before this scandir ran. A walk
+        -- ROOT that simply does not exist YET never reaches this function
+        -- at all any more — see `pursue()` below, which is what the caller
+        -- routes a missing folder root through instead. The directory
+        -- handle just opened above still gets a chance to observe this
+        -- directory changing again later (including disappearing and
+        -- reappearing, which `pursue`'s own retained ancestor handle also
+        -- independently notices — see its docstring).
         return
       end
       while true do
@@ -660,8 +708,144 @@ function M.start(opts)
       end
     end
 
-    for _, root in ipairs(walk_roots) do
-      visit_dir(workspace .. (root == "" and "" or ("/" .. root)), root, false)
+    --- Nearest EXISTING ancestor directory of `rel` (a folder root's rel
+    --- path, no trailing slash), bounded at the workspace root — `""` —
+    --- which always exists for a running session and is never itself
+    --- walked past. Pure stat-walk-up, no side effects.
+    --- @param rel string
+    --- @return string  existing ancestor rel path ("" == workspace root)
+    local function nearest_existing_dir(rel)
+      local cur = rel
+      while cur ~= "" do
+        local st = uv.fs_stat(workspace .. "/" .. cur)
+        if st and st.type == "directory" then
+          return cur
+        end
+        cur = cur:match("^(.*)/[^/]+$") or ""
+      end
+      return ""
+    end
+
+    --- Pursue a folder root that does not exist yet (or existed, then was
+    --- deleted) from `cur_rel`/`cur_abs` — an ancestor of `target_rel` known
+    --- to currently exist — toward `target_rel`/`target_abs` itself. See
+    --- this module's own top-of-file docstring section "A folder root that
+    --- does not exist yet at session start" for the full design rationale;
+    --- summary here:
+    ---
+    ---   1. Re-check FIRST, every time this runs (both the initial call and
+    ---      every subsequent notification): if `target_abs` already exists,
+    ---      promote — hand off to `visit_dir(target_abs, target_rel, true)`,
+    ---      the SAME live-discovery treatment any other mid-session-
+    ---      appeared directory already gets — and stop pursuing. This closes
+    ---      the race between resolving `cur` and getting here, and (via the
+    ---      recursive step 3 below) the "mkdir -p a/b/c may fire as one
+    ---      notification or several, in any order" race too.
+    ---   2. Otherwise, make sure a pursuit `fs_event` handle is watching
+    ---      `cur_abs` (no-op if one already is). RETAINED for the rest of
+    ---      the session, never closed early — see the docstring section
+    ---      above for why (delete + recreate must keep working).
+    ---   3. Advance synchronously as far as currently possible: re-derive
+    ---      the next path segment beyond `cur_rel` toward `target_rel` and,
+    ---      if it already exists on disk, recurse into it immediately
+    ---      (rather than waiting for a notification that may never come
+    ---      for it specifically, e.g. if it appeared in the same batch as
+    ---      segments already accounted for).
+    ---
+    --- If `target_rel` was visited before (this is a RE-promotion after a
+    --- delete + recreate — the reason the ancestor handle in step 2 is
+    --- retained rather than closed), `visit_dir`'s own re-visit guard
+    --- (`dirs[dir_rel] ~= nil`) would otherwise block a fresh visit of what
+    --- is, on disk, a brand-new directory — so the promotion branch clears
+    --- the stale `dirs` bookkeeping for `target_rel` and everything nested
+    --- under it first. Stale handles from the PRIOR visit (now watching a
+    --- deleted path) are left alone, not proactively closed: harmless
+    --- (their next scandir/stat simply fails and they no-op), and closing
+    --- them is unnecessary work this fix does not need to do; `dispose()`
+    --- closes everything regardless at teardown.
+    --- @param target_rel string
+    --- @param target_abs string
+    --- @param cur_rel string
+    --- @param cur_abs string
+    local function pursue(target_rel, target_abs, cur_rel, cur_abs)
+      local target_st = uv.fs_stat(target_abs)
+      if target_st and target_st.type == "directory" then
+        if dirs[target_rel] ~= nil then
+          local prefix = target_rel .. "/"
+          for key in pairs(dirs) do
+            if key == target_rel or key:sub(1, #prefix) == prefix then
+              dirs[key] = nil
+            end
+          end
+        end
+        visit_dir(target_abs, target_rel, true)
+        return
+      end
+
+      if cur_rel == target_rel then
+        -- Unreachable in practice (the stat above would have matched), but
+        -- guards the remainder/next-segment math below against an empty
+        -- remainder.
+        return
+      end
+
+      if not pursuit_watched[cur_rel] then
+        pursuit_watched[cur_rel] = true
+        local ev = uv.new_fs_event()
+        if ev then
+          local ok = ev:start(cur_abs, {}, function(_err, _filename, _events)
+            if disposed then
+              return
+            end
+            vim.schedule(function()
+              if disposed then
+                return
+              end
+              pcall(pursue, target_rel, target_abs, cur_rel, cur_abs)
+            end)
+          end)
+          if ok then
+            watchers[#watchers + 1] = ev
+            dir_watcher_count = dir_watcher_count + 1
+          else
+            pcall(function() ev:close() end)
+          end
+        end
+      end
+
+      local remainder = cur_rel == "" and target_rel or target_rel:sub(#cur_rel + 2)
+      local next_seg = remainder:match("^[^/]+")
+      if next_seg == nil then
+        return
+      end
+      local next_rel = cur_rel == "" and next_seg or (cur_rel .. "/" .. next_seg)
+      local next_abs = workspace .. "/" .. next_rel
+      local next_st = uv.fs_stat(next_abs)
+      if next_st and next_st.type == "directory" then
+        pursue(target_rel, target_abs, next_rel, next_abs)
+      end
+    end
+
+    if has_suffix_rule then
+      -- A suffix rule matches at any depth, so it needs the WHOLE tree; the
+      -- workspace root always exists for a running session, so no missing-
+      -- root case applies here.
+      visit_dir(workspace, "", false)
+    else
+      for _, root in ipairs(folder_roots) do
+        local root_abs = workspace .. "/" .. root
+        local root_st = uv.fs_stat(root_abs)
+        if root_st and root_st.type == "directory" then
+          visit_dir(root_abs, root, false)
+        else
+          -- The folder does not exist yet at session start — walk up to
+          -- the nearest existing ancestor and pursue the target from
+          -- there. See `pursue`'s own docstring above.
+          local anc_rel = nearest_existing_dir(root)
+          local anc_abs = workspace .. (anc_rel == "" and "" or ("/" .. anc_rel))
+          pursue(root, root_abs, anc_rel, anc_abs)
+        end
+      end
     end
   end
 

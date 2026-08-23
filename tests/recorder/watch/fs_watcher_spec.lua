@@ -570,4 +570,208 @@ describe("fs_watcher", function()
     -- clean afterward (no leaked libuv handle).
     watch.dispose()
   end)
+
+  -------------------------------------------------------------------------
+  -- A folder root absent at session start (path-scope design spec D3):
+  -- pre-fix, a `src/` scope entry that does not exist on disk at start()
+  -- has NO handle anywhere reaching it -- its later creation, and
+  -- everything inside it, goes unwatched for the whole session, silently.
+  -- See fs_watcher.lua's own top-of-file docstring section "A folder root
+  -- that does not exist yet at session start" for the fix.
+  -------------------------------------------------------------------------
+
+  --- Every "create" op emitted so far, in order, as {path, ...} entries --
+  --- shared helper for the delete+recreate test below, which cares about
+  --- creates specifically and does not want to assume a fixed total event
+  --- count (a delete for the wiped file may also land in between).
+  --- @param evs table
+  --- @return string[]
+  local function created_paths(evs)
+    local out = {}
+    for _, e in ipairs(evs) do
+      if e.data.operation == "create" then
+        table.insert(out, e.data.path)
+      end
+    end
+    return out
+  end
+
+  describe("a folder root that does not exist yet at session start", function()
+    it("DEFECT: src/ created mid-session (it did not exist at start()) is still discovered", function()
+      -- No "src/" on disk at start() -- exactly the defect this fix closes.
+      -- Proven to fail against the pre-fix module: reverting fs_watcher.lua
+      -- to its state before this fix (`git show <pre-fix-rev>:lua/....lua`)
+      -- and running only this test times out waiting for `ok`, because
+      -- nothing ever opens a handle anywhere under a directory that was
+      -- absent when start() ran -- there is no parent watcher reaching that
+      -- far for a walk ROOT specifically (see the pre-fix comment this fix
+      -- replaces, which named this exact gap as a known, unaddressed
+      -- limitation).
+      local reg = registry_mod.new(scope({ track = { "src/" } }))
+      local events, emit = new_emit()
+      local watch = track(fs_watcher.start({
+        registry = reg,
+        workspace = dir,
+        scope = scope({ track = { "src/" } }),
+        emit = emit,
+        poll_interval_ms = 100,
+      }))
+
+      vim.fn.mkdir(dir .. "/src", "p")
+      write_file(dir .. "/src/Main.java", "class Main {}\n")
+
+      -- ONE combined, generous wait rather than bisecting the budget
+      -- between "src/ promoted" and "Main.java discovered": promotion's
+      -- own visit_dir call does a fresh scandir of "src" as its first act,
+      -- so it picks up Main.java even if the write landed before promotion
+      -- noticed the directory — splitting the wait would only make the
+      -- test more sensitive to relative timing, not less. Wider than the
+      -- sibling fs_poll integration test's 3s budget: this path needs TWO
+      -- real fs_event round trips under load (src/ appearing, then
+      -- Main.java appearing inside it), not one.
+      local ok = vim.wait(6000, function() return #events > 0 end, 50)
+
+      assert.is_true(ok, "expected src/Main.java to be discovered after src/ was created mid-session")
+      assert.equals(1, #events)
+      assert.equals("fs.external_change", events[1].kind)
+      assert.equals("create", events[1].data.operation)
+      assert.equals("src/Main.java", events[1].data.path)
+      assert.is_not_nil(reg.get("src/Main.java"))
+
+      watch.dispose()
+    end)
+
+    it("promotes through a folder root several levels deep, created in one batched mkdir -p", function()
+      -- `mkdir -p a/b/c` in one call: the OS may coalesce this into a
+      -- single fs_event notification at the workspace root, or fire
+      -- several -- pursue() must re-derive progress from disk state every
+      -- time, not assume a fixed notification count or order.
+      local reg = registry_mod.new(scope({ track = { "a/b/c/" } }))
+      local events, emit = new_emit()
+      local watch = track(fs_watcher.start({
+        registry = reg,
+        workspace = dir,
+        scope = scope({ track = { "a/b/c/" } }),
+        emit = emit,
+        poll_interval_ms = 100,
+      }))
+
+      vim.fn.mkdir(dir .. "/a/b/c", "p")
+      write_file(dir .. "/a/b/c/Deep.java", "class Deep {}\n")
+
+      local ok = vim.wait(3000, function() return #events > 0 end, 50)
+
+      assert.is_true(ok, "expected promotion through a/b/c despite the batched mkdir -p")
+      assert.equals(1, #events)
+      assert.equals("create", events[1].data.operation)
+      assert.equals("a/b/c/Deep.java", events[1].data.path)
+      assert.is_not_nil(reg.get("a/b/c/Deep.java"))
+
+      watch.dispose()
+    end)
+
+    it("keeps working after the promoted directory is deleted and recreated (retains the ancestor pursuit handle)", function()
+      local reg = registry_mod.new(scope({ track = { "src/" } }))
+      local events, emit = new_emit()
+      local watch = track(fs_watcher.start({
+        registry = reg,
+        workspace = dir,
+        scope = scope({ track = { "src/" } }),
+        emit = emit,
+        poll_interval_ms = 100,
+      }))
+
+      vim.fn.mkdir(dir .. "/src", "p")
+      write_file(dir .. "/src/First.java", "class First {}\n")
+
+      local ok1 = vim.wait(3000, function() return #created_paths(events) >= 1 end, 50)
+      assert.is_true(ok1, "sanity: the initial promotion + create fired")
+      assert.same({ "src/First.java" }, created_paths(events))
+
+      -- rm -rf src && recreate, e.g. `git checkout src` or a build step
+      -- that wipes and regenerates -- a different file this time, so the
+      -- assertion below cannot be satisfied by the (harmless, still-alive)
+      -- fs_poll handle left over from the first file alone.
+      vim.fn.delete(dir .. "/src", "rf")
+      vim.wait(300) -- let the deletion settle / be observed
+
+      vim.fn.mkdir(dir .. "/src", "p")
+      write_file(dir .. "/src/Second.java", "class Second {}\n")
+
+      local ok2 = vim.wait(3000, function()
+        for _, p in ipairs(created_paths(events)) do
+          if p == "src/Second.java" then
+            return true
+          end
+        end
+        return false
+      end, 50)
+
+      assert.is_true(ok2, "expected detection to keep working after src/ was deleted and recreated")
+      local creates = created_paths(events)
+      assert.equals(2, #creates)
+      assert.equals("src/First.java", creates[1])
+      assert.equals("src/Second.java", creates[2])
+
+      watch.dispose()
+    end)
+
+    it("dispose() closes a still-pending pursuit handle (target folder never appeared) without error", function()
+      local reg = registry_mod.new(scope({ track = { "never/appears/" } }))
+      local events, emit = new_emit()
+      local watch = track(fs_watcher.start({
+        registry = reg,
+        workspace = dir,
+        scope = scope({ track = { "never/appears/" } }),
+        emit = emit,
+      }))
+
+      -- One pursuit handle, on the workspace root, waiting for "never" to
+      -- appear -- it never will in this test.
+      assert.equals(1, watch._dir_watcher_count())
+
+      assert.has_no.errors(function() watch.dispose() end)
+      assert.has_no.errors(function() watch.dispose() end) -- idempotent
+    end)
+
+    it("an exact entry naming a not-yet-created file still opens ZERO directory watchers (pursuit never triggers for exact entries)", function()
+      local reg = registry_mod.new(scope({ track = { "not_yet.py" } }))
+      local events, emit = new_emit()
+      local watch = track(fs_watcher.start({
+        registry = reg,
+        workspace = dir,
+        scope = scope({ track = { "not_yet.py" } }),
+        emit = emit,
+      }))
+
+      assert.equals(0, watch._dir_watcher_count())
+    end)
+
+    it("a folder entry that resolves into a hard-excluded directory opens no handle there", function()
+      local reg = registry_mod.new(scope({ track = { ".provenance/" } }))
+      local events, emit = new_emit()
+      local watch = track(fs_watcher.start({
+        registry = reg,
+        workspace = dir,
+        scope = scope({ track = { ".provenance/" } }),
+        emit = emit,
+      }))
+
+      assert.equals(0, watch._dir_watcher_count())
+    end)
+
+    it("a nested hard-excluded folder entry (a/.git/) opens no handle there either", function()
+      vim.fn.mkdir(dir .. "/a", "p")
+      local reg = registry_mod.new(scope({ track = { "a/.git/" } }))
+      local events, emit = new_emit()
+      local watch = track(fs_watcher.start({
+        registry = reg,
+        workspace = dir,
+        scope = scope({ track = { "a/.git/" } }),
+        emit = emit,
+      }))
+
+      assert.equals(0, watch._dir_watcher_count())
+    end)
+  end)
 end)
