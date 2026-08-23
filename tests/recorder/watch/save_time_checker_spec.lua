@@ -37,7 +37,7 @@ describe("save_time_checker", function()
   end)
 
   it("typed-then-clean-save: on-disk content matches expected -> no emit", function()
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     local content = "print('hello')\n"
     reg.get_or_create("a.py", content)
 
@@ -54,7 +54,7 @@ describe("save_time_checker", function()
   end)
 
   it("external change: emits ONE fs.external_change with correct direction and resets the model", function()
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     local expected_content = "print('hello')\n"
     local ec = reg.get_or_create("a.py", expected_content)
 
@@ -86,7 +86,7 @@ describe("save_time_checker", function()
   end)
 
   it("explanation: a fresh formatter mark on the tagger surfaces as data.explanation", function()
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     reg.get_or_create("a.py", "old content\n")
 
     local disk_content = "new content from formatter\n"
@@ -106,7 +106,7 @@ describe("save_time_checker", function()
   end)
 
   it("no explanation: without a fresh tagger mark, data.explanation is absent (nil)", function()
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     reg.get_or_create("a.py", "old content\n")
 
     local disk_content = "new content, no tool ran\n"
@@ -124,7 +124,7 @@ describe("save_time_checker", function()
   end)
 
   it("never-opened file: registry has no entry -> no-op (no emit, no error)", function()
-    local reg = registry_mod.new({})
+    local reg = registry_mod.new({ track = {}, ignore = {}, attachments = {} })
     local abs_path = dir .. "/never.py"
     write_file(abs_path, "some content\n")
 
@@ -140,7 +140,7 @@ describe("save_time_checker", function()
   end)
 
   it("read failure: on-disk path unreadable -> no-op (no emit, no throw)", function()
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     reg.get_or_create("a.py", "content\n")
 
     local events, emit = new_emit()
@@ -155,7 +155,7 @@ describe("save_time_checker", function()
   end)
 
   it("large content (> 64 KB): new_content_head/new_content_tail set instead of new_content", function()
-    local reg = registry_mod.new({ "big.py" })
+    local reg = registry_mod.new({ track = { "big.py" }, ignore = {}, attachments = {} })
     reg.get_or_create("big.py", "small\n")
 
     local disk_content = string.rep("x", 70000)

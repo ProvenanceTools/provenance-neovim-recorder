@@ -301,6 +301,19 @@ describe("build_recorder_context session.start 2.0", function()
     assert.is_nil(m.some_future_field)
   end)
 
+  it("carries ignore and attachments on a 2.0 manifest block", function()
+    -- Regression: build_manifest_block used to copy named fields one at a
+    -- time and never copied these two REQUIRED 2.0 fields, so the emitted
+    -- manifest silently dropped signed content. Assert the keys are actually
+    -- present (not merely that verify_chain happens to still pass), tagged
+    -- as JSON arrays, so a future field addition fails loudly here too.
+    local m = build(v2_manifest).manifest
+    assert.is_not_nil(m.ignore)
+    assert.is_not_nil(m.attachments)
+    assert.is_true(core_json.is_array(m.ignore))
+    assert.is_true(core_json.is_array(m.attachments))
+  end)
+
   it("the emitted 2.0 manifest still verifies its own chain", function()
     -- The strongest statement that nothing was dropped or reshaped in transit:
     -- lift the manifest back out of the payload and re-walk the trust chain.
@@ -419,5 +432,28 @@ describe("build_recorder_context session.start capability reports (collaboration
     local direct = recorder_context.resolve_file_scope({ "a.txt", "b.txt" })
     assert.same({ "a.txt", "b.txt" }, direct.watched)
     assert.is_true(direct.complete)
+  end)
+
+  it("an all-exact list is complete=true", function()
+    local direct = recorder_context.resolve_file_scope({ "a.txt", "src/b.txt" })
+    assert.same({ "a.txt", "src/b.txt" }, direct.watched)
+    assert.is_true(direct.complete)
+  end)
+
+  it("adding one rule entry makes complete=false and keeps only the exact entries in watched", function()
+    local direct = recorder_context.resolve_file_scope({ "a.txt", "src/", "*.java" })
+    assert.same({ "a.txt" }, direct.watched)
+    assert.is_false(direct.complete)
+  end)
+
+  it(">4096 exact entries truncates and sets complete=false", function()
+    local list = {}
+    for i = 1, recorder_context.FILE_SCOPE_MAX_ENTRIES + 5 do
+      list[i] = "f" .. i .. ".txt"
+    end
+    local direct = recorder_context.resolve_file_scope(list)
+    assert.equals(recorder_context.FILE_SCOPE_MAX_ENTRIES, #direct.watched)
+    assert.is_false(direct.complete)
+    assert.equals("f1.txt", direct.watched[1])
   end)
 end)

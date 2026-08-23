@@ -25,6 +25,7 @@ local band, bor = bit.band, bit.bor
 local core_session_keys = require("provenance.core.session_keys")
 local core_clock = require("provenance.core.clock")
 local core_checkpoint = require("provenance.core.checkpoint")
+local core_manifest = require("provenance.core.manifest")
 local recorder_context = require("provenance.recorder.session.recorder_context")
 local session_host = require("provenance.recorder.session.session_host")
 local policy_gate = require("provenance.recorder.session.policy_gate")
@@ -602,7 +603,7 @@ function M.start(opts)
   if enable_signals then
     coordinator = external_change_coordinator.start({
       workspace = workspace,
-      files_under_review = manifest.files_under_review,
+      scope = core_manifest.scope_from_manifest(manifest),
       emit = host.emit,
       tagger = tagger,
       get_now = clock.now,

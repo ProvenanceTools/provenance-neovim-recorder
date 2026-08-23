@@ -9,6 +9,7 @@
 local core_sha256 = require("provenance.core.sha256")
 local core_json = require("provenance.core.json")
 local session_capabilities = require("provenance.core.session_capabilities")
+local path_scope = require("provenance.core.path_scope")
 local bit = require("bit")
 local band, bor = bit.band, bit.bor
 
@@ -47,16 +48,38 @@ M.FILE_SCOPE_MAX_ENTRIES = 4096
 --- (`recorder-context.ts`) uses for `assignmentRoot`-relative paths. No
 --- divergence needed: `file_scope.watched` is emitted exactly as
 --- `files_under_review` already is, with no re-basing.
+--- ## Rules make the list partial, not wrong
+---
+--- A manifest may now name a folder or a suffix (path-scope design spec §3).
+--- Those entries cannot be enumerated at session start — that is the whole
+--- point of naming one — so `watched` carries the exact-path entries only
+--- and `complete` goes false whenever ANY rule entry is present, however few
+--- exact entries there are. The analyzer then has two better answers
+--- available before it falls back to `unknown`: it can evaluate the rules
+--- itself against the signed manifest in `session.start`, and any file with
+--- recorded activity was self-evidently watched.
+---
 --- @param files_under_review string[]|nil
 --- @return table|nil SessionFileScope, or nil when nothing honest can be built
 function M.resolve_file_scope(files_under_review)
   local list = files_under_review or {}
-  local complete = #list <= M.FILE_SCOPE_MAX_ENTRIES
-  local watched = list
-  if not complete then
+  -- A rule entry cannot be enumerated, so it cannot go in `watched` — and its
+  -- presence means absence from `watched` no longer proves "not watched".
+  -- `complete: false` is precisely the downgrade-to-unknown this field
+  -- already defines for the truncation case; rules reuse it unchanged.
+  local exact = {}
+  for i = 1, #list do
+    if path_scope.is_exact_entry(list[i]) then
+      exact[#exact + 1] = list[i]
+    end
+  end
+  local has_rules = #exact ~= #list
+  local complete = not has_rules and #exact <= M.FILE_SCOPE_MAX_ENTRIES
+  local watched = exact
+  if #exact > M.FILE_SCOPE_MAX_ENTRIES then
     watched = {}
     for i = 1, M.FILE_SCOPE_MAX_ENTRIES do
-      watched[i] = list[i]
+      watched[i] = exact[i]
     end
   end
   return session_capabilities.build_file_scope(watched, complete)
@@ -170,6 +193,31 @@ local function build_manifest_block(m)
   block.scope = m.scope
   block.policy = m.policy
   block.course_cert = m.course_cert
+
+  -- `ignore` and `attachments`: REQUIRED fields of a 2.0 manifest (path-scope
+  -- design spec §3), so a 2.0 manifest missing either fails core.manifest's
+  -- own parse and never reaches here — but this block re-derives the signed
+  -- payload from scratch by copying named fields, and until these two lines
+  -- existed neither was among them. That silently dropped two SIGNED fields
+  -- from the emitted session.start manifest, so `manifest.verify_chain`
+  -- (correctly) refused to re-verify it: the analyzer's whole offline
+  -- root->course->manifest->session trust walk failed for every 2.0 session
+  -- this recorder recorded.
+  --
+  -- Guarded (not `core_json.array(m.ignore)` unconditionally) because
+  -- `core_json.array(nil)` returns an EMPTY array, not nil — it would
+  -- materialize `ignore = []` on a 1.x manifest, which has neither field, and
+  -- an invented empty array is a key an unguarded assignment would not have
+  -- produced. `m.ignore`/`m.attachments` are already json.array-tagged by
+  -- core.manifest's own `normalize()` when they came from `parse()`, but a
+  -- hand-built manifest table might not tag them, so they are re-tagged here
+  -- too, the same reasoning `files_under_review` above already follows.
+  if m.ignore ~= nil then
+    block.ignore = core_json.array(m.ignore)
+  end
+  if m.attachments ~= nil then
+    block.attachments = core_json.array(m.attachments)
+  end
 
   return block
 end

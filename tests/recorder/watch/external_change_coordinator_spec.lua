@@ -88,7 +88,7 @@ describe("external_change_coordinator", function()
     local events, emit = new_emit()
     local coordinator = scratch.track(coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "a.py" },
+      scope = { track = { "a.py" } },
       emit = emit,
       get_now = function() return 0 end,
     }))
@@ -122,7 +122,7 @@ describe("external_change_coordinator", function()
     local events, emit = new_emit()
     local coordinator = scratch.track(coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "a.py" },
+      scope = { track = { "a.py" } },
       emit = emit,
       get_now = function() return 0 end,
       tolerance_ms = 250,
@@ -160,7 +160,7 @@ describe("external_change_coordinator", function()
     local events, emit = new_emit()
     local coordinator = scratch.track(coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "a.py" },
+      scope = { track = { "a.py" } },
       emit = emit,
       get_now = function() return now end,
       -- default tolerance_ms (250) — deliberately not overridden, so this
@@ -212,7 +212,7 @@ describe("external_change_coordinator", function()
     local events, emit = new_emit()
     local coordinator = scratch.track(coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "b.py" },
+      scope = { track = { "b.py" } },
       emit = emit,
       get_now = function() return 0 end,
     }))
@@ -243,7 +243,7 @@ describe("external_change_coordinator", function()
     local events, emit = new_emit()
     local coordinator = scratch.track(coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "a.py" },
+      scope = { track = { "a.py" } },
       emit = emit,
       get_now = function() return now end,
       tolerance_ms = 250,
@@ -281,7 +281,7 @@ describe("external_change_coordinator", function()
       local events, emit = new_emit()
       local coordinator = coordinator_mod.start({
         workspace = workspace,
-        files_under_review = { "a.py" },
+        scope = { track = { "a.py" } },
         emit = emit,
         get_now = function() return 0 end,
       })
@@ -315,7 +315,7 @@ describe("external_change_coordinator", function()
       local events, emit = new_emit()
       local coordinator = coordinator_mod.start({
         workspace = workspace,
-        files_under_review = {},
+        scope = { track = {} },
         emit = emit,
       })
 
@@ -338,7 +338,7 @@ describe("external_change_coordinator", function()
       local events, emit = new_emit()
       local coordinator = coordinator_mod.start({
         workspace = workspace,
-        files_under_review = {},
+        scope = { track = {} },
         emit = emit,
       })
 
@@ -351,7 +351,7 @@ describe("external_change_coordinator", function()
     local events, emit = new_emit()
     local coordinator = scratch.track(coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "a.py" },
+      scope = { track = { "a.py" } },
       emit = emit,
     }))
 
@@ -372,13 +372,30 @@ describe("external_change_coordinator", function()
     local events, emit = new_emit()
     local coordinator = scratch.track(coordinator_mod.start({
       workspace = workspace,
-      files_under_review = {},
+      scope = { track = {} },
       emit = emit,
     }))
 
     assert.has_no.errors(function()
       coordinator.apply_change("never.py", { { range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 0 } }, text = "x" } })
     end)
+  end)
+
+  it("exposes cap_hit(), wired straight through to the shared registry's own flag", function()
+    -- A dedicated seal-time seam (Part 1's decorative-cap hazard): a later
+    -- task reads THIS, not the registry directly, to write scope_capped.
+    -- The cap-tripping behaviour itself is covered exhaustively by
+    -- expected_content_registry_spec.lua; this only confirms the wiring.
+    local workspace = scratch.workspace()
+    local events, emit = new_emit()
+    local coordinator = scratch.track(coordinator_mod.start({
+      workspace = workspace,
+      scope = { track = {} },
+      emit = emit,
+    }))
+
+    assert.is_false(coordinator.cap_hit())
+    assert.equals(coordinator.registry.cap_hit(), coordinator.cap_hit())
   end)
 
   it("INTEGRATION: autoread + :checktime drives Path 3 through the real FileChangedShellPost autocmd", function()
@@ -392,7 +409,7 @@ describe("external_change_coordinator", function()
     local events, emit = new_emit()
     local coordinator = scratch.track(coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "a.py" },
+      scope = { track = { "a.py" } },
       emit = emit,
       get_now = function() return 0 end,
     }))

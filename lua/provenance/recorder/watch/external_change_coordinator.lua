@@ -9,9 +9,9 @@
 --- them, per CLAUDE.md's "compose, don't reimplement"):
 ---   - Path 1 (`save_time_checker`): the editor's own `BufWritePost` —
 ---     compares on-disk bytes to the expected model right after a save.
----   - Path 2 (`fs_watcher`): a `vim.uv.new_fs_poll()` watcher per file in
----     `files_under_review` — catches writes that happen while unfocused, or
----     to a file that isn't even open.
+---   - Path 2 (`fs_watcher`): a `vim.uv.new_fs_poll()` watcher per exact
+---     `scope.track` entry, plus `fs_event`-discovered rule matches — catches
+---     writes that happen while unfocused, or to a file that isn't even open.
 ---   - Path 3 (`reload_checker`): Neovim's LAZY `FileChangedShellPost`
 ---     (focus-gain / explicit `:checktime`) reload-from-disk.
 ---
@@ -70,7 +70,10 @@ end
 --- start(opts) -> handle
 --- @param opts table {
 ---   workspace: string             -- absolute path to the activated workspace root
----   files_under_review: string[]  -- workspace-relative paths to track/watch
+---   scope: table|nil              -- ResolvedScope {track, ignore, attachments}
+---                                    (see core.manifest.scope_from_manifest —
+---                                    the ONLY way to build one). Defaults to
+---                                    an empty scope (nothing watched).
 ---   emit: function(kind, data)    -- SessionHost.emit
 ---   tagger: table|nil             -- ExplanationTagger; defaults to a real
 ---                                    explanation_tags.new({get_now=get_now})
@@ -83,13 +86,13 @@ end
 ---   seed_open(rel, content), apply_change(rel, deltas),
 ---   reconcile_save(rel, written_content), note_save(rel),
 ---   check_after_save(rel, abs_path), on_file_changed_shell(buf),
----   registry, dispose()
+---   registry, cap_hit(), dispose()
 --- }
 function M.start(opts)
   opts = opts or {}
 
   local workspace = opts.workspace
-  local files_under_review = opts.files_under_review or {}
+  local scope = opts.scope or { track = {}, ignore = {}, attachments = {} }
   local emit = opts.emit
   local get_now = opts.get_now or default_get_now
   local tolerance_ms = opts.tolerance_ms or DEFAULT_TOLERANCE_MS
@@ -97,7 +100,7 @@ function M.start(opts)
 
   -- ONE shared registry, ONE shared recent_saves map — the foundation both
   -- double-emit-prevention mechanisms rely on.
-  local registry = expected_content_registry.new(files_under_review)
+  local registry = expected_content_registry.new(scope)
   local recent_saves = {}
 
   local saver = save_time_checker.new({ registry = registry, emit = emit, tagger = tagger })
@@ -105,7 +108,7 @@ function M.start(opts)
   local watcher = fs_watcher.start({
     registry = registry,
     workspace = workspace,
-    files_under_review = files_under_review,
+    scope = scope,
     emit = emit,
     tagger = tagger,
     recent_saves = recent_saves,
@@ -141,6 +144,18 @@ function M.start(opts)
 
   --- The shared registry (test / integration seam).
   handle.registry = registry
+
+  --- Whether the shared registry's memory cap has ever refused an
+  --- otherwise-`reviewed` path. Exposed directly (not just via `registry`)
+  --- so a later task (seal-time `scope_capped` disclosure) can read it
+  --- without reaching into the registry's own internals — mirrors how
+  --- `registry` itself is already exposed above. See
+  --- expected_content_registry.lua's module docstring for why disclosure of
+  --- this fact is mandatory, not decorative.
+  --- @return boolean
+  function handle.cap_hit()
+    return registry.cap_hit()
+  end
 
   --- TEST-ONLY seam: the underlying Path 2 watcher handle, so tests can
   --- drive `handle_path_event` directly (simulating a real fs_poll firing)
