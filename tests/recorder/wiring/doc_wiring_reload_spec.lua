@@ -28,20 +28,23 @@
 --- ONLY thing that reports the reload, as `fs.external_change`.
 ---
 --- THIS IS A LOAD-BEARING PIN, NOT A TAUTOLOGY. It is an assertion about a
---- Neovim implementation detail this port silently depends on. If a future
---- change gives doc_wiring's `nvim_buf_attach` an `on_reload` callback (a
---- plausible fix for the detach consequence noted below) and routes the
---- reloaded content through the change path, or if a future Neovim starts
---- reporting reloads as ordinary `on_bytes` splices, `provjet`'s fabricated
---- paste appears here too. These tests fail loudly if either happens.
+--- Neovim implementation detail this port depends on. doc_wiring DOES now
+--- supply `on_reload` (see below), so if that callback ever grows an emit,
+--- or if a future Neovim starts reporting reloads as ordinary `on_bytes`
+--- splices, `provjet`'s fabricated paste appears here too. These tests fail
+--- loudly if either happens.
 ---
---- NOTED, NOT FIXED (out of scope for this spec — see the task report): the
---- `on_detach` above is delivered AFTER doc_wiring's own BufReadPost handler
---- has already run and early-returned on its still-true `attached_bufs[buf]`
---- bookkeeping, so a reloaded buffer is left permanently detached and later
---- edits to it go unrecorded. That is an UNDER-recording bug, the opposite
---- failure from `provjet`'s, and it is deliberately not asserted here: these
---- tests must keep passing once it is fixed.
+--- THE SECOND HALF OF THE CONTRACT (the `describe` block's back half): a
+--- reload must not be silently UNDER-reported either. Neovim drops any
+--- buffer listener that supplies no `on_reload`, and it delivers that
+--- `on_detach` AFTER doc_wiring's own BufReadPost handler has already run
+--- and early-returned on its still-true `attached_bufs[buf]` — so nothing
+--- re-attaches, and every keystroke after a `git pull` used to vanish from
+--- the record. doc_wiring now supplies `on_reload`, which keeps the buffer
+--- attached and re-seeds `buf_shadow` from the reloaded content without
+--- emitting anything. Both halves are pinned here because they pull in
+--- opposite directions: the cheap way to satisfy either one alone is to
+--- break the other.
 ---
 --- Headless, REAL buffers, REAL files on disk, REAL coordinator, REAL
 --- `vim.paste` — matching this repo's convention for wiring-layer specs
@@ -335,5 +338,158 @@ describe("doc_wiring: reload-from-disk is never recorded as a paste", function()
     assert.equals("typed", ev.data.source)
     assert.equals(0, count(events, "paste"))
     assert.equals(0, count(events, "fs.external_change"))
+  end)
+
+  -----------------------------------------------------------------------
+  -- Surviving the reload (the OTHER half of the reload contract).
+  --
+  -- The tests above pin that a reload is never OVER-reported (as a paste).
+  -- These pin that it is never silently UNDER-reported either: Neovim
+  -- unloads buffer listeners across a reload, so a listener that supplies
+  -- no `on_reload` is handed `on_detach` and dropped. Verified against
+  -- Neovim 0.12.1:
+  --
+  --   with on_reload:    BufReadPre -> BufReadPost -> on_reload  -> FileChangedShellPost   (stays attached)
+  --   without on_reload: BufReadPre -> BufReadPost -> on_detach  -> FileChangedShellPost   (dropped)
+  --
+  -- Note where `on_detach` lands: AFTER doc_wiring's own BufReadPost
+  -- handler has already run and early-returned on its still-true
+  -- `attached_bufs[buf]` bookkeeping. So BufReadPost cannot re-attach — it
+  -- ran too early — and nothing else ever will. That is what made every
+  -- post-`git pull` keystroke vanish from the record.
+  -----------------------------------------------------------------------
+
+  it("keystrokes AFTER a reload are still recorded — the buffer survives the reload attached", function()
+    local workspace = scratch.workspace()
+    local path = workspace .. "/ArrayDeque.java"
+    scratch.write_file(path, "class ArrayDeque {\n  private int size;\n}\n")
+
+    local events, emit = new_emit()
+    scratch.coordinator = coordinator_mod.start({
+      workspace = workspace,
+      scope = { track = { "ArrayDeque.java" }, ignore = {}, attachments = {} },
+      emit = emit,
+    })
+    scratch.doc_handle = doc_wiring.attach({
+      workspace = workspace,
+      emit = emit,
+      external_change = scratch.coordinator,
+    })
+    scratch.assembly_handle = paste_assembly.attach({
+      emit = emit,
+      doc_wiring_handle = scratch.doc_handle,
+    })
+
+    local buf = scratch.edit(path)
+    assert.equals("ArrayDeque.java", scratch.doc_handle.recordable_rel(buf))
+
+    scratch.write_file(path, PULLED_BLOCK)
+    vim.bo[buf].autoread = true
+    vim.o.autoread = true
+    vim.cmd("checktime")
+
+    -- The buffer is still a tracked, recordable buffer after the reload.
+    assert.equals("ArrayDeque.java", scratch.doc_handle.recordable_rel(buf))
+
+    -- Now the student types. This MUST be recorded — it is their own work,
+    -- and it is the work that follows every `git pull` in a real session.
+    local before = count(events, "doc.change")
+    vim.api.nvim_buf_set_text(buf, 1, 2, 1, 2, { "x" })
+    assert.equals(before + 1, count(events, "doc.change"))
+  end)
+
+  it("the post-reload delta is computed against the RELOADED content, not a stale pre-reload shadow", function()
+    -- Re-attaching without re-seeding `buf_shadow` would be worse than the
+    -- gap it fixes: precise_delta resolves UTF-16 columns against the
+    -- shadow, and utf16_col CLAMPS to the line's length, so a shadow still
+    -- holding the short pre-reload line silently collapses a real range
+    -- onto that line's end instead of erroring. The recorded delta would be
+    -- quietly wrong rather than absent, and replay would diverge.
+    local workspace = scratch.workspace()
+    local path = workspace .. "/ArrayDeque.java"
+    -- Line 0 is ONE character before the reload...
+    scratch.write_file(path, "x\nkeep\n")
+
+    local events, emit = new_emit()
+    scratch.coordinator = coordinator_mod.start({
+      workspace = workspace,
+      scope = { track = { "ArrayDeque.java" }, ignore = {}, attachments = {} },
+      emit = emit,
+    })
+    scratch.doc_handle = doc_wiring.attach({
+      workspace = workspace,
+      emit = emit,
+      external_change = scratch.coordinator,
+    })
+    scratch.assembly_handle = paste_assembly.attach({
+      emit = emit,
+      doc_wiring_handle = scratch.doc_handle,
+    })
+
+    local buf = scratch.edit(path)
+
+    -- ...and SIXTEEN characters after it.
+    scratch.write_file(path, "abcdefghijklmnop\nkeep\n")
+    vim.bo[buf].autoread = true
+    vim.o.autoread = true
+    vim.cmd("checktime")
+    assert.same({ "abcdefghijklmnop", "keep" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+
+    -- Replace characters [4, 9) of the reloaded line 0 — a range that does
+    -- not even EXIST in the pre-reload line "x".
+    vim.api.nvim_buf_set_text(buf, 0, 4, 0, 9, { "ZZ" })
+
+    local ev = find(events, "doc.change")
+    assert.is_not_nil(ev)
+    local delta = ev.data.deltas[1]
+    assert.equals("ZZ", delta.text)
+    -- A stale shadow would clamp BOTH of these to character 1 (the length
+    -- of the pre-reload "x").
+    assert.same({ line = 0, character = 4 }, delta.range.start)
+    assert.same({ line = 0, character = 9 }, delta.range["end"])
+  end)
+
+  it("surviving the reload does not re-report it: still exactly one doc.open and one fs.external_change", function()
+    -- Re-attachment must not fabricate a second doc.open baseline. The
+    -- expected-content model is already reset to disk reality by
+    -- reload_checker (`ec.reset(on_disk_content)` after it emits), so a
+    -- fresh doc.open would be redundant at best; at worst the analyzer
+    -- would replay a full-content doc.open ON TOP of the
+    -- fs.external_change content for the same bytes.
+    local workspace = scratch.workspace()
+    local path = workspace .. "/ArrayDeque.java"
+    local original = "class ArrayDeque {\n  private int size;\n}\n"
+    scratch.write_file(path, original)
+
+    local events, emit = new_emit()
+    scratch.coordinator = coordinator_mod.start({
+      workspace = workspace,
+      scope = { track = { "ArrayDeque.java" }, ignore = {}, attachments = {} },
+      emit = emit,
+    })
+    scratch.doc_handle = doc_wiring.attach({
+      workspace = workspace,
+      emit = emit,
+      external_change = scratch.coordinator,
+    })
+    scratch.assembly_handle = paste_assembly.attach({
+      emit = emit,
+      doc_wiring_handle = scratch.doc_handle,
+    })
+
+    local buf = scratch.edit(path)
+    scratch.write_file(path, PULLED_BLOCK)
+    vim.bo[buf].autoread = true
+    vim.o.autoread = true
+    vim.cmd("checktime")
+
+    assert.equals(1, count(events, "doc.open"))
+    assert.equals(1, count(events, "fs.external_change"))
+    assert.equals(0, count(events, "paste"))
+    assert.equals(0, count(events, "doc.change"))
+
+    -- The coordinator's model is disk reality, set by reload_checker — not
+    -- by anything doc_wiring did on re-attach.
+    assert.equals(PULLED_BLOCK, scratch.coordinator.registry.get("ArrayDeque.java").get_content())
   end)
 end)
