@@ -9,6 +9,15 @@
 --- session" and starts/stops sessions via an injected start_recording seam
 --- (production: recording_controller.start; tests: a spy, mirroring
 --- init_controller_spec.lua's existing style).
+---
+--- It also owns the VERIFIED-ROOT CACHE (`reg.load_and_verify`). Activation
+--- resolution runs on BufEnter/BufReadPost/BufNewFile, i.e. on every buffer
+--- switch, and each resolution used to re-run a pure-Lua ed25519 verification
+--- costing ~12 ms on the main loop -- a visible UI hitch inside any activated
+--- workspace. The registry is the natural home for that cache: it is already
+--- the per-editor-instance "what do we know about this root" map.
+local activation = require("provenance.recorder.activation")
+
 local M = {}
 
 --- @param opts table { start_recording: function(start_opts) -> controller }
@@ -20,7 +29,77 @@ function M.new(opts)
   -- root -> { manifest, controller, provenance_dir }
   local sessions = {}
 
+  -- Verified-root cache: root -> { digest, pubkey_override, result }.
+  --
+  -- Keyed on the root directory PLUS the manifest's content digest PLUS the
+  -- caller's public-key OVERRIDE, so a cached verdict cannot outlive any of the
+  -- three inputs that produced it.
+  --
+  -- The override rather than the resolved key, because since Manifest 2.0 there
+  -- is no single resolved key to name up front: activation.evaluate picks the
+  -- anchor from the manifest's own `format_version` (2.0 -> root key, 1.x ->
+  -- grandfathered legacy course key). Keying on the digest covers that
+  -- completely -- the bytes determine the version, the version determines the
+  -- anchor -- so a manifest that switches format version between reads has a
+  -- different digest and therefore cannot hit a verdict computed under the other
+  -- anchor. A `nil` override is a distinct key from any explicit one.
+  --
+  -- The manifest identity is a sha256 of its bytes, deliberately NOT
+  -- mtime+size. This cache short-circuits a security gate, so its key has to be
+  -- as hard to forge as the gate itself: mtime and size are both
+  -- attacker-controlled (`touch -t`, pad to length), which would let a
+  -- "verified" verdict survive the manifest being swapped for a forgery -- the
+  -- cache would become the attack. A content digest cannot be spoofed that way,
+  -- and it is effectively free: the bytes are read either way, and hashing a few
+  -- hundred of them is microseconds against a ~12 ms verification.
+  --
+  -- Unbounded by root, which is fine: entries are tiny and bounded by the
+  -- number of distinct manifest-bearing directories one editor session visits.
+  local verified = {}
+
   local reg = {}
+
+  --- Cached front door to activation.load_and_verify -- same signature, same
+  --- return shapes, same semantics, minus the repeated ed25519 cost. Drop-in
+  --- for discovery.resolve_from_dir's `load_and_verify` seam.
+  ---
+  --- Verification still happens on first sight of a root and again after ANY
+  --- change to the manifest file's bytes; only a byte-identical re-read is
+  --- served from the cache.
+  --- @param workspace_dir string
+  --- @param pubkey_hex string|nil
+  --- @return table  see activation.load_and_verify
+  function reg.load_and_verify(workspace_dir, pubkey_hex)
+    local read = activation.read_manifest(workspace_dir)
+    if read.status ~= "found" then
+      -- No bytes means no identity to key on -- and nothing expensive ran.
+      return read
+    end
+
+    local digest_ok, digest = pcall(vim.fn.sha256, read.text)
+    local hit = verified[workspace_dir]
+    if digest_ok and hit and hit.digest == digest and hit.pubkey_override == pubkey_hex then
+      return hit.result
+    end
+
+    local eval_ok, result = pcall(activation.evaluate, read.text, pubkey_hex)
+    if not eval_ok then
+      return { status = "inactive", reason = "manifest_read_error" }
+    end
+
+    -- Only cache when the digest is trustworthy; otherwise re-verify each time.
+    if digest_ok then
+      verified[workspace_dir] = { digest = digest, pubkey_override = pubkey_hex, result = result }
+    end
+    return result
+  end
+
+  --- Drop every cached verification verdict, forcing the next resolve of each
+  --- root to re-verify. Nothing in the plugin needs this today; it exists so no
+  --- caller has to reach into the cache table to get a clean slate.
+  function reg.clear_verification_cache()
+    verified = {}
+  end
 
   --- Aggregate, no-arg (deliberately named to match RecorderState.is_active()
   --- so status.attach(reg) works unmodified): true iff at least one session
@@ -39,6 +118,23 @@ function M.new(opts)
   --- @return table|nil { manifest, controller, provenance_dir }
   function reg.get(root)
     return sessions[root]
+  end
+
+  --- Every started session's identity outcome, for `status.lua` and the enroll
+  --- nudge. A controller that predates the identity wiring (or whose start was
+  --- given no identity store) simply contributes nothing -- "we never asked" is
+  --- not "they are not enrolled", and neither surface may turn the first into
+  --- the second.
+  --- @return table[]  { kind = "emitted"|"skipped", ... }
+  function reg.identity_outcomes()
+    local out = {}
+    for _, entry in pairs(sessions) do
+      local outcome = entry.controller and entry.controller._identity_outcome
+      if type(outcome) == "table" then
+        out[#out + 1] = outcome
+      end
+    end
+    return out
   end
 
   --- @return table[]  { root, manifest, controller }, sorted by root ascending

@@ -435,6 +435,59 @@ function M.attach(opts)
           end
         end
       end,
+      -- A reload-from-disk (`:checktime` under `autoread`, i.e. what a
+      -- `git pull` / `git stash pop` looks like from in here) is NOT an
+      -- edit, and produces no on_bytes splice. Neovim UNLOADS buffer
+      -- listeners across a reload instead, handing each one `on_reload` if
+      -- it supplied one and `on_detach` -- dropping it permanently -- if it
+      -- did not. Supplying this callback is therefore not an optimization;
+      -- it is the ONLY way to stay attached. Verified against Neovim
+      -- 0.12.1, a reload delivers:
+      --
+      --   BufReadPre -> BufReadPost -> on_reload/on_detach -> FileChangedShellPost
+      --
+      -- Note where `on_detach` lands: AFTER the BufReadPost autocmd below
+      -- has already run and early-returned on its still-true
+      -- `attached_bufs[b]`. So BufReadPost cannot re-attach the buffer --
+      -- it ran too early -- and nothing else ever does. Before this
+      -- callback existed, every keystroke a student made after a `git pull`
+      -- went unrecorded for the remainder of the session: a silent,
+      -- permanent hole in the record, through no fault of theirs.
+      --
+      -- This callback EMITS NOTHING, deliberately:
+      --   - the reloaded CONTENT is already reported exactly once, as
+      --     `fs.external_change`, by Path 3 (watch/reload_checker.lua) on
+      --     the FileChangedShellPost that immediately follows;
+      --   - it must NOT be reported as a doc.change/paste -- reporting a
+      --     partner's pulled code as the student's own authorship is
+      --     precisely provjet's fabricated-paste bug, pinned against this
+      --     port by doc_wiring_reload_spec.lua;
+      --   - and it must NOT re-seed the external-change model. Path 3 owns
+      --     resetting that to disk reality (`ec.reset`) after it emits;
+      --     seeding a fresh baseline here would both race that reset and
+      --     leave the analyzer replaying a full-content doc.open on top of
+      --     the fs.external_change carrying the same bytes.
+      --
+      -- The one thing the reload genuinely invalidated, and the one thing
+      -- repaired here, is the pre-edit shadow.
+      on_reload = function(_, b)
+        if disposed then
+          return
+        end
+        if not buf_rel[b] then
+          return
+        end
+        -- The buffer already holds the RELOADED content at this point
+        -- (verified empirically: lines read inside on_reload are the
+        -- post-reload lines), so re-seeding straight from it is correct.
+        -- This is not optional bookkeeping: precise_delta resolves a
+        -- delta's UTF-16 columns against this shadow, and its utf16_col
+        -- CLAMPS to the line length rather than erroring -- so a shadow
+        -- left holding pre-reload text would not fail loudly, it would
+        -- silently emit a wrong range for the student's next edit. A
+        -- quietly corrupt delta is worse than the gap this closes.
+        buf_shadow[b] = vim.api.nvim_buf_get_lines(b, 0, -1, false)
+      end,
       on_detach = function(_, b)
         attached_bufs[b] = nil
         buf_rel[b] = nil

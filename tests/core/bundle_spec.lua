@@ -153,6 +153,88 @@ describe("bundle.validate_shape", function()
   end)
 end)
 
+describe("submission_files[i].role", function()
+  it("round-trips 'attachment' through build -> canonical JSON -> validate_shape", function()
+    local v = vim.deepcopy(VALID_1_1)
+    v.submission_files[1].role = "attachment"
+    local built = bundle.build(v)
+    local canonical = bundle.to_canonical(built)
+    assert.is_true(canonical:find('"role":"attachment"', 1, true) ~= nil)
+
+    local decoded = vim.json.decode(canonical)
+    local res = bundle.validate_shape(decoded)
+    assert.is_true(res.ok)
+  end)
+
+  it("omits the role key entirely from canonical JSON when the input has no role", function()
+    local v = vim.deepcopy(VALID_1_1)
+    v.submission_files[1].role = nil
+    local built = bundle.build(v)
+    local canonical = bundle.to_canonical(built)
+    assert.is_true(canonical:find('"role"', 1, true) == nil)
+  end)
+
+  it("validate_shape rejects role = 'bogus'", function()
+    local v = vim.deepcopy(VALID_1_1)
+    v.submission_files[1].role = "bogus"
+    local res = bundle.validate_shape(v)
+    assert.is_false(res.ok)
+    assert.equals("invalid_field", res.error.kind)
+    assert.equals("role", res.error.field)
+  end)
+
+  it("validate_shape accepts an absent role", function()
+    local v = vim.deepcopy(VALID_1_1)
+    v.submission_files[1].role = nil
+    local res = bundle.validate_shape(v)
+    assert.is_true(res.ok)
+  end)
+end)
+
+describe("BundleManifest.scope_capped", function()
+  it("appears in canonical JSON when true", function()
+    local v = vim.deepcopy(VALID_1_1)
+    v.scope_capped = true
+    local built = bundle.build(v)
+    local canonical = bundle.to_canonical(built)
+    assert.is_true(canonical:find('"scope_capped":true', 1, true) ~= nil)
+  end)
+
+  it(
+    "SIGNED BYTES: scope_capped = false produces canonical JSON with no scope_capped key",
+    function()
+      local v = vim.deepcopy(VALID_1_1)
+      v.scope_capped = false
+      local built = bundle.build(v)
+      local canonical = bundle.to_canonical(built)
+      assert.is_true(canonical:find('"scope_capped"', 1, true) == nil)
+    end
+  )
+
+  it(
+    "SIGNED BYTES: an absent scope_capped produces canonical JSON with no scope_capped key",
+    function()
+      local built = bundle.build(VALID_1_1)
+      local canonical = bundle.to_canonical(built)
+      assert.is_true(canonical:find('"scope_capped"', 1, true) == nil)
+    end
+  )
+
+  it("validate_shape rejects a non-boolean scope_capped", function()
+    local v = vim.deepcopy(VALID_1_1)
+    v.scope_capped = "yes"
+    local res = bundle.validate_shape(v)
+    assert.is_false(res.ok)
+    assert.equals("invalid_field", res.error.kind)
+    assert.equals("scope_capped", res.error.field)
+  end)
+
+  it("validate_shape accepts an absent scope_capped", function()
+    local res = bundle.validate_shape(VALID_1_1)
+    assert.is_true(res.ok)
+  end)
+end)
+
 describe("conformance: bundle-manifest.json (byte-exact JCS pin + verify_sig)", function()
   local fx = load_fixture("bundle-manifest.json")
 
@@ -173,6 +255,21 @@ describe("conformance: bundle-manifest.json (byte-exact JCS pin + verify_sig)", 
     assert.equals(fx.canonical_json, signed.canonical_json)
     assert.is_true(bundle.verify_sig(signed.canonical_json, signed.signature_hex, pub_hex))
   end)
+
+  it(
+    "REGRESSION: adding role/scope_capped support did not move the pinned "
+      .. "canonical bytes for a manifest that uses neither",
+    function()
+      -- fx.manifest carries no submission_files[i].role and no scope_capped.
+      -- If build()/to_canonical() started emitting either key by default, this
+      -- would fail against the pin recorded before those fields existed.
+      local built = bundle.build(fx.manifest)
+      local canonical = bundle.to_canonical(built)
+      assert.equals(fx.canonical_json, canonical)
+      assert.is_true(canonical:find('"role"', 1, true) == nil)
+      assert.is_true(canonical:find('"scope_capped"', 1, true) == nil)
+    end
+  )
 end)
 
 describe("conformance: golden-bundle.json (real sealed 1.0 manifest validates)", function()

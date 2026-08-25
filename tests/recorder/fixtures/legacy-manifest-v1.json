@@ -1,0 +1,10 @@
+{
+  "assignment_id": "hw3",
+  "semester": "fa25",
+  "issued_at": "2026-07-14T00:00:00Z",
+  "files_under_review": [
+    "src/main.py",
+    "src/util.py"
+  ],
+  "sig": "3f17ecf05ffe407c9e2dda454a8811049712894c62a2db8ba4c52bff257fd019fc784aa2f536d1766bf167e9cc5baa5fb23f15ec874e60f6bf6a00c8a4a87b08"
+}

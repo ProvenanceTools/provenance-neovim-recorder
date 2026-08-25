@@ -101,7 +101,7 @@ describe("doc_wiring <-> external_change_coordinator integration", function()
     local events, emit = new_emit()
     scratch.coordinator = coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "foo.txt" },
+      scope = { track = { "foo.txt" } },
       emit = emit,
     })
 
@@ -127,7 +127,7 @@ describe("doc_wiring <-> external_change_coordinator integration", function()
     local events, emit = new_emit()
     scratch.coordinator = coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "foo.txt" },
+      scope = { track = { "foo.txt" } },
       emit = emit,
     })
 
@@ -153,7 +153,7 @@ describe("doc_wiring <-> external_change_coordinator integration", function()
     local events, emit = new_emit()
     scratch.coordinator = coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "foo.txt" },
+      scope = { track = { "foo.txt" } },
       emit = emit,
     })
 
@@ -223,7 +223,7 @@ describe("doc_wiring <-> external_change_coordinator integration", function()
       local events, emit = new_emit()
       scratch.coordinator = coordinator_mod.start({
         workspace = workspace,
-        files_under_review = { "noeol.txt" },
+        scope = { track = { "noeol.txt" } },
         emit = emit,
       })
 

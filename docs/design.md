@@ -152,16 +152,40 @@ paste reconciler. Do not simplify to one signal without discussion.
   The tree-hash algorithm (sorted relative paths, per-file SHA-256, one rolling
   digest) is part of `core/` and itself covered by a vector so it is reproducible.
 
-- **The master public key is a committed constant.** Verification uses a single
-  maintainer-held *master* key, not a per-course key: there is one published
-  plugin, mirroring the single published VS Code / JetBrains extension. Its public
-  half is committed as a Lua constant (`lua/provenance/course_public_key.lua`) on
-  `main`; the private half is held offline and never enters the repo. There is no
-  build-time embed step (Neovim has no build step), so the key ships as-is in every
-  tagged release. Because the key is part of the hashed source, a given release's
-  tree hash already covers it: rotating the key is simply a new tagged release with
-  a new allowlist entry. No secret is ever committed; the *public* key is. (The
-  constant is named `COURSE_PUBLIC_KEY_HEX` for parity with the other recorders.)
+- **The trust anchors are committed constants.** Since Manifest 2.0 there are
+  **two**, both public halves, committed as Lua constants in
+  `lua/provenance/trust_keys.lua` on `main`; the private halves are held offline
+  and never enter the repo. Which one applies is decided by the manifest's
+  `format_version`, in `recorder/activation.lua`:
+  - `ROOT_PUBLIC_KEY_HEX` — the Provenance **root** key, anchor for Manifest 2.0.
+    A course's authority comes from its root-signed `course_cert`, carried inline
+    in the manifest, so one published plugin serves every course. All three
+    recorder implementations embed the same value.
+  - `LEGACY_COURSE_PUBLIC_KEY_HEX` — the **grandfathered** course key, used for
+    Manifest 1.x only. 1.x manifests predate the chain, carry no cert, and were
+    signed directly by a course key; verifying them against the root key would
+    fail closed, and a failed activation is silent non-recording. **Scheduled for
+    removal** once every course has re-issued as 2.0 — a permanent second anchor
+    is exactly what the hierarchy exists to eliminate.
+
+    **Each recorder grandfathers its own prior embedded constant**, so unlike the
+    root key this value is *not* shared across the three implementations — the
+    key that signed the 1.x manifests a recorder encounters is whatever that
+    recorder shipped with. Here it is the maintainer-held master key that went
+    out in every tagged release (this repo has no build step, so it was never a
+    dev placeholder). `tests/recorder/fixtures/legacy-manifest-v1.json` is a 1.x
+    manifest signed with it, and `scripts/e2e/produce_bundle.lua` activates
+    against it with **no pubkey override** — that is the end-to-end proof the
+    embedded constant still works. Keep that fixture separate from
+    `tests/conformance/fixtures/manifest.json`, which is a generated vector
+    signed with a different key.
+
+  There is no build-time embed step (Neovim has no build step), so both ship as-is
+  in every tagged release. Because they are part of the hashed source, a release's
+  tree hash already covers them: rotating either is simply a new tagged release
+  with a new allowlist entry. No secret is ever committed; the *public* keys are.
+  (This replaces the former single `COURSE_PUBLIC_KEY_HEX` in
+  `lua/provenance/course_public_key.lua`.)
 
 - **The `vscode` field wrinkle.** `session.start` has a hard-coded
   `vscode: { version, commit, platform }` object that is part of the signed,
@@ -173,6 +197,18 @@ paste reconciler. Do not simplify to one signal without discussion.
   Generalizing the field to `host`/`editor` would be an approval-gated format bump
   in the monorepo and is explicitly deferred. This is the identical decision
   `provjet` made.
+
+  **RESOLVED at session.start 2.0** (program spec §5): the format bump happened
+  in the monorepo, and `session.start` now also carries a `host: { editor,
+  editor_version, editor_build, platform }` block. This recorder emits
+  `editor = "neovim"` and `editor_build = ""` (Neovim has no build-commit
+  concept; the spec explicitly permits `""`). The `vscode` block is **retained
+  alongside it** so 1.x readers keep working — additive, not a replacement.
+  `session.start` 2.0 also carries the FULL `manifest` (for 1.x manifests too,
+  which is what lets the analyzer apply the absence-vs-disabled rule). It
+  deliberately does **not** carry `identity`: enrollment keys are sub-project S2
+  and do not exist yet, and the field is optional precisely so this could land
+  first.
 
 ## 7. Distribution & the "prod build" analog
 

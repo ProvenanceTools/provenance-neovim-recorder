@@ -82,7 +82,7 @@ describe("reload_checker", function()
 
     local buf = scratch.edit(path)
 
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     local ec = reg.get_or_create("a.py", expected_content)
 
     -- Simulate an external write that Neovim then reloaded: buffer content
@@ -123,7 +123,7 @@ describe("reload_checker", function()
 
     local buf = scratch.edit(path)
 
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     reg.get_or_create("a.py", content)
 
     local events, emit = new_emit()
@@ -142,7 +142,7 @@ describe("reload_checker", function()
 
     local buf = scratch.edit(path)
 
-    local reg = registry_mod.new({}) -- "never.py" not in files_under_review
+    local reg = registry_mod.new({ track = {}, ignore = {}, attachments = {} }) -- "never.py" not in files_under_review
 
     local events, emit = new_emit()
     local tagger = tagger_mod.new({ get_now = function() return 0 end })
@@ -163,7 +163,7 @@ describe("reload_checker", function()
 
     local buf = scratch.edit(path)
 
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     reg.get_or_create("a.py", "different content\n")
 
     local events, emit = new_emit()
@@ -180,7 +180,7 @@ describe("reload_checker", function()
   it("empty buffer name: no-op (no emit, no error)", function()
     local workspace = scratch.workspace()
 
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     reg.get_or_create("a.py", "content\n")
 
     local events, emit = new_emit()
@@ -205,7 +205,7 @@ describe("reload_checker", function()
 
     local buf = scratch.edit(path)
 
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     reg.get_or_create("a.py", "old content\n")
 
     local disk_content = "new content from formatter\n"
@@ -230,7 +230,7 @@ describe("reload_checker", function()
 
     local buf = scratch.edit(path)
 
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     reg.get_or_create("a.py", "old content\n")
 
     local disk_content = "new content, no tool ran\n"
@@ -253,7 +253,7 @@ describe("reload_checker", function()
 
     local buf = scratch.edit(path)
 
-    local reg = registry_mod.new({ "big.py" })
+    local reg = registry_mod.new({ track = { "big.py" }, ignore = {}, attachments = {} })
     reg.get_or_create("big.py", "small\n")
 
     local disk_content = string.rep("x", 70000)
@@ -281,7 +281,7 @@ describe("reload_checker", function()
 
     local buf = scratch.edit(path)
 
-    local reg = registry_mod.new({ "a.py" })
+    local reg = registry_mod.new({ track = { "a.py" }, ignore = {}, attachments = {} })
     local ec = reg.get_or_create("a.py", expected_content)
 
     local events, emit = new_emit()

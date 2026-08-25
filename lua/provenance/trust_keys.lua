@@ -1,0 +1,71 @@
+--- The recorder's embedded verification anchors (design.md §4.1; program spec
+--- §2/§9, 2026-08-18-multicourse-program-architecture).
+---
+--- There are TWO, and they are not interchangeable. Which one applies is decided
+--- by the manifest's `format_version`, in `recorder/activation.lua`:
+---
+---   2.0        -> ROOT_PUBLIC_KEY_HEX, via manifest.verify_chain
+---   1.x/absent -> LEGACY_COURSE_PUBLIC_KEY_HEX, via manifest.verify
+---
+--- Both are PUBLIC keys, public by definition and committed here on `main`; the
+--- private halves are held offline and never enter the repo. Because Neovim
+--- plugins have no build step, these constants ship as-is in every tagged
+--- release, and the release's source tree-hash (its `extension_hash`) is what
+--- the analyzer allowlists — so rotating either key is a normal new tagged
+--- release plus a new allowlist entry (docs/design.md §6-§7). That is this
+--- repo's equivalent of the VS Code recorder's `build:prod` key-embedding step.
+---
+--- ROOT_PUBLIC_KEY_HEX is shared verbatim by all three recorder implementations.
+--- LEGACY_COURSE_PUBLIC_KEY_HEX deliberately is NOT — each recorder grandfathers
+--- its own prior embedded constant. See that constant's docstring.
+---
+--- This module replaces the former `provenance.course_public_key`, which
+--- exported a single `COURSE_PUBLIC_KEY_HEX`. One embedded key per build is
+--- exactly what the trust hierarchy exists to remove.
+local M = {}
+
+--- The Provenance ROOT public key — the trust anchor for Manifest 2.0.
+---
+--- At 1.x the recorder embedded one course's signing key, so every course would
+--- have needed its own release. At 2.0 it embeds the ROOT key only: a course's
+--- authority comes from its root-signed `course_cert`, which travels inline in
+--- the `.provenance-manifest`. One published plugin serves every course.
+---
+--- This is the DEV root key, shared verbatim by all three recorder
+--- implementations so one dev manifest activates in any of them.
+M.ROOT_PUBLIC_KEY_HEX = "80051f5bdb9064e0768bf2fca5cc9a4ee888502ab45472e0c6d0f4f704de4499"
+
+--- The LEGACY course public key — the grandfathered anchor for Manifest 1.x.
+---
+--- Every 1.x manifest already in the field was signed directly by a course's OLD
+--- signing key, with no cert and no chain. Verifying those against the ROOT key
+--- fails closed, and a failed activation is silent non-recording — total
+--- evidence loss for anyone whose course has not re-issued yet. So the old key
+--- is grandfathered back in for the 1.x path, and ONLY the 1.x path: a 2.0
+--- manifest never verifies against it, which is what keeps the chain's step-0
+--- downgrade gate meaningful.
+---
+--- **This is THIS recorder's own prior embedded constant, and that is the rule.**
+--- Each recorder grandfathers the key it was itself verifying against, because
+--- the key that signed the 1.x manifests a given recorder encounters is whatever
+--- that recorder shipped with. The three implementations embed three DIFFERENT
+--- legacy keys (VS Code `46f91d59…`, provjet `958d262b…`, provnvim the value
+--- below); only ROOT_PUBLIC_KEY_HEX is shared. Do not "align" this one.
+---
+--- It matters most here. provnvim has no build step, so this was never a dev
+--- placeholder: it is the real maintainer-held master key that shipped in every
+--- tagged release and signed every real 1.x manifest in the field. The private
+--- half is held offline and has never entered the repo. Swapping it for another
+--- recorder's key would silently kill recording for every existing provnvim
+--- user — the precise failure this clause exists to prevent.
+---
+--- **Scheduled for removal.** A second permanent trust anchor is precisely what
+--- the root-key hierarchy exists to eliminate. Once program spec §9's migration
+--- has completed for every course with manifests still active in the field —
+--- i.e. no 1.x manifest anyone still needs to verify remains unreissued as 2.0 —
+--- delete this constant, the 1.x branch in `recorder/activation.lua` that reads
+--- it, tests/recorder/fixtures/legacy-manifest-v1.json, and the entries in
+--- tests/recorder/trust_keys_spec.lua.
+M.LEGACY_COURSE_PUBLIC_KEY_HEX = "b5bca59ffa918c879d01050dab428e60c630f9d2051508af3d29c60cce985e25"
+
+return M

@@ -229,21 +229,29 @@ prints the current indicator text.
 > commit or a fork with modified source will produce a hash the analyzer does not recognize,
 > and every submission from it gets flagged.
 
-## Distribution & the master key
+## Distribution & the trust anchors
 
 There is one canonical, published plugin — not a fork per course. Distribution works like this:
 
-- This repo commits a single **master public key** as a Lua constant in
-  `lua/provenance/course_public_key.lua`. It is the maintainer-held signing key's public half —
-  **public, not a secret** — committed as part of the source; the private half is kept offline and
-  never enters the repo. Neovim has no build step, so the key ships as-is in every release (there
-  is no build-time embedding step like the VS Code recorder's).
+- This repo commits **two public keys** as Lua constants in `lua/provenance/trust_keys.lua`.
+  Both are public halves — **public, not secrets** — committed as part of the source; the private
+  halves are kept offline and never enter the repo. Neovim has no build step, so they ship as-is
+  in every release (there is no build-time embedding step like the VS Code recorder's).
+  - `ROOT_PUBLIC_KEY_HEX` — the Provenance root key, and the anchor for **Manifest 2.0**. A
+    course's authority comes from a root-signed `course_cert` carried inline in its
+    `.provenance-manifest`, so one plugin serves every course.
+  - `LEGACY_COURSE_PUBLIC_KEY_HEX` — the grandfathered course key, used for **Manifest 1.x**
+    only. 1.x manifests carry no certificate, so they are verified against it directly. This is
+    the master key that shipped in earlier tagged releases of *this* plugin; each recorder
+    grandfathers its own, so it is not shared across the three implementations the way the root
+    key is. It is **scheduled for removal** once every course has re-issued its manifests as 2.0.
 - Students install a **pinned tag** of this repo (e.g., `version = "v0.1.0"`). The recorder
-  records only for a workspace whose `.provenance-manifest` is signed by that master key.
-- Because the key is part of the plugin's source tree, and the `extension_hash` is a hash of that
-  source tree (§ `extension_hash` below), each released tag has a fixed `extension_hash` that the
-  analyzer allowlists. Rotating the master key is a normal new tagged release with a new allowlist
-  entry; older tags keep their old key immutably.
+  records only for a workspace whose `.provenance-manifest` verifies on the path its
+  `format_version` selects.
+- Because the keys are part of the plugin's source tree, and the `extension_hash` is a hash of
+  that source tree (§ `extension_hash` below), each released tag has a fixed `extension_hash`
+  that the analyzer allowlists. Rotating either key is a normal new tagged release with a new
+  allowlist entry; older tags keep their old keys immutably.
 
 The sealed bundle's `manifest.json` and `manifest.sig` are **never modified after seal**. The
 stored bundle must remain signature and chain verifiable.

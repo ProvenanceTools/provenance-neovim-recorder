@@ -55,9 +55,110 @@
 --- (`git_payloads.build_git_event`), so an event without it is a valid,
 --- format-compatible shape.
 ---
+--- ## THE COMMIT GRAPH (program spec S5)
+---
+--- `git.event` also carries `sha`, `parents[]` and `branch`, so replay can
+--- show real branch and merge structure. Gradescope delivers the working
+--- tree only, never `.git`, and a `.git` that did travel would be
+--- rewritable after the fact (`amend`, `rebase`, `filter-branch`) — so the
+--- graph is captured HERE, at record time, inside the signed hash chain.
+--- The payload rules (the order of `parents` is meaningful; `[]` ≠ absent;
+--- `commit_sha` is still emitted alongside `sha`) live in `git_payloads.lua`
+--- and are pinned by `tests/conformance/fixtures/git-event.json`.
+---
+--- Three reads, all through the one injectable `run_git` seam:
+---   `rev-parse HEAD`                    -> sha / commit_sha  (pre-existing)
+---   `rev-list --parents -n 1 <sha>`     -> parents           (new)
+---   `symbolic-ref --quiet --short HEAD` -> branch            (new)
+--- `symbolic-ref` failing IS the detached-HEAD signal, so `branch` is
+--- omitted rather than invented. `rev-list` is asked only when there is a
+--- sha to describe, and its answer is accepted only if its first token is
+--- that same sha — otherwise `parents` is omitted, because "could not read"
+--- must never be reported as `[]` ("root commit").
+---
+--- NO GIT AUTHOR IDENTITY reaches the log — not a name, not an email, not
+--- an author date, not a commit message. That is a protocol constraint (the
+--- approved CPHS protocol 2026-06-19796 treats a new category of identifier
+--- as requiring a filed modification BEFORE implementation), enforced here
+--- by two things: the only commit projection available is
+--- `git_payloads.commit_view(sha, parents)`, which has no parameter an
+--- author field could enter through; and every value this module lifts out
+--- of git's stdout must first pass `is_single_token` / `is_object_id` below,
+--- so an author-shaped line (`Name <a@b.example> 1700000000 +0000`) is
+--- rejected outright instead of landing in `sha`, `parents`, or `branch`.
+--- Note this tightens the pre-existing `commit_sha` read too: it used to
+--- take `rev-parse`'s stdout verbatim. See the IRB tests in
+--- tests/recorder/wiring/git_wiring_spec.lua and
+--- tests/recorder/events/git_payloads_spec.lua.
+---
+--- ## THE REPOSITORY DISCRIMINATOR (decision D12)
+---
+--- `git.event` also carries `root_commit_sha`: the root of HEAD's first-parent
+--- lineage, which is what lets a reader key observed commits by
+--- `(repository, sha)` instead of by `sha` alone. Without it, a scope that
+--- observed a submodule alongside its outer repository merges two unrelated sha
+--- spaces into one graph.
+---
+--- Derived ONCE here, at `start()`, and memoized for the life of the handle —
+--- writer rule 1. It cannot change for the life of a repository, and the event
+--- path must not pay for it. `_on_head_change` reads a settled local, never a
+--- subprocess.
+---
+--- ONE VALUE PER REPOSITORY OBSERVED (writer rule 9). This port watches exactly
+--- one repository — the activated workspace — and derives the discriminator
+--- through the SAME `run_git` seam that `_on_head_change` reads `HEAD` through.
+--- That is the invariant, not merely a convenience: the label and the sha it
+--- labels are resolved by one `git -C <workspace>`, so a workspace that IS a
+--- submodule gets the submodule's own root, and a workspace that CONTAINS one
+--- never observes the inner repository's commits in the first place. Labelling
+--- a submodule's event with the outer repository's root would re-create the
+--- exact merge the field exists to prevent, so a future change that widened
+--- this module to several repositories must give each its own seam and its own
+--- derivation — never share this one.
+---
+--- OMITTED, never null, on a shallow clone or any failure — see
+--- `wiring/root_commit_sha.lua` for the derivation rules and
+--- `events/git_payloads.lua` for the omission rule. Absence is legal,
+--- permanent and blameless; it is the state of every bundle recorded before
+--- D12 and of every shallow clone forever.
+---
+--- ## WHY EMISSION STAYS SYNCHRONOUS (unlike provcode/provjet)
+---
+--- The other two recorders had to make emission asynchronous, because their
+--- host APIs expose parents only through a call that is async (VS Code) or
+--- must not run on the UI thread (JetBrains) — and they then each needed a
+--- serializing queue so a fast graph read could not overtake a slow one and
+--- write log entries out of order. This port needs none of that and
+--- deliberately does not add it: reading the graph is two more `run_git`
+--- calls inside the SAME synchronous `_on_head_change` handler that already
+--- read `rev-parse HEAD`, so `emit` is still called exactly once, from
+--- straight-line code, with no yield between the session host reading and
+--- advancing `prev_hash`/`seq`. That atomicity is what stops a concurrent
+--- emitter from manufacturing a tamper finding against an innocent student;
+--- introducing an await here to mirror the other ports would reintroduce
+--- precisely the race they had to engineer around.
+---
+--- Cost of the two extra invocations: `_on_head_change` runs only from an
+--- fs_poll / timer callback (default every 2000 ms) and only when the reflog
+--- actually moved — never from a buffer callback, never on the keystroke
+--- path. It reuses the existing `vim.fn.system` seam rather than adding a
+--- new blocking mechanism.
+---
+--- NO CAPTURE-POLICY GATE HERE. `git.event` is a FLOOR event kind: it has
+--- no key in `policy.capture`, so "off" is not expressible, and adding
+--- fields to a floor payload does not make it gateable. That is deliberate
+--- — the commit graph is the EXCULPATORY evidence that a large insert was a
+--- merge or a checkout rather than a paste. It also matters mechanically:
+--- suppression must happen before an entry is chained and given a `seq`
+--- (see session/policy_gate.lua), because a `seq` hole reads to validation
+--- check 4 (`seq_gaps`) as a deleted entry — which would turn a course's
+--- privacy setting into a tamper signal against the student.
+---
 --- Composes (does not reimplement): recorder.events.git_payloads
---- (build_git_event), recorder.events.explanation_tags (tagger.mark_git()).
+--- (commit_view, build_git_event), recorder.events.explanation_tags
+--- (tagger.mark_git()).
 local git_payloads = require("provenance.recorder.events.git_payloads")
+local root_commit_sha = require("provenance.recorder.wiring.root_commit_sha")
 
 local M = {}
 
@@ -100,6 +201,110 @@ local function safe_run_git(run_git, args_list)
     return { ok = result.ok == true, out = result.out or "" }
   end
   return { ok = false, out = "" }
+end
+
+--- Is `s` a single bare token — non-empty, no whitespace, no ASCII control
+--- characters? This is the floor every value lifted out of git's stdout has
+--- to clear before it can enter a signed payload.
+---
+--- It is deliberately looser than "looks like a sha" (an object id can be 40
+--- or 64 hex depending on the repo's hash algorithm, and abbreviations exist)
+--- and deliberately strict about whitespace, which is what makes it
+--- load-bearing for the no-author-identity constraint: every shape author
+--- identity arrives in — `Real Name <a@b.example>`, a reflog line, a
+--- `git log` line — contains a space. Git's own ref-name rules forbid
+--- whitespace and control characters in a branch name too, so nothing
+--- legitimate is lost.
+--- @param s any
+--- @return boolean
+local function is_single_token(s)
+  if type(s) ~= "string" or s == "" then
+    return false
+  end
+  return s:match("^[^%s%c]+$") ~= nil
+end
+
+--- Is `s` plausibly a git object id — a single token of at least 7 hex
+--- digits? Applied to PARENT shas only, where we are parsing a multi-token
+--- line and need to know we parsed the right thing.
+--- @param s any
+--- @return boolean
+local function is_object_id(s)
+  if not is_single_token(s) then
+    return false
+  end
+  return #s >= 7 and s:match("^%x+$") ~= nil
+end
+
+--- read_parents(run_git, sha) -> string[]|nil
+---
+--- Parent object ids of `sha`, in GIT'S OWN ORDER — `[1]` is the branch that
+--- was merged into. `git rev-list --parents -n 1 <sha>` prints one line:
+--- `<sha> <parent1> <parent2> ...`, so a root commit yields a line with a
+--- single token, which is how `{}` ("genuinely no parents") is distinguished
+--- from nil ("could not read").
+---
+--- Returns nil — never `{}` — on every failure, because `{}` is a positive
+--- claim of "root commit" that a failed read is not entitled to make. The
+--- line is accepted only when its first token is the very sha we asked
+--- about and every remaining token is an object id; anything else (a git
+--- error printed to stdout, an injected seam answering something unrelated,
+--- an author-bearing line) is a read we did not understand.
+--- @param run_git function
+--- @param sha string
+--- @return string[]|nil
+local function read_parents(run_git, sha)
+  local r = safe_run_git(run_git, { "rev-list", "--parents", "-n", "1", sha })
+  if not r.ok or r.out == "" then
+    return nil
+  end
+
+  -- One commit was requested, so one line is expected. More than one line
+  -- means we are not reading what we think we are reading.
+  if r.out:find("[\r\n]") ~= nil then
+    return nil
+  end
+
+  local tokens = vim.split(vim.trim(r.out), "%s+", { trimempty = true })
+  if #tokens == 0 or tokens[1] ~= sha then
+    return nil
+  end
+
+  local parents = {}
+  for i = 2, #tokens do
+    if not is_object_id(tokens[i]) then
+      return nil
+    end
+    -- NEVER sorted: the first parent is the branch merged INTO, so order is
+    -- meaning, and JCS leaves array elements alone.
+    parents[i - 1] = tokens[i]
+  end
+  return parents
+end
+
+--- read_branch(run_git) -> string|nil
+---
+--- The current branch name, or nil when HEAD is detached. `git symbolic-ref
+--- --quiet --short HEAD` exits non-zero exactly when HEAD is not a symbolic
+--- ref, which IS the detached-HEAD signal — so a failure omits the key
+--- rather than inventing `"HEAD"` or `""`. An omitted branch and a branch
+--- literally named "HEAD" are different claims.
+---
+--- Note this succeeds on an unborn branch (a fresh `git init`, where
+--- `rev-parse HEAD` fails): the branch exists even though no commit does, so
+--- `branch` without `sha` is a correct payload, not a contradiction.
+--- @param run_git function
+--- @return string|nil
+local function read_branch(run_git)
+  local r = safe_run_git(run_git, { "symbolic-ref", "--quiet", "--short", "HEAD" })
+  if not r.ok then
+    return nil
+  end
+  local name = vim.trim(r.out or "")
+  if not is_single_token(name) then
+    return nil
+  end
+  return name
 end
 
 --- detect_repo(workspace, run_git) -> boolean
@@ -242,21 +447,78 @@ function M.start(opts)
   local disposed = false
   local watcher = nil -- either a uv fs_poll or a uv timer, both stop()/close()
 
+  -- THE REPOSITORY DISCRIMINATOR (D12), derived ONCE here — writer rule 1 —
+  -- and never on the event path. Two local object-database reads, at wiring
+  -- setup, only for a workspace already established to be a repository:
+  -- running git in a workspace whose events are dropped is work it should
+  -- never do.
+  --
+  -- Derived through the SAME `run_git` seam `_on_head_change` reads HEAD
+  -- through, which is writer rule 9: the label and the sha it labels come from
+  -- one `git -C <workspace>`, so a workspace that IS a submodule is labelled
+  -- with the submodule's own root rather than an outer repository's.
+  --
+  -- `derive` never raises; a pcall here is belt-and-braces against a caller
+  -- supplied `run_git` that does something exotic, and its failure is an
+  -- omission like every other.
+  local derive_ok, discriminator = pcall(root_commit_sha.derive, run_git)
+  if not derive_ok or type(discriminator) ~= "string" then
+    discriminator = nil
+  end
+
   local handle = { active = true }
 
-  --- Deterministic decision handler: read the current HEAD commit sha,
-  --- build+emit a state_change git.event, mark the tagger. Guarded end to
-  --- end (pcall) so any run_git/tagger failure degrades to a silent no-op
-  --- rather than propagating into an fs_poll/timer callback.
+  -- Test/inspection seam: the memoized value, so a spec can prove the
+  -- derivation ran ONCE at setup rather than per event.
+  handle._root_commit_sha = discriminator
+
+  --- Deterministic decision handler: read the current HEAD commit sha and
+  --- its graph position (parents, branch), build+emit a state_change
+  --- git.event, mark the tagger. Guarded end to end (pcall) so any
+  --- run_git/tagger failure degrades to a silent no-op rather than
+  --- propagating into an fs_poll/timer callback.
+  ---
+  --- Straight-line and fully SYNCHRONOUS on purpose: `emit` is called
+  --- exactly once, with nothing between the session host reading and
+  --- advancing `prev_hash`/`seq`. See the module docstring on why this port
+  --- does not need (and must not grow) the serializing queue provcode and
+  --- provjet required.
   function handle._on_head_change()
     if disposed then
       return
     end
     pcall(function()
       local r = safe_run_git(run_git, { "rev-parse", "HEAD" })
-      local commit_sha = (r.ok and r.out ~= "") and r.out or nil
+      local out = (r.ok and r.out ~= "") and r.out or nil
+      -- Tightened alongside S5: a bare token only. `rev-parse` printing
+      -- anything multi-token means we did not read a sha, and this is the
+      -- one place git stdout could otherwise reach a signed payload
+      -- verbatim.
+      local commit_sha = is_single_token(out) and out or nil
 
-      local ev = git_payloads.build_git_event("state_change", commit_sha)
+      -- The graph read is skipped when there is no commit to describe (a
+      -- fresh `git init`): there is nothing to ask about, and `parents`
+      -- must stay ABSENT rather than become `[]`.
+      local view = nil
+      if commit_sha ~= nil then
+        -- commit_view is the ONLY projection of a commit this plugin has,
+        -- and takes exactly (sha, parents) — no author field can enter here.
+        view = git_payloads.commit_view(commit_sha, read_parents(run_git, commit_sha))
+      end
+
+      local branch = read_branch(run_git)
+
+      -- `commit_sha` and `sha` carry the same value on purpose: 1.x readers
+      -- only know the former, and 1.x support is permanent (program spec §9).
+      --
+      -- `root_commit_sha` rides along on every event that carries a sha (D12
+      -- writer rule 10) — not only on commits, because an unlabelled
+      -- observation does not correlate even when its neighbours in the same
+      -- session do. It is the value derived at setup: a settled local, so this
+      -- costs a table read and never a git invocation. The builder OMITS it,
+      -- never nulls it, and re-checks it through log-core's own reader.
+      local ev =
+        git_payloads.build_git_event("state_change", commit_sha, view, branch, discriminator)
       emit(ev.kind, ev.data)
 
       if tagger then

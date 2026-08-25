@@ -129,15 +129,20 @@ describe("session_writer", function()
     local flush_ok = pcall(w.flush)
     assert.is_true(flush_ok)
 
-    assert.equals(1, #errors)
+    -- TWO errors, not one: open() now also tries to create the .slog eagerly and
+    -- fails on this same broken path, reporting through the same on_error seam.
+    -- That earlier report is the point — a session whose .slog cannot be created
+    -- should say so at start, not silently at the first flush.
+    assert.equals(2, #errors)
     assert.is_truthy(errors[1])
+    assert.is_truthy(errors[2])
 
     -- The dropped line must not resurface: appending+flushing again against
     -- the same broken path only ever reports one more failure, never a
     -- write that somehow contains the first entry.
     assert.is_true(pcall(w.append, make_entry(1, "also-fails")))
     assert.is_true(pcall(w.flush))
-    assert.equals(2, #errors)
+    assert.equals(3, #errors)
   end)
 
   it("flushes buffered entries on dispose even without an explicit flush call", function()
@@ -151,8 +156,10 @@ describe("session_writer", function()
     })
 
     w.append(make_entry(0, "flushed-on-dispose"))
-    -- Below both thresholds: nothing written yet.
-    assert.is_nil(read_file(slog_path))
+    -- Below both thresholds: nothing WRITTEN yet. The file exists from open()
+    -- (created empty so it always pairs with the .slog.meta), so the assertion
+    -- is emptiness rather than absence.
+    assert.equals("", read_file(slog_path))
 
     w.dispose()
 

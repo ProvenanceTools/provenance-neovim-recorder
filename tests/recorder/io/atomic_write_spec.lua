@@ -90,3 +90,88 @@ describe("atomic_write_file", function()
     assert.equals("original content", read_all(target))
   end)
 end)
+
+describe("atomic_write_file_pair", function()
+  local atomic_write_file_pair = require("provenance.recorder.io.atomic_write").atomic_write_file_pair
+  local tempdirs = {}
+
+  after_each(function()
+    for _, dir in ipairs(tempdirs) do
+      vim.fn.delete(dir, "rf")
+    end
+    tempdirs = {}
+  end)
+
+  local function new_tempdir()
+    local dir = make_tempdir()
+    table.insert(tempdirs, dir)
+    return dir
+  end
+
+  it("commits every entry and leaves no temp behind", function()
+    local dir = new_tempdir()
+    local json_path = dir .. "/manifest-abc.json"
+    local sig_path = dir .. "/manifest-abc.sig"
+
+    atomic_write_file_pair({
+      { target_path = json_path, contents = '{"format_version":"1.2"}' },
+      { target_path = sig_path, contents = "deadbeef" },
+    })
+
+    assert.equals('{"format_version":"1.2"}', read_all(json_path))
+    assert.equals("deadbeef", read_all(sig_path))
+    assert.same({}, vim.fn.glob(dir .. "/*.tmp", true, true))
+  end)
+
+  it("commits NOTHING when any entry fails to stage", function()
+    -- The point of staging both before renaming either: a seal whose .sig could
+    -- not be written must not replace the previous, self-consistent pair with a
+    -- .json that verifies against nothing.
+    local dir = new_tempdir()
+    local json_path = dir .. "/manifest-abc.json"
+    local sig_path = dir .. "/nonexistent-subdir/manifest-abc.sig"
+
+    atomic_write_file_pair({
+      { target_path = json_path, contents = "V1" },
+      { target_path = dir .. "/manifest-abc.sig", contents = "SIG1" },
+    })
+
+    local ok = pcall(atomic_write_file_pair, {
+      { target_path = json_path, contents = "V2" },
+      { target_path = sig_path, contents = "SIG2" },
+    })
+    assert.is_false(ok)
+
+    -- The previous pair survives, intact and matched.
+    assert.equals("V1", read_all(json_path))
+    assert.equals("SIG1", read_all(dir .. "/manifest-abc.sig"))
+    assert.same({}, vim.fn.glob(dir .. "/*.tmp", true, true))
+  end)
+
+  it("stages every entry before renaming any of them", function()
+    local dir = new_tempdir()
+    local uv = vim.uv or vim.loop
+    local real_open, real_rename = uv.fs_open, uv.fs_rename
+    local order = {}
+
+    uv.fs_open = function(path, flags, mode)
+      if path:match("%.tmp$") and flags == "w" then
+        order[#order + 1] = "stage"
+      end
+      return real_open(path, flags, mode)
+    end
+    uv.fs_rename = function(from, to)
+      order[#order + 1] = "rename"
+      return real_rename(from, to)
+    end
+
+    local ok = pcall(atomic_write_file_pair, {
+      { target_path = dir .. "/a.json", contents = "A" },
+      { target_path = dir .. "/b.sig", contents = "B" },
+    })
+    uv.fs_open, uv.fs_rename = real_open, real_rename
+
+    assert.is_true(ok)
+    assert.same({ "stage", "stage", "rename", "rename" }, order)
+  end)
+end)

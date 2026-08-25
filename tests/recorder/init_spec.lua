@@ -168,6 +168,34 @@ describe("recorder.setup", function()
     assert.is_true(#calls >= 1)
   end)
 
+  --- Regression: resolve_buf is wired to BufEnter/BufReadPost/BufNewFile, so
+  --- an uncached resolve re-ran a ~12 ms pure-Lua ed25519 verification on the
+  --- main loop for every buffer switch inside an activated workspace. setup()
+  --- must hand discovery the registry's verified-root cache as its
+  --- load_and_verify seam so a root is verified once, not once per buffer.
+  it("passes the registry's cached load_and_verify to the resolve seam", function()
+    local seen_opts = {}
+    handle = recorder.setup({
+      workspace = "/tmp/ws",
+      resolve = function(_, resolve_opts)
+        table.insert(seen_opts, resolve_opts)
+        return { status = "active", root = "/tmp/ws", manifest = { assignment_id = "hw3" } }
+      end,
+      start_recording = function()
+        return { seal = function() end, stop = function() end }
+      end,
+    })
+
+    assert.is_true(#seen_opts >= 1)
+    assert.is_table(seen_opts[1])
+    assert.is_function(seen_opts[1].load_and_verify)
+    -- Same table every call: one cache for the editor session, not a fresh
+    -- (and therefore useless) one per resolve.
+    for i = 2, #seen_opts do
+      assert.equals(seen_opts[1], seen_opts[i])
+    end
+  end)
+
   it("dispose(): detaches status so segment() goes back to empty", function()
     handle = recorder.setup({
       workspace = "/tmp/ws",

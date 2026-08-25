@@ -13,6 +13,11 @@ local recording_controller = require("provenance.recorder.session.recording_cont
 local core_clock = require("provenance.core.clock")
 local discovery = require("provenance.recorder.discovery")
 local registry_mod = require("provenance.recorder.registry")
+local secret_store = require("provenance.recorder.identity.secret_store")
+local key_cache_mod = require("provenance.recorder.identity.key_cache")
+local enrollment_cmd = require("provenance.recorder.commands.enrollment")
+local enroll_nudge_ui = require("provenance.recorder.enroll_nudge_ui")
+local seal_cmd = require("provenance.recorder.commands.seal")
 
 local M = {}
 
@@ -38,13 +43,46 @@ function M.setup(opts)
   local registry = registry_mod.new({ start_recording = start_recording })
   status.attach(registry)
 
+  -- Student identity (program spec §S2). BOTH of these have exactly one owner
+  -- (this setup call) and exactly one disposal path (handle.dispose below).
+  -- That matters for the key cache in particular: it retains derived PRIVATE
+  -- keys, which is precisely why core/student_keys.lua refuses to memoize them
+  -- itself. `opts.identity_store` / `opts.identity_key_cache` are injection
+  -- seams so tests never touch the real store under stdpath("data").
+  local identity_store = opts.identity_store or secret_store.new({ path = opts.identity_store_path })
+  local identity_key_cache = opts.identity_key_cache or key_cache_mod.new()
+
+  -- Route discovery's verification seam through the registry's verified-root
+  -- cache. resolve_buf below runs on EVERY buffer switch, and an uncached
+  -- resolve pays a ~12 ms pure-Lua ed25519 verification on the main loop.
+  local resolve_opts = { load_and_verify = registry.load_and_verify }
+
   --- Resolve a single anchor directory and, if active, ensure its session
   --- exists in the registry. Idempotent (registry.ensure_session already
   --- guards against double-starting the same root).
+  -- The enrollment nudge is considered at most ONCE per Neovim process. Without
+  -- this guard it would re-read its state file on every BufEnter, since that is
+  -- how often activation is re-resolved.
+  local nudge_considered = false
+  local nudge_deps = opts.enroll_nudge_deps
+
   local function resolve_and_activate(start_dir)
-    local result = resolve(start_dir)
+    local result = resolve(start_dir, resolve_opts)
     if result.status == "active" then
-      registry.ensure_session(result.root, result.manifest, { clock = core_clock.system() })
+      registry.ensure_session(result.root, result.manifest, {
+        clock = core_clock.system(),
+        identity_store = identity_store,
+        identity_key_cache = identity_key_cache,
+      })
+      -- Deferred: `ensure_session` has just returned, so the outcome exists, but
+      -- a notification fired synchronously from a BufEnter autocmd lands while
+      -- the student is mid-keystroke. `vim.schedule` puts it on the next tick.
+      if not nudge_considered then
+        nudge_considered = true
+        vim.schedule(function()
+          enroll_nudge_ui.maybe_nudge(registry, nudge_deps)
+        end)
+      end
     end
     return result
   end
@@ -135,6 +173,34 @@ function M.setup(opts)
       else
         vim.notify("Provenance: sealed submission bundle -> " .. result.bundle_path, vim.log.levels.INFO)
       end
+      -- A dropped artifact must never read as "nothing was wrong". SEPARATE
+      -- from the branch above: this is not evidence of tampering (the chain
+      -- may be perfectly intact) — it's either an incomplete session
+      -- recording artifact left out so the bundle stays openable, or a
+      -- workspace file the path-scope seal (Task F) could not include: one
+      -- that could not be read, that resolved outside this workspace folder
+      -- (an out-of-workspace symlink target), or that was a duplicate of
+      -- another file already sealed under a different spelling. The
+      -- overwhelmingly likely cause of any of those is a staff typo in the
+      -- course manifest's scope (`src` instead of `src/`) or an ordinary
+      -- symlink into a shared directory, not anything the student did —
+      -- hence "this is not a finding about your work", and "nothing was
+      -- removed from disk" because the student's first fear is that the
+      -- tool deleted their work. Mirrors the monorepo's widened copy
+      -- (`packages/recorder/src/extension.ts:278`), plus provnvim's own
+      -- added final clause. Do NOT fold this into the chain_broken branch
+      -- above: its "sealed WITH WARNINGS (hash chain broken)" copy would be
+      -- factually false here, since the chain is intact.
+      if seal_cmd.seal_dropped_artifacts(result.warnings) then
+        vim.notify(
+          "Provenance: bundle produced. Some files could not be included — either session "
+            .. "recording artifacts left out so the bundle can be opened, or workspace files that "
+            .. "could not be read, resolved outside this workspace folder, or were duplicates of "
+            .. "another sealed file at seal time. Nothing was removed from disk, and this is not a "
+            .. "finding about your work. Mention it to course staff.",
+          vim.log.levels.WARN
+        )
+      end
     elseif result.kind == "no_sessions" then
       vim.notify("Provenance: nothing to seal (no recorded sessions).", vim.log.levels.WARN)
     else
@@ -195,10 +261,118 @@ function M.setup(opts)
   -- autocmd event.
   resolve_cwd()
 
+  --- Course ids of every active root whose manifest is 2.0. Used to default the
+  --- `course_id` argument on the enrollment commands.
+  local function active_course_ids()
+    local seen, out = {}, {}
+    for _, entry in ipairs(registry.list()) do
+      local course_id = entry.manifest and entry.manifest.course_id
+      if type(course_id) == "string" and course_id ~= "" and not seen[course_id] then
+        seen[course_id] = true
+        out[#out + 1] = course_id
+      end
+    end
+    table.sort(out)
+    return out
+  end
+
+  local function notify_result(res)
+    vim.notify(res.message, res.level)
+  end
+
+  --- Read a multi-line paste. `vim.fn.input()` is single-line, and an enrollment
+  --- token is a long JSON blob, so this asks for it via the prompt and tolerates
+  --- whatever the terminal delivers; the store normalizes and validates.
+  local function prompt(message)
+    local ok, value = pcall(vim.fn.input, { prompt = message, cancelreturn = "" })
+    if not ok then
+      return ""
+    end
+    return value
+  end
+
+  local IDENTITY_COMMANDS = {
+    ProvenanceEnrollmentRequest = {
+      -- Identity is INSTITUTION-scoped: one key, one credential, every course.
+      -- An argument selects the LEGACY per-course request, for a student who
+      -- must re-derive a key an existing 2.0 token names.
+      desc = "Provenance: print your student public key for the enrolment page",
+      nargs = "?",
+      run = function(cmd_opts)
+        if cmd_opts.args ~= "" then
+          return enrollment_cmd.request_course({
+            store = identity_store,
+            key_cache = identity_key_cache,
+            course_id = cmd_opts.args,
+            active_course_ids = active_course_ids(),
+          })
+        end
+        return enrollment_cmd.request({
+          store = identity_store,
+          key_cache = identity_key_cache,
+        })
+      end,
+    },
+    ProvenanceEnroll = {
+      desc = "Provenance: open your institution's enrolment page in a browser",
+      nargs = 0,
+      run = function()
+        return enroll_nudge_ui.open_enroll_page()
+      end,
+    },
+    ProvenanceEnrollmentImport = {
+      desc = "Provenance: import the identity JSON (credential 2.1 or token 2.0)",
+      nargs = "?",
+      run = function(cmd_opts)
+        local raw = cmd_opts.args ~= "" and cmd_opts.args or prompt("Paste enrollment token JSON: ")
+        return enrollment_cmd.import_token({ store = identity_store, raw_json = raw })
+      end,
+    },
+    ProvenanceEnrollmentStatus = {
+      desc = "Provenance: show the identity store location, credential and enrollments",
+      nargs = 0,
+      run = function()
+        return enrollment_cmd.status({ store = identity_store })
+      end,
+    },
+    ProvenanceIdentityExport = {
+      desc = "Provenance: print your identity secret to move to another machine",
+      nargs = 0,
+      run = function()
+        return enrollment_cmd.export_secret({ store = identity_store })
+      end,
+    },
+    ProvenanceIdentityImport = {
+      desc = "Provenance: adopt an identity secret exported from another machine",
+      nargs = "?",
+      run = function(cmd_opts)
+        local raw = cmd_opts.args ~= "" and cmd_opts.args or prompt("Paste identity secret (64 hex chars): ")
+        return enrollment_cmd.import_secret({ store = identity_store, raw = raw })
+      end,
+    },
+  }
+
+  for name, spec in pairs(IDENTITY_COMMANDS) do
+    vim.api.nvim_create_user_command(name, function(cmd_opts)
+      local ok, res = pcall(spec.run, cmd_opts)
+      if not ok then
+        vim.notify("Provenance: " .. name .. " failed: " .. tostring(res), vim.log.levels.ERROR)
+        return
+      end
+      notify_result(res)
+    end, { desc = spec.desc, nargs = spec.nargs })
+  end
+
   local handle = {}
 
   function handle.dispose()
     registry.stop_all("deactivate")
+    -- Drop every derived PRIVATE key — the global one and every per-course one.
+    -- This is the disposal path that justifies caching them at this layer at all.
+    identity_key_cache.dispose()
+    for name in pairs(IDENTITY_COMMANDS) do
+      pcall(vim.api.nvim_del_user_command, name)
+    end
     pcall(vim.api.nvim_del_augroup_by_name, AUGROUP_NAME)
     status.detach()
     pcall(vim.api.nvim_del_user_command, SEAL_COMMAND_NAME)

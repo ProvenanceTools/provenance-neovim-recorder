@@ -25,8 +25,11 @@ local band, bor = bit.band, bit.bor
 local core_session_keys = require("provenance.core.session_keys")
 local core_clock = require("provenance.core.clock")
 local core_checkpoint = require("provenance.core.checkpoint")
+local core_manifest = require("provenance.core.manifest")
 local recorder_context = require("provenance.recorder.session.recorder_context")
 local session_host = require("provenance.recorder.session.session_host")
+local policy_gate = require("provenance.recorder.session.policy_gate")
+local session_identity = require("provenance.recorder.identity.session_identity")
 local session_writer = require("provenance.recorder.io.session_writer")
 local meta_writer = require("provenance.recorder.io.meta_writer")
 local checkpoint_cadence = require("provenance.recorder.session.checkpoint_cadence")
@@ -47,6 +50,9 @@ local ext_activation_wiring = require("provenance.recorder.wiring.ext_activation
 local clock_skew_watcher = require("provenance.recorder.events.clock_skew_watcher")
 local explanation_tags = require("provenance.recorder.events.explanation_tags")
 local seal_cmd = require("provenance.recorder.commands.seal")
+local rolling_seal_writer = require("provenance.recorder.io.rolling_seal_writer")
+local peer_watcher = require("provenance.recorder.watch.peer_watcher")
+local extension_hash_cmd = require("provenance.recorder.commands.extension_hash")
 local chain_recovery = require("provenance.recorder.startup.chain_recovery")
 local uv_recovery_deps = require("provenance.recorder.startup.uv_recovery_deps")
 local disk_full_handler = require("provenance.recorder.failure.disk_full_handler")
@@ -113,14 +119,17 @@ end
 ---   notify: function|nil           -- (message) -> nil; injected into the disk-full
 ---     handler as its user notification. Defaults to degraded_notifier.notify
 ---     (vim.notify at ERROR level). A seam so tests can capture the degraded message.
----   recover: function|nil          -- () -> RecoveryDecision; full injection seam for tests.
----     Defaults to running chain_recovery.recover_previous_session over the real
----     vim.uv deps (uv_recovery_deps.new(provenance_dir)). Runs BEFORE this
+---   recover: function|nil          -- (own_student_ref) -> RecoveryDecision; full
+---     injection seam for tests. Defaults to running
+---     chain_recovery.recover_previous_session over the real vim.uv deps
+---     (uv_recovery_deps.new(provenance_dir, own_student_ref)). Runs BEFORE this
 ---     session's own artifacts (.slog/.slog.meta) exist, so it only ever sees
----     a PRIOR session. A "previous_session_dangling" decision links
----     prev_session_id (unless overridden above); "previous_session_corrupt"
----     additionally emits recorder.recovered_from_corruption as the entry
----     right after session.start. clean_start/complete do neither.
+---     a PRIOR session — but AFTER this session's identity is resolved, so the
+---     ownership gate has a student_ref to work with (see step 1d). A
+---     "previous_session_dangling" decision links prev_session_id (unless
+---     overridden above); "previous_session_corrupt" additionally emits
+---     recorder.recovered_from_corruption as the entry right after
+---     session.start. clean_start/complete do neither.
 --- }
 --- @return table session {
 ---   session_id, slog_path, meta_path, public_key_hex,
@@ -158,7 +167,36 @@ function M.start(opts)
   -- upvalue now and assigning it later (never re-`local`-ing it) means the
   -- closure sees the real host once writes are actually flowing — a write
   -- error can only happen after the host exists.
+  --
+  -- The SAME trick is used below for git_wiring/peer_watcher, which must
+  -- both run BEFORE `context` (and therefore session.start) is built, so
+  -- their `git_capture`/`witness_capture` capability reports can be included
+  -- in it (collaboration spec §5.6). Neither module calls `emit` synchronously
+  -- during its own `start()` — git_wiring only emits from a later fs_poll/
+  -- timer callback, peer_watcher only from `drain()` — so by the time either
+  -- callback can fire, `host` is already assigned; Neovim's single-threaded
+  -- event loop guarantees nothing else runs in between.
   local host
+
+  --- @param kind string
+  --- @param data table
+  local function deferred_emit(kind, data)
+    if host then
+      return host.emit(kind, data)
+    end
+    return nil
+  end
+
+  -- Forward-declared for the same reason: peer_watcher's `is_own_file`
+  -- closure (built below, before these paths exist) reads them lazily, at
+  -- `drain()` time, not at construction time — so it is safe for
+  -- peer_watcher.start() to run before step 3 assigns them.
+  local slog_path, meta_path
+
+  -- Forward-declared: assigned at step 1e below (before `host` exists), read
+  -- by the checkpoint-drain hook (step 6b) and by session.stop()'s final
+  -- drain + teardown.
+  local peer
 
   -- 0. Ensure provenance_dir exists before anything below writes into it
   -- (meta_writer.create in step 6 atomic-writes immediately and does not
@@ -171,17 +209,66 @@ function M.start(opts)
     error(mkdir_err)
   end
 
-  -- 0b. Startup chain recovery (Plan 8, Task 4/5): run BEFORE any of this
+  -- 1. Fresh per-session ed25519 keypair (recorder PRD §4.6).
+  local keypair = core_session_keys.generate()
+
+  -- 1b. Effective capture policy (program spec §4), compiled into the gate
+  -- SessionHost consults on every emit. Only a 2.0 manifest may carry a
+  -- policy; a 1.x manifest resolves to DEFAULTS, which IS the v1.x capture
+  -- set, so legacy sessions are unchanged. Resolved exactly once per session:
+  -- the emit path must never re-resolve, re-parse or re-verify anything.
+  local policy = policy_gate.effective_policy(manifest)
+  local gate = policy_gate.new(policy)
+
+  -- 1c. Student identity (program spec §5/§S2). NEVER blocks recording: every
+  -- failure path — unenrolled, unreadable store, lapsed cert, a token minted
+  -- for a different master secret — returns `skipped` and the session records
+  -- with the `identity` key simply ABSENT. `opts.identity_store` is nil in
+  -- tests and in any caller that has not wired identity, which reads as "not
+  -- enrolled" and is equally non-blocking.
+  local identity_outcome = session_identity.build({
+    manifest = manifest,
+    session_pubkey_hex = keypair.public_key_hex,
+    session_started_at = clock.wall(),
+    store = opts.identity_store,
+    key_cache = opts.identity_key_cache,
+  })
+  local identity = identity_outcome.kind == "emitted" and identity_outcome.identity or nil
+
+  -- 1d. Startup chain recovery (Plan 8, Task 4/5): run BEFORE any of this
   -- session's own artifacts exist, so recovery only ever sees a PRIOR
   -- session's .slog(s) — never the one about to be created below. `recover`
   -- is a full-injection seam for tests; production wires the real vim.uv
   -- deps layer.
+  --
+  -- ORDERING: this used to be step 0b, before the keypair and the identity
+  -- existed. It runs HERE, after 1c, because it needs this session's
+  -- `student_ref` to tell our own `.slog` files from a partner's in a shared,
+  -- committed `.provenance/` (decision-log bug 2; see chain_recovery.lua's
+  -- "Decision — OWNERSHIP"). Nothing between step 0 and here reads the
+  -- recovery result and nothing above depends on it, so the move is
+  -- behaviour-preserving apart from the ownership gate itself. It is still
+  -- well before the writer/meta_writer create this session's artifacts in
+  -- step 6, which is the invariant that matters.
+  --
+  -- `own_student_ref` is nil whenever session_identity did not emit — not
+  -- enrolled, no store, a lapsed cert. That is the common case today, it is
+  -- handled explicitly inside recover_previous_session, and it must never
+  -- throw or block recording.
+  local own_student_ref = nil
+  if identity ~= nil and type(identity.enrollment) == "table" then
+    local ref = identity.enrollment.student_ref
+    if type(ref) == "string" and #ref > 0 then
+      own_student_ref = ref
+    end
+  end
+
   local recover = opts.recover
   local recovery
   if recover then
-    recovery = recover()
+    recovery = recover(own_student_ref)
   else
-    local deps = uv_recovery_deps.new(provenance_dir)
+    local deps = uv_recovery_deps.new(provenance_dir, own_student_ref)
     recovery = chain_recovery.recover_previous_session(deps)
   end
 
@@ -191,13 +278,74 @@ function M.start(opts)
   -- linked, and clean_start/complete/corrupt leave it nil (no link — a
   -- complete prior session is reported by recovery but is deliberately not
   -- linked here, per chain_recovery.lua's own docstring).
+  --
+  -- The session it names is now guaranteed to be one this contributor can
+  -- prove is their own, so the back-pointer is a real intra-contributor chain
+  -- link rather than "whoever's filename happened to sort last".
   local prev_session_id = opts.prev_session_id
   if prev_session_id == nil and recovery.kind == "previous_session_dangling" then
     prev_session_id = recovery.prev_session_id
   end
 
-  -- 1. Fresh per-session ed25519 keypair (recorder PRD §4.6).
-  local keypair = core_session_keys.generate()
+  -- 1e. THE CAPABILITY REPORTS (collaboration spec §5.6 items 2 and 3). Both
+  -- must be known BEFORE `context` is built below, because `session.start` is
+  -- the entry that carries them and it is the first line of the chain. They
+  -- say "I could not", never "I was told not to" — neither is policy-gated,
+  -- neither is ever a finding (see core/session_capabilities.lua).
+  --
+  -- git_capture: this recorder's own `git_wiring.start()` IS the probe — the
+  -- SAME repo-detection it uses to decide whether to watch at all — so the
+  -- report cannot drift from what the wiring actually does (mirrors the VS
+  -- Code reference's `probeGitCapture` reusing `resolveGitApi`). Only
+  -- `'available'`/`'unavailable'` are ever produced here (see the ternary
+  -- below): provnvim's git wiring watches exactly one repository, discovered
+  -- by a `git -C <this session's own workspace>` call with no shared,
+  -- project-wide repo enumeration and no cross-session ownership routing —
+  -- unlike provjet, where a single project-wide VCS-root discovery IS routed
+  -- to sessions by a path-prefix predicate, and a discovered repo matching no
+  -- session's root is exactly `not_owned`. This still holds with more than
+  -- one session recording concurrently (registry.lua): each session's
+  -- git_wiring call is scoped to its OWN `workspace` and cannot observe
+  -- another session's repository, so there is no "git worked, but pointed at
+  -- a repo that belongs to a different session" state for THIS writer to be
+  -- in. See core/session_capabilities.lua's module docstring for the full
+  -- re-derivation, including the shared-class-repo-above-the-assignment-root
+  -- layout (handled for free by git's own upward `-C` search).
+  -- Gated on `enable_signals`, matching where `git_wiring.start()` used to be
+  -- called (old step 9c): the lean-core test/e2e path that never attempts git
+  -- observation must not claim a capability it never tried, and omission is
+  -- exactly the correct "does not report" answer for that case.
+  --
+  -- peer_watcher.start() is called here in full (not merely probed) and
+  -- reused unmodified below: constructing the real `.provenance/` watcher IS
+  -- the answer to whether it could be created, exactly as the VS Code
+  -- reference creates its FileSystemWatcher early for the same reason. It has
+  -- always been unconditional (not gated by enable_signals — peer witnessing
+  -- postdates the Plan 9 signal set and is a provenance-integrity mechanism,
+  -- not an editor signal), so `witness_capture` is always reported, never
+  -- omitted. `emit = deferred_emit` because `host` does not exist yet; see the
+  -- forward-declaration above for why that is safe.
+  local git_capture = nil
+  if enable_signals then
+    git = git_wiring.start({ workspace = workspace, emit = deferred_emit, tagger = tagger })
+    git_capture = git.active and "available" or "unavailable"
+  end
+
+  peer = peer_watcher.start({
+    provenance_dir = provenance_dir,
+    -- This session's own `.slog` and `.slog.meta`, BY BASENAME. Reads
+    -- `slog_path`/`meta_path` as upvalues — forward-declared above, assigned
+    -- at step 3 below — so this closure is only ever CALLED (at drain() time)
+    -- after they hold real values. A chain cannot corroborate itself, and the
+    -- reader excluding a self-witness is not a licence for the writer to
+    -- produce one.
+    is_own_file = function(basename)
+      return basename == vim.fn.fnamemodify(slog_path, ":t")
+        or basename == vim.fn.fnamemodify(meta_path, ":t")
+    end,
+    emit = deferred_emit,
+  })
+  local witness_capture = peer._watching and "available" or "unavailable"
 
   -- 2. Logical session context — the session.start payload. session_id
   -- here is the LOGICAL session id (chain/manifest identity), distinct
@@ -206,14 +354,19 @@ function M.start(opts)
     manifest = manifest,
     prev_session_id = prev_session_id,
     session_pubkey_hex = keypair.public_key_hex,
+    identity = identity,
     env = opts.env,
+    git_capture = git_capture,
+    witness_capture = witness_capture,
   })
 
   -- 3. TWO-UUID RULE: the `.slog` FILENAME uses a SEPARATE fresh uuid, not
-  -- context.session_id.
+  -- context.session_id. Assigns the upvalues forward-declared above (no
+  -- `local`): peer_watcher's `is_own_file` closure, built earlier at step 1e,
+  -- reads them lazily and only from here on holds real paths.
   local file_uuid = generate_file_uuid()
-  local slog_path = provenance_dir .. "/session-" .. file_uuid .. ".slog"
-  local meta_path = slog_path .. ".meta"
+  slog_path = provenance_dir .. "/session-" .. file_uuid .. ".slog"
+  meta_path = slog_path .. ".meta"
 
   -- 3b. Disk-full handler (Plan 8, Task 6/7). Wired as the writer's
   -- on_error below so a write failure flips it into degraded mode: notify
@@ -253,18 +406,131 @@ function M.start(opts)
     encrypted_privkey = encrypted_privkey,
   })
 
+  -- 6a. THE ROLLING SEAL (program spec §8, S3). A git-submitted assignment has
+  -- no seal step: the student pushes, the grader clones, nothing ever runs
+  -- `:ProvenanceSeal`. So this session maintains a seal of its OWN log at
+  -- `.provenance/manifest-<session_id>.json` + `.sig`, rewritten at three
+  -- points, so whatever is committed to git is always a valid seal of the state
+  -- at that moment. See core/rolling_manifest.lua for the design and
+  -- io/rolling_seal_writer.lua for the write side.
+  --
+  -- SUPPRESSED only when the course has SIGNED a statement that it submits
+  -- bundles. A 1.x manifest has no `submission` field at all, so it rolls: not
+  -- rolling where it IS needed costs an `unsealed_session` defect on every
+  -- session, which fails check 1 — a false accusation against a student whose
+  -- course simply has not migrated to a 2.0 manifest yet. Between "a couple of
+  -- redundant files in a bundle" and "an integrity finding against innocent
+  -- work", only one is acceptable.
+  local rolling_seal_enabled = manifest.submission ~= "bundle"
+
+  -- `extension_hash` is resolved LAZILY and exactly once. compute_installed
+  -- walks the whole `lua/` tree, so doing it per checkpoint would be the
+  -- pathological version of this feature. Injectable for tests, mirroring
+  -- seal.lua's own `compute_extension_hash` seam.
+  local compute_extension_hash = opts.compute_extension_hash or extension_hash_cmd.compute_installed
+  local extension_hash_once = nil
+  local function get_extension_hash_once()
+    if extension_hash_once == nil then
+      extension_hash_once = compute_extension_hash()
+    end
+    return extension_hash_once
+  end
+
+  --- Rewrite the rolling seal to cover this session as it stands right now.
+  ---
+  --- NEVER raises and never stops recording: a seal failure must not abort the
+  --- checkpoint that carries it. Recording is more important than sealing, so
+  --- every failure is reported through the existing debug-log path and the
+  --- session records on. Deliberately NOT routed into the disk-full handler —
+  --- that switches the session to a critical-events-only ring buffer, and
+  --- throwing away the student's event stream because a seal could not be
+  --- rewritten would trade the recording for the receipt.
+  ---
+  --- Unlike the VS Code reference this needs no serialization chain: every roll
+  --- here runs synchronously to completion on the main loop, so two rolls can
+  --- never interleave their renames in the first place.
+  ---
+  --- @param is_final boolean|nil  see the ONE call site that passes true
+  local function roll_rolling_seal(is_final)
+    if not rolling_seal_enabled then
+      return
+    end
+    local ok, res = pcall(function()
+      return rolling_seal_writer.write_rolling_seal({
+        provenance_dir = provenance_dir,
+        -- The LOGICAL session id from session.start — never the `.slog`
+        -- filename uuid (two-uuid rule). The analyzer keys sessions by
+        -- session.start.data.session_id, and that is the id it matches seals
+        -- against.
+        session_id = context.session_id,
+        prev_session_id = prev_session_id,
+        slog_path = slog_path,
+        workspace = workspace,
+        assignment_id = manifest.assignment_id,
+        semester = manifest.semester,
+        scope = core_manifest.scope_from_manifest(manifest),
+        -- This session's own cap bit. `coordinator` is nil when signals are
+        -- disabled (no registry exists, so nothing can have capped) and on
+        -- the very first roll (WRITE POINT 1), which fires before the
+        -- coordinator is constructed — both correctly read as "not capped".
+        scope_capped = coordinator ~= nil and coordinator.cap_hit() or false,
+        session_privkey = keypair.private_key,
+        extension_hash = get_extension_hash_once(),
+        -- Strictly true or absent. `final = false` is never passed down, and
+        -- the writer would omit the key anyway.
+        final = is_final == true or nil,
+      })
+    end)
+    if (not ok or res.kind == "error") and vim.g.provenance_debug then
+      vim.notify(
+        "Provenance: rolling seal error: " .. tostring(ok and res.message or res),
+        vim.log.levels.DEBUG
+      )
+    end
+  end
+
   -- 6b. Checkpoint cadence + async scheduler (Plan 8). Every
   -- `checkpoint_interval`-th appended entry, a signed seq->hash checkpoint
   -- is scheduled: signing/persisting is deferred off the on_lines hot path
   -- (checkpoint_scheduler defers via vim.schedule) and drained synchronously
   -- at stop()/seal() so nothing pending is lost.
+  --
+  -- PEER WITNESSING (program spec §7 mechanism 2, collaboration spec §5.5).
+  -- `peer` was already constructed at step 1e above, via `deferred_emit`
+  -- (host does not exist until step 7 below, but nothing in peer_watcher's
+  -- own `start()` calls emit synchronously — only `drain()` does, which is
+  -- always called after `host` is assigned). The checkpoint hook below just
+  -- DRAINS it, on the checkpoint cadence, which is guaranteed to be long
+  -- after the first checkpoint, `checkpoint_interval` entries away.
+
   local cadence = checkpoint_cadence.new(checkpoint_interval)
   local scheduler = checkpoint_scheduler.new({
     sign = function(seq, hash)
       return core_checkpoint.sign(seq, hash, keypair.private_key)
     end,
     persist = function(cp)
-      mw.append_checkpoint(cp)
+      -- WRITE POINT 2 of 3: after each checkpoint LANDS in the `.meta`, so the
+      -- seal's `meta_sha256` covers it.
+      local ok, err = pcall(mw.append_checkpoint, cp)
+      -- Peer witnessing drains on the CHECKPOINT CADENCE (writer contract rule
+      -- 3) and BEFORE the rolling seal, so the observations it emits are in the
+      -- `.slog` that the seal about to be written commits to. The watcher's
+      -- callbacks did no I/O; all of it happens here, off the event path.
+      --
+      -- Synchronous, and that is the safety property: `drain` reads everything
+      -- first and only then emits, with no yield across the session host's
+      -- read-and-advance of `prev_hash`/`seq`. It never raises, so a witnessing
+      -- failure cannot cost the checkpoint or the seal.
+      if peer then
+        pcall(peer.drain)
+      end
+      -- Rolled even when the checkpoint itself failed, so a session whose
+      -- `.meta` append broke still gets the best seal available. The scheduler's
+      -- on_error still sees the failure: it is re-raised below.
+      roll_rolling_seal()
+      if not ok then
+        error(err)
+      end
     end,
     on_error = function(err)
       -- Checkpoint failures must never crash recording; debug-log only.
@@ -291,6 +557,7 @@ function M.start(opts)
   host = session_host.new({
     session_id = context.session_id,
     clock = clock,
+    policy_gate = gate,
     on_entry = function(entry)
       if is_degraded() then
         -- Disk is failing: bypass the writer entirely; only CRITICAL kinds
@@ -320,6 +587,19 @@ function M.start(opts)
     host.emit("recorder.recovered_from_corruption", { quarantined_path = recovery.quarantined_path })
   end
 
+  -- 8d. WRITE POINT 1 of 3: seal immediately, before the first checkpoint is
+  -- anywhere near due.
+  --
+  -- Checkpoints land every 100 entries, so a session that records only
+  -- session.start would never reach one — and in a git-submitted repo that
+  -- session's `.slog` would be committed with no seal covering it at all
+  -- (`unsealed_session`). Sealing here means a session is sealed from its first
+  -- instant and every later rewrite is an update, never the first write.
+  --
+  -- NOT final: the log is about to grow. The digests here commit to a prefix,
+  -- which is exactly right.
+  roll_rolling_seal()
+
   -- 8c. External-change coordinator (Plan 9): MUST be created AFTER host
   -- exists (it needs host.emit) and AFTER session.start is emitted, but
   -- BEFORE doc-wiring, because doc-wiring below takes the coordinator's
@@ -328,7 +608,7 @@ function M.start(opts)
   if enable_signals then
     coordinator = external_change_coordinator.start({
       workspace = workspace,
-      files_under_review = manifest.files_under_review,
+      scope = core_manifest.scope_from_manifest(manifest),
       emit = host.emit,
       tagger = tagger,
       get_now = clock.now,
@@ -371,13 +651,19 @@ function M.start(opts)
     focus = focus_wiring.start({ emit = host.emit })
   end
 
-  -- 9c. Terminal / git / snapshot / clock-skew signals (Plan 9). snapshot
-  -- emits an ext.snapshot immediately on start; git degrades to an inert
-  -- handle when the workspace is not a git repo; clock-skew + snapshot both
-  -- run unref'd timers that never block headless exit.
+  -- 9c. Terminal / snapshot / clock-skew signals (Plan 9). snapshot emits an
+  -- ext.snapshot immediately on start; clock-skew + snapshot both run
+  -- unref'd timers that never block headless exit.
+  --
+  -- `git` is NOT started here: it was already constructed at step 1e, before
+  -- `context`/`session.start` were built, via `deferred_emit`, so that its
+  -- `.active` could feed `git_capture`. Nothing here re-starts it — a second
+  -- `git_wiring.start()` would double-watch the reflog and double-derive
+  -- `root_commit_sha`. Same for `peer` (peer witnessing): also built at step
+  -- 1e, also via `deferred_emit`, also never gated by `enable_signals` — see
+  -- that step's comment for the full reasoning.
   if enable_signals then
     term = terminal_wiring.start({ emit = host.emit, workspace = workspace })
-    git = git_wiring.start({ workspace = workspace, emit = host.emit, tagger = tagger })
     snap = snapshot_wiring.start({ emit = host.emit })
     -- ext.activate: polls for plugins that load AFTER start (baseline covered
     -- by snap's immediate ext.snapshot). Mirrors VS Code's activation poller.
@@ -394,6 +680,11 @@ function M.start(opts)
     emit = host.emit,
     get_now = clock.now,
     get_focused = focus and focus.get_focused or nil,
+    -- session.heartbeat is a FLOOR kind — a course can retune its cadence but
+    -- can never switch it off, because bundle-level Active/Idle and the
+    -- gap_in_heartbeats heuristic both depend on it. Already clamped to
+    -- [5000, 120000] by capture_policy.resolve.
+    interval_ms = policy.heartbeat_interval_ms,
   })
 
   local stopped = false
@@ -420,6 +711,16 @@ function M.start(opts)
     -- enable_signals is true (term is nil otherwise), same as the
     -- coordinator seam above.
     _terminal_augroup_id = term and term._augroup_id or nil,
+    -- Test/inspection seams for the capture policy (program spec §4). `_host`
+    -- is the emit chokepoint every wiring module already calls, so a test can
+    -- drive the policy gate exactly the way production does; `_policy` is the
+    -- resolved policy this session is running under. Always present, like
+    -- _doc_wiring_augroup_id above.
+    _host = host,
+    _policy = policy,
+    -- Test/inspection seam: why an identity was or was not emitted. Diagnostic
+    -- only — nothing branches on it.
+    _identity_outcome = identity_outcome,
   }
 
   -- TEST SEAM (Plan 9): expose the signal sub-handles so the integration test
@@ -467,7 +768,12 @@ function M.start(opts)
       provenance_dir = provenance_dir,
       assignment_id = manifest.assignment_id,
       semester = manifest.semester,
-      files_under_review = manifest.files_under_review,
+      scope = core_manifest.scope_from_manifest(manifest),
+      -- This session's own cap bit; seal_bundle ORs it against every other
+      -- packed session's own rolling seal (read_rolled_scope_capped) before
+      -- it reaches the manifest. `coordinator` is nil when signals are
+      -- disabled — no registry exists, so nothing can have capped.
+      scope_capped = coordinator ~= nil and coordinator.cap_hit() or false,
       session_privkey = keypair.private_key,
       session_pubkey_hex = keypair.public_key_hex,
       now = seal_opts.now or default_iso_now,
@@ -485,6 +791,21 @@ function M.start(opts)
       return
     end
     stopped = true
+
+    -- FINAL peer-witness drain, BEFORE session.end so the observations land
+    -- inside the session they belong to. Checkpoints fire every
+    -- `checkpoint_interval` entries, so a partner's log that arrived after the
+    -- last one would otherwise never be witnessed by this session at all — and
+    -- a `git pull` immediately before closing the editor is an ordinary thing
+    -- to do. This is also the whole of the answer to the contract's "or a
+    -- timer": there is no timer, and stop() always drains, so a long-idle
+    -- session delays witnessing but never loses it.
+    --
+    -- drain() never raises; the pcall is belt-and-braces so witnessing can
+    -- never block shutdown.
+    if peer then
+      pcall(peer.drain)
+    end
 
     host.emit("session.end", { reason = reason or "deactivate" })
 
@@ -507,10 +828,36 @@ function M.start(opts)
     if snap then snap.dispose() end
     if git then git.dispose() end
     if term then term.dispose() end
+    -- Disposed AFTER its final drain above, and before the writer closes, so
+    -- no libuv fs_event handle outlives the session (a leaked handle keeps
+    -- headless Neovim from exiting).
+    if peer then peer.dispose() end
 
     hb.dispose()
     wiring.dispose()
     writer.dispose()
+
+    -- WRITE POINT 3 of 3: the FINAL roll, last of the three file-touching steps
+    -- so it covers the fully flushed `.slog` (session.end included) and the
+    -- drained `.meta`.
+    --
+    -- `final = true` is claimable HERE AND ONLY HERE, and only because of the
+    -- three steps above: session.end has been emitted, the last checkpoint has
+    -- landed in the `.meta`, and writer.dispose() has performed the final flush
+    -- and closed the file. Nothing can append to either file after this point,
+    -- so the digests about to be signed are WHOLE-FILE commitments rather than
+    -- prefixes, and a reader is entitled to fail an append against them.
+    --
+    -- The claim is made only on a path that actually reached here. Every way a
+    -- session can die without a clean stop() — a crash, a power cut, a full
+    -- disk, a read-only checkout, `.provenance/` removed by a `git checkout` —
+    -- simply leaves the last non-final seal in place, which a reader treats as
+    -- a prefix commitment with a REPORTED unattested tail. That is a blameless
+    -- coverage gap, not a tamper finding, and it is precisely why finality is
+    -- claimed explicitly by the writer here rather than inferred by a reader
+    -- from a trailing `session.end` entry: `session.end` lives in the log, and
+    -- the log's completeness is the very thing in question.
+    roll_rolling_seal(true)
   end
 
   return session

@@ -153,7 +153,7 @@ describe("doc_wiring save-time race (D1) regression pins", function()
     local events, emit = new_emit()
     scratch.coordinator = coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "foo.txt" },
+      scope = { track = { "foo.txt" } },
       emit = emit,
     })
     scratch.handle = doc_wiring.attach({
@@ -200,7 +200,7 @@ describe("doc_wiring save-time race (D1) regression pins", function()
     local events, emit = new_emit()
     scratch.coordinator = coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "foo.txt" },
+      scope = { track = { "foo.txt" } },
       emit = emit,
     })
 
@@ -256,7 +256,7 @@ describe("doc_wiring save-time race (D1) regression pins", function()
     local events, emit = new_emit()
     scratch.coordinator = coordinator_mod.start({
       workspace = workspace,
-      files_under_review = { "foo.txt" },
+      scope = { track = { "foo.txt" } },
       emit = emit,
     })
     scratch.handle = doc_wiring.attach({

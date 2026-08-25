@@ -177,6 +177,12 @@ real OS-level watcher latency — those need a live TUI:
 
 - [ ] **Git commit emits git.event:** In an activated workspace that is a git repository, make a commit (e.g., `git commit -m "test"`). Confirm a `git.event` with `operation="state_change"` is recorded, including the new `commit_sha`. Confirm that a file change shortly after the commit is tagged with `explanation="git"` by the explanation tagger.
 
+- [ ] **git.event carries the commit graph (program spec S5):** Against a LIVE repository — these are the parts the headless tests can only mock `run_git` for. On an ordinary commit, confirm the `git.event` carries `sha` (equal to `commit_sha`), a `parents` array with exactly one entry, and `branch`. Then `git merge --no-ff` a side branch and confirm `parents` has two entries with **`parents[0]` equal to the tip of the branch you merged INTO** — the order is meaning, and nothing may sort it. On the very first commit of a fresh repo, confirm `parents` is `[]` (an empty JSON array — not `{}`, not absent). `git checkout --detach` and confirm `branch` is **absent**, never `"HEAD"` and never `""`. Check out a branch whose name contains `/` and a non-ASCII character and confirm it round-trips verbatim as a string **value**.
+
+- [ ] **git.event carries NO author identity (IRB — CPHS 2026-06-19796):** Set `user.name` / `user.email` in the repo to something distinctive, make a commit, and grep the whole `.slog` for both. Neither may appear — nor an author date, nor the commit message. This is a protocol commitment, not a preference: a new category of identifier requires a filed CPHS modification BEFORE implementation. Attribution lives in the opaque `student_ref` inside `session.start.identity`.
+
+- [ ] **Unborn branch (fresh `git init`, no commits):** Start a session in a just-initialised repo and trigger a HEAD change. Confirm the `git.event` carries `branch` but NO `sha`/`commit_sha` and NO `parents` — the branch exists, the commit does not, and "could not read the parents" must never be recorded as `[]`.
+
 - [ ] **No git installed → session still works:** With no `git` binary on PATH, or in a non-git workspace, start a session in an activated directory. Confirm the session activates, records events normally, and seals without error. The git wiring degrades to a no-op (no `git.event`, no tagger marks) — a missing git integration is a degraded signal, not a failure.
 
 ## Plan 9 Task 4 — full-signals end-to-end analyzer acceptance

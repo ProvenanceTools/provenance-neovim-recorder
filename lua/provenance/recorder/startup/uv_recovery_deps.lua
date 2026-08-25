@@ -41,9 +41,15 @@ local function read_file_bytes(path)
 end
 
 --- @param provenance_dir string  absolute path to the session's .provenance dir
---- @return table deps  { list_slogs, read_slog, rename, now }
-function M.new(provenance_dir)
-  local deps = {}
+--- @param own_student_ref string|nil  `identity.enrollment.student_ref` of the
+---   session that is STARTING, or nil when this recorder holds no verifying
+---   enrollment. This is the ownership signal chain_recovery uses to tell this
+---   student's `.slog` files from a partner's in a shared, committed
+---   `.provenance/` — see startup/slog_ownership.lua. Passed straight through;
+---   this layer holds no identity logic of its own.
+--- @return table deps  { list_slogs, read_slog, rename, now, own_student_ref }
+function M.new(provenance_dir, own_student_ref)
+  local deps = { own_student_ref = own_student_ref }
 
   --- list_slogs() -> list of absolute paths of real `.slog` files in
   --- provenance_dir. Excludes `.slog.meta` sidecars (the anchored `%.slog$`
