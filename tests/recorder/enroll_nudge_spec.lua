@@ -95,6 +95,75 @@ describe("enroll_nudge.is_unenrolled", function()
   end)
 end)
 
+--- `enrollment_required` (2026-08-25 professor-facing "don't nag this course's
+--- students" flag — `core/enrollment_policy.lua`, `registry.lua`'s
+--- `identity_outcomes()`). ASYMMETRIC by design: see `is_unenrolled`'s own
+--- doc-comment in enroll_nudge.lua for why "did anyone emit" must read every
+--- outcome while "does anyone still need to enrol" reads only
+--- enrollment-requiring ones. These two tests are the exact regression pair
+--- that doc-comment calls out; do not collapse them into a single filter.
+describe("enroll_nudge.is_unenrolled with enrollment_required annotations", function()
+  --- Merge `enrollment_required` onto a copy of an outcome built by this
+  --- file's own `skipped`/`emitted` helpers, mirroring what
+  --- `registry.identity_outcomes()` produces.
+  local function with_required(outcome, required)
+    return vim.tbl_extend("force", {}, outcome, { enrollment_required = required })
+  end
+
+  it("a waived root EMITTED + a requiring root SKIPPED -> NOT un-enrolled, no nudge", function()
+    -- The legacy-2.0-holder scenario: enrolled in the waived course (emits),
+    -- not enrolled in the one that still requires it (skipped). Filtering the
+    -- waived outcome out before checking "did anyone emit" would leave only
+    -- the skipped outcome and wrongly report this student as un-enrolled.
+    local outcomes = {
+      with_required(emitted(), false),
+      with_required(skipped({ kind = "not_enrolled", course_id = "cs61c" }), true),
+    }
+    assert.is_true(enroll_nudge.any_identity_emitted(outcomes))
+    assert.is_false(enroll_nudge.is_unenrolled(outcomes))
+    assert.is_false(enroll_nudge.should_show(outcomes, S.UNSEEN))
+  end)
+
+  it("a waived root SKIPPED + a requiring root SKIPPED -> un-enrolled, nudge shows", function()
+    local outcomes = {
+      with_required(skipped({ kind = "not_enrolled", course_id = "cs61b" }), false),
+      with_required(skipped({ kind = "not_enrolled", course_id = "cs61c" }), true),
+    }
+    assert.is_false(enroll_nudge.any_identity_emitted(outcomes))
+    assert.is_true(enroll_nudge.is_unenrolled(outcomes))
+    assert.is_true(enroll_nudge.should_show(outcomes, S.UNSEEN))
+  end)
+
+  it("a waived root, alone, skipped -> NOT un-enrolled: nobody who needs to enrol is missing it", function()
+    local outcomes = { with_required(skipped({ kind = "not_enrolled" }), false) }
+    assert.is_false(enroll_nudge.is_unenrolled(outcomes))
+  end)
+
+  it("enrollment_required = true behaves exactly like the field being absent", function()
+    local reason = { kind = "not_enrolled", course_id = "x" }
+    assert.equals(
+      enroll_nudge.is_unenrolled({ skipped(reason) }),
+      enroll_nudge.is_unenrolled({ with_required(skipped(reason), true) })
+    )
+  end)
+
+  it("only an explicit false waives a session -- absent, nil, and non-boolean all read as required", function()
+    local reason = { kind = "not_enrolled", course_id = "x" }
+
+    -- Absent key entirely (no enrollment_required at all).
+    assert.is_true(enroll_nudge.is_unenrolled({ skipped(reason) }))
+
+    -- Present but nil, or present and non-boolean: table constructors can't
+    -- hold a literal `nil` element for ipairs to walk, so these are asserted
+    -- individually rather than in a loop.
+    for _, garbage in ipairs({ "false", 0, {} }) do
+      local outcome = with_required(skipped(reason), true)
+      outcome.enrollment_required = garbage
+      assert.is_true(enroll_nudge.is_unenrolled({ outcome }), vim.inspect(garbage))
+    end
+  end)
+end)
+
 describe("enroll_nudge state machine", function()
   local unenrolled = { skipped({ kind = "not_enrolled", course_id = "cs61b" }) }
 

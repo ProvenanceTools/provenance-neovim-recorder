@@ -154,6 +154,136 @@ describe("registry.new", function()
   end)
 end)
 
+--- `identity_outcomes()` is the single chokepoint both `status.lua` and
+--- `enroll_nudge_ui.lua` read (see `enroll_nudge_spec.lua` for the pure
+--- decision logic those two consume it with). It ANNOTATES every outcome with
+--- `enrollment_required`, resolved from that session's own manifest -- it
+--- never filters one out. See `enroll_nudge.is_unenrolled`'s doc-comment for
+--- why filtering here would be wrong: the "did anyone emit an identity" half
+--- of that check needs to see a waived session's `emitted` outcome too.
+describe("registry.identity_outcomes", function()
+  local enroll_nudge = require("provenance.recorder.enroll_nudge")
+
+  --- A start_recording spy whose fake controller reports `outcome` as its
+  --- `_identity_outcome`, regardless of which root it is started for.
+  local function start_recording_with_outcome(outcome)
+    return function()
+      return { _identity_outcome = outcome, stop = function() end }
+    end
+  end
+
+  local skipped_not_enrolled = { kind = "skipped", reason = { kind = "not_enrolled", course_id = "cs61b" } }
+  local emitted = { kind = "emitted", identity = {}, verified = {} }
+
+  --- @param outcome table  a bare outcome (kind/reason/...), no enrollment_required key
+  --- @param required boolean
+  --- @return table  the SAME outcome, plus enrollment_required, matching what
+  ---   identity_outcomes() is expected to produce
+  local function annotated(outcome, required)
+    return vim.tbl_extend("force", {}, outcome, { enrollment_required = required })
+  end
+
+  it("a controller with no _identity_outcome contributes nothing", function()
+    local reg = registry_mod.new({ start_recording = function() return { stop = function() end } end })
+    reg.ensure_session("/tmp/cats", { assignment_id = "cats" })
+    assert.same({}, reg.identity_outcomes())
+  end)
+
+  it("a plain 1.x manifest is annotated enrollment_required = true (the pre-flag default)", function()
+    local reg = registry_mod.new({ start_recording = start_recording_with_outcome(skipped_not_enrolled) })
+    reg.ensure_session("/tmp/cats", { assignment_id = "cats" })
+    assert.same({ annotated(skipped_not_enrolled, true) }, reg.identity_outcomes())
+  end)
+
+  it("a 2.0 manifest with policy.enrollment.required = false is annotated enrollment_required = false, NOT dropped", function()
+    local reg = registry_mod.new({ start_recording = start_recording_with_outcome(skipped_not_enrolled) })
+    reg.ensure_session("/tmp/cats", {
+      format_version = "2.0",
+      policy = { enrollment = { required = false } },
+    })
+    assert.same({ annotated(skipped_not_enrolled, false) }, reg.identity_outcomes())
+  end)
+
+  it("a 2.0 manifest with policy.enrollment.required = true is annotated enrollment_required = true", function()
+    local reg = registry_mod.new({ start_recording = start_recording_with_outcome(skipped_not_enrolled) })
+    reg.ensure_session("/tmp/cats", {
+      format_version = "2.0",
+      policy = { enrollment = { required = true } },
+    })
+    assert.same({ annotated(skipped_not_enrolled, true) }, reg.identity_outcomes())
+  end)
+
+  it("a 1.x manifest STAPLING policy.enrollment.required = false is annotated required = true (the 1.x gate)", function()
+    -- `policy` is not inside the signed payload below 2.0, so a manifest
+    -- claiming format_version 1.x (or omitting it) can carry ANY policy JSON
+    -- without invalidating a real course signature. Honouring it here would
+    -- hand a student exactly the "hide my own not-enrolled notice" switch the
+    -- format-version gate exists to deny.
+    local reg = registry_mod.new({ start_recording = start_recording_with_outcome(skipped_not_enrolled) })
+    reg.ensure_session("/tmp/cats", { policy = { enrollment = { required = false } } })
+    assert.same({ annotated(skipped_not_enrolled, true) }, reg.identity_outcomes())
+  end)
+
+  it("MIXED CASE: a waived root EMITTED an identity, a requiring root was skipped -> NOT un-enrolled", function()
+    -- The scenario `enroll_nudge.is_unenrolled`'s doc-comment names: a legacy
+    -- 2.0 per-course token holder enrolled in the waived course (its session
+    -- emits) but not the requiring one (its session is skipped). Filtering
+    -- the waived session's outcome out before the emitted-check would lose
+    -- the only `emitted` outcome in the list and misreport this student as
+    -- un-enrolled -- they ARE attributed, on the root that is open.
+    local outcomes_by_root = {
+      ["/tmp/waived-course"] = emitted,
+      ["/tmp/normal-course"] = skipped_not_enrolled,
+    }
+    local reg = registry_mod.new({
+      start_recording = function(opts)
+        return { _identity_outcome = outcomes_by_root[opts.workspace], stop = function() end }
+      end,
+    })
+    reg.ensure_session("/tmp/waived-course", {
+      format_version = "2.0",
+      policy = { enrollment = { required = false } },
+    })
+    reg.ensure_session("/tmp/normal-course", { format_version = "2.0" })
+
+    local outcomes = reg.identity_outcomes()
+    assert.is_true(enroll_nudge.any_identity_emitted(outcomes), "the waived root's emitted outcome must still be visible")
+    assert.is_false(enroll_nudge.is_unenrolled(outcomes))
+    assert.is_false(enroll_nudge.should_show(outcomes, enroll_nudge.STATES.UNSEEN))
+  end)
+
+  it("MIXED CASE: a waived root SKIPPED and a requiring root SKIPPED -> un-enrolled, nudge shows", function()
+    -- Neither session emitted, so the first half of is_unenrolled passes
+    -- through; the second half then finds the requiring root's skipped
+    -- outcome (the waived root's is present too, but excluded from THAT half
+    -- by its enrollment_required = false annotation) and reports true.
+    local reg = registry_mod.new({
+      start_recording = function()
+        return { _identity_outcome = skipped_not_enrolled, stop = function() end }
+      end,
+    })
+    reg.ensure_session("/tmp/waived-course", {
+      format_version = "2.0",
+      policy = { enrollment = { required = false } },
+    })
+    reg.ensure_session("/tmp/normal-course", { format_version = "2.0" })
+
+    local outcomes = reg.identity_outcomes()
+    assert.is_false(enroll_nudge.any_identity_emitted(outcomes))
+    assert.is_true(enroll_nudge.is_unenrolled(outcomes))
+    assert.is_true(enroll_nudge.should_show(outcomes, enroll_nudge.STATES.UNSEEN))
+  end)
+
+  it("a waived root, alone, skipped -> NOT un-enrolled (nobody who needs to enrol is missing it)", function()
+    local reg = registry_mod.new({ start_recording = start_recording_with_outcome(skipped_not_enrolled) })
+    reg.ensure_session("/tmp/waived-course", {
+      format_version = "2.0",
+      policy = { enrollment = { required = false } },
+    })
+    assert.is_false(enroll_nudge.is_unenrolled(reg.identity_outcomes()))
+  end)
+end)
+
 --- The verified-root cache. Activation resolution runs on every BufEnter /
 --- BufReadPost / BufNewFile, and each uncached resolve pays a ~12 ms pure-Lua
 --- ed25519 verification on the main loop. These tests pin BOTH halves of the
