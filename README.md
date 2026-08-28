@@ -99,7 +99,7 @@ same golden conformance vectors that pin the format.
 ## Install
 
 Install with any Neovim plugin manager, **pinned to the release tag your course points you
-at** (examples below use `v0.2.0`). Pinning a tag is not optional: the tag ships the master
+at** (examples below use `v0.3.0`). Pinning a tag is not optional: the tag ships the master
 public key, and its source tree-hash is the `extension_hash` the analyzer allowlist
 recognizes (see [below](#extension_hash--the-integrity-anchor)). Installing an unpinned
 `HEAD`, a branch, or a fork produces a hash the analyzer does not recognize.
@@ -111,7 +111,7 @@ recognizes (see [below](#extension_hash--the-integrity-anchor)). Installing an u
 -- lua/plugins/provenance.lua  (or inside your lazy spec table)
 {
   "ProvenanceTools/provenance-neovim-recorder",
-  version = "v0.2.0",
+  version = "v0.3.0",
   lazy = false, -- REQUIRED: must load at startup, never on a trigger (see note below)
 }
 ```
@@ -128,7 +128,7 @@ defaults.
 ```lua
 use({
   "ProvenanceTools/provenance-neovim-recorder",
-  tag = "v0.2.0",
+  tag = "v0.3.0",
   -- Do NOT add `opt = true`, `cmd`, `ft`, or `event` — those lazy-load the
   -- plugin and prevent it from registering its activation autocmds at startup.
 })
@@ -142,7 +142,7 @@ use({
 " in your init.vim (or init.lua inside a vim.cmd block)
 " Do NOT add { 'on': ... } or { 'for': ... } — on-demand loading stops the
 " plugin from registering its activation autocmds at startup.
-Plug 'ProvenanceTools/provenance-neovim-recorder', { 'tag': 'v0.2.0' }
+Plug 'ProvenanceTools/provenance-neovim-recorder', { 'tag': 'v0.3.0' }
 ```
 </details>
 
@@ -154,7 +154,7 @@ Plug 'ProvenanceTools/provenance-neovim-recorder', { 'tag': 'v0.2.0' }
 -- would defer sourcing and delay/skip activation for the session you launch into.
 require("mini.deps").add({
   source = "ProvenanceTools/provenance-neovim-recorder",
-  checkout = "v0.2.0",
+  checkout = "v0.3.0",
 })
 ```
 </details>
@@ -163,7 +163,7 @@ require("mini.deps").add({
 <summary>Built-in packages (no plugin manager)</summary>
 
 ```sh
-git clone --branch v0.2.0 --depth 1 \
+git clone --branch v0.3.0 --depth 1 \
   https://github.com/ProvenanceTools/provenance-neovim-recorder \
   ~/.config/nvim/pack/provenance/start/provenance-neovim-recorder
 ```

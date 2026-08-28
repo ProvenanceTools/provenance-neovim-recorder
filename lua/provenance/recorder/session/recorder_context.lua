@@ -18,7 +18,7 @@ local M = {}
 -- No package.json in a Neovim plugin; this is the single source of truth
 -- for the recorder's own version until Plan 9 (dist) sources it centrally
 -- (e.g. from a generated version file or the plugin manifest).
-local PLUGIN_VERSION = "0.2.0"
+local PLUGIN_VERSION = "0.3.0"
 
 --- The cap on `file_scope.watched`, in entries (collaboration spec §5.6
 --- item 1). Today's resolver is the manifest's own `files_under_review` — a
