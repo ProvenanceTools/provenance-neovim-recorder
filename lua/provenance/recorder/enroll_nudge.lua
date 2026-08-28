@@ -140,11 +140,45 @@ end
 
 --- Should the student see "(not enrolled)"?
 ---
---- True only when no session emitted an identity AND at least one skipped for a
---- reason enrolling would fix. A machine whose identity store is broken reads as
---- plain "recording": the identity is missing, but "not enrolled" would be the
---- wrong diagnosis and the wrong instruction.
---- @param outcomes table[]
+--- True only when no session emitted an identity AND at least one
+--- ENROLLMENT-REQUIRING session skipped for a reason enrolling would fix. A
+--- machine whose identity store is broken reads as plain "recording": the
+--- identity is missing, but "not enrolled" would be the wrong diagnosis and
+--- the wrong instruction.
+---
+--- ## ASYMMETRIC ON PURPOSE -- do not "simplify" this into one filter
+---
+--- It is tempting to filter `outcomes` down to enrollment-requiring sessions
+--- ONCE, up front, and run both checks below over that filtered list. That is
+--- wrong, and differs from `any_identity_emitted`'s existing all-or-nothing
+--- contract in a way that reintroduces the exact misdiagnosis it was written
+--- to prevent:
+---
+---  - `any_identity_emitted` below reads EVERY outcome -- waived-course
+---    sessions included.
+---  - The loop below it reads ONLY outcomes where `enrollment_required` is not
+---    explicitly `false` (registry.lua's `identity_outcomes()` annotates each
+---    outcome with this from `policy.enrollment.required`, 2026-08-25; an
+---    outcome with no such key -- every outcome this file's own tests build by
+---    hand, and every outcome from a manifest that predates the flag -- reads
+---    as required, unchanged from before the flag existed).
+---
+--- Filtering the waived session out BEFORE the emitted-check would discard its
+--- `emitted` outcome along with it. That is reachable: a student holding a
+--- LEGACY 2.0 per-course token (the case `any_identity_emitted`'s own
+--- doc-comment already worries about) can have their cs61b session (course
+--- opted OUT of enrollment nagging) EMIT an identity, while their cs61c
+--- session (course did not opt out) is `skipped` for want of a credential.
+--- Pre-filtering to enrollment-requiring sessions leaves only the skipped
+--- cs61c outcome, and this function would wrongly report "(not enrolled)" for
+--- a student who IS attributed on a session that is currently open. A 2.1
+--- institution credential cannot produce this split -- it is global, so it
+--- emits for every root or none -- so this is rare, but rare is not the same
+--- as impossible, and all three recorders (VS Code, JetBrains, this one) must
+--- agree on it regardless.
+--- @param outcomes table[]  each optionally carrying `enrollment_required`
+---   (boolean; absent/non-`false` means required, matching every outcome that
+---   predates the flag)
 --- @return boolean
 function M.is_unenrolled(outcomes)
   if M.any_identity_emitted(outcomes) then
@@ -152,7 +186,12 @@ function M.is_unenrolled(outcomes)
   end
   for _, o in ipairs(outcomes or {}) do
     if type(o) == "table" and o.kind == "skipped" and M.is_unenrolled_skip(o.reason) then
-      return true
+      -- `~= false` rather than truthiness: an absent key must read as
+      -- required (every pre-flag outcome, and every outcome this file's own
+      -- tests construct by hand), and only an explicit `false` may waive it.
+      if o.enrollment_required ~= false then
+        return true
+      end
     end
   end
   return false

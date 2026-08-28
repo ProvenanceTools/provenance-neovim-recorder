@@ -17,6 +17,7 @@
 --- workspace. The registry is the natural home for that cache: it is already
 --- the per-editor-instance "what do we know about this root" map.
 local activation = require("provenance.recorder.activation")
+local enrollment_policy_gate = require("provenance.recorder.enrollment_policy_gate")
 
 local M = {}
 
@@ -125,13 +126,28 @@ function M.new(opts)
   --- given no identity store) simply contributes nothing -- "we never asked" is
   --- not "they are not enrolled", and neither surface may turn the first into
   --- the second.
-  --- @return table[]  { kind = "emitted"|"skipped", ... }
+  ---
+  --- Each outcome is ANNOTATED with `enrollment_required`, resolved from that
+  --- session's own manifest (`policy.enrollment.required`, 2026-08-25
+  --- professor-facing "don't nag this course's students" flag,
+  --- `enrollment_policy_gate.lua`). It is annotated, never filtered out: this
+  --- list is the input to `enroll_nudge.is_unenrolled`, whose check is
+  --- deliberately ASYMMETRIC -- "did anyone emit an identity" must still see a
+  --- waived session's `emitted` outcome, and only the separate "does anyone
+  --- still need to enrol" half is restricted to `enrollment_required` ones.
+  --- Dropping a waived session's outcome here entirely would break the first
+  --- half for a legacy 2.0 holder enrolled in a waived course but not a
+  --- requiring one -- see `enroll_nudge.is_unenrolled`'s doc-comment for the
+  --- full scenario. Do not reintroduce a filter here.
+  --- @return table[]  { kind = "emitted"|"skipped", enrollment_required, ... }
   function reg.identity_outcomes()
     local out = {}
     for _, entry in pairs(sessions) do
       local outcome = entry.controller and entry.controller._identity_outcome
       if type(outcome) == "table" then
-        out[#out + 1] = outcome
+        out[#out + 1] = vim.tbl_extend("force", {}, outcome, {
+          enrollment_required = enrollment_policy_gate.effective_required(entry.manifest),
+        })
       end
     end
     return out

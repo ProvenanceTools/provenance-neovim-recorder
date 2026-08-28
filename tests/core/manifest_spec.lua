@@ -2,6 +2,8 @@
 --- Mirrors log-core's parseManifest: JSON + field-shape validation, then
 --- ed25519 verify of the canonicalized payload (sig field excluded).
 local manifest = require("provenance.core.manifest")
+local json = require("provenance.core.json")
+local ed25519 = require("provenance.core.ed25519")
 
 -- Locate the shared conformance fixtures dir (see conformance_spec for why
 -- debug.getinfo is used rather than <sfile> under plenary's loadfile runner).
@@ -185,5 +187,98 @@ describe("manifest.verify against the manifest.json fixture", function()
     assert.is_false(manifest.verify(nil, fx.course_pubkey_hex))
     assert.is_false(manifest.verify({}, fx.course_pubkey_hex))
     assert.is_false(manifest.verify({ assignment_id = "x" }, fx.course_pubkey_hex))
+  end)
+end)
+
+--- `policy.enrollment` (2026-08-25, professor-facing enrollment-nag off
+--- switch) MUST NOT require any change to `signed_payload`, `verify`, or
+--- `verify_chain` -- `policy` is signed and canonicalized VERBATIM
+--- (`policy = m.policy` in `signed_payload`), so a new key nested inside it
+--- rides along for free. This section proves that claim rather than assuming
+--- it: a manifest carrying `policy.enrollment` signs and verifies exactly like
+--- one that does not, and the ONLY difference in the signed bytes is the
+--- `policy` sub-object itself -- nothing about the fixed field list changed.
+describe("manifest signing with policy.enrollment present (a new signed-payload field is NOT needed)", function()
+  --- A minimal, otherwise-valid 2.0 manifest body (no `sig` yet).
+  --- @param policy table
+  --- @return table
+  local function v2_manifest(policy)
+    return {
+      format_version = "2.0",
+      course_id = "cs61b",
+      assignment_id = "hw3",
+      semester = "fa26",
+      issued_at = "2026-08-25T00:00:00Z",
+      files_under_review = { "src/main.py" },
+      ignore = {},
+      attachments = {},
+      collaboration = "solo",
+      submission = "bundle",
+      scope = "directory",
+      policy = policy,
+    }
+  end
+
+  it("the signed bytes differ from a policy with no enrollment key ONLY in the policy sub-object", function()
+    local without_enrollment = v2_manifest({ capture = { terminal = true } })
+    local with_enrollment = v2_manifest({ capture = { terminal = true }, enrollment = { required = false } })
+
+    local payload_without = manifest.signed_payload(without_enrollment)
+    local payload_with = manifest.signed_payload(with_enrollment)
+    assert.are_not.equal(payload_without, payload_with)
+
+    -- Rebuild the payload using json.canonicalize DIRECTLY (bypassing
+    -- signed_payload entirely) over the exact same fixed field list
+    -- signed_payload's 2.0 branch uses, but substituting the "without" policy
+    -- back in. If this matches payload_without byte-for-byte, then
+    -- `policy.enrollment` reached the wire purely through the pre-existing
+    -- verbatim `policy = m.policy` passthrough -- no special-cased handling,
+    -- no new top-level signed key, nothing signed_payload had to learn.
+    local rebuilt = json.canonicalize({
+      format_version = "2.0",
+      course_id = with_enrollment.course_id,
+      assignment_id = with_enrollment.assignment_id,
+      semester = with_enrollment.semester,
+      issued_at = with_enrollment.issued_at,
+      files_under_review = json.array(with_enrollment.files_under_review),
+      ignore = json.array(with_enrollment.ignore),
+      attachments = json.array(with_enrollment.attachments),
+      collaboration = with_enrollment.collaboration,
+      submission = with_enrollment.submission,
+      scope = with_enrollment.scope,
+      policy = without_enrollment.policy,
+    })
+    assert.equals(payload_without, rebuilt)
+  end)
+
+  it("signs and verifies fine with policy.enrollment.required = false", function()
+    local priv, pub_hex = ed25519.generate_keypair()
+    local m = v2_manifest({ capture = { terminal = true }, enrollment = { required = false } })
+    m.sig = ed25519.to_hex(ed25519.sign(manifest.signed_payload(m), priv))
+
+    assert.is_true(manifest.verify(m, pub_hex))
+  end)
+
+  it("signs and verifies fine with policy.enrollment.required = true, and against a fixture with no enrollment key at all", function()
+    local priv, pub_hex = ed25519.generate_keypair()
+
+    local required_true = v2_manifest({ enrollment = { required = true } })
+    required_true.sig = ed25519.to_hex(ed25519.sign(manifest.signed_payload(required_true), priv))
+    assert.is_true(manifest.verify(required_true, pub_hex))
+
+    local no_enrollment_key = v2_manifest({ capture = { terminal = true } })
+    no_enrollment_key.sig = ed25519.to_hex(ed25519.sign(manifest.signed_payload(no_enrollment_key), priv))
+    assert.is_true(manifest.verify(no_enrollment_key, pub_hex))
+  end)
+
+  it("tampering policy.enrollment.required after signing invalidates the signature, same as any other policy field", function()
+    local priv, pub_hex = ed25519.generate_keypair()
+    local m = v2_manifest({ enrollment = { required = false } })
+    m.sig = ed25519.to_hex(ed25519.sign(manifest.signed_payload(m), priv))
+    assert.is_true(manifest.verify(m, pub_hex))
+
+    local tampered = vim.deepcopy(m)
+    tampered.policy.enrollment.required = true
+    assert.is_false(manifest.verify(tampered, pub_hex))
   end)
 end)
