@@ -121,13 +121,19 @@ local ROTATE_IDLE_POLL_MS = 250
 --- produce a 2 s gap, and a session that grows without limit ends in a repo
 --- that cannot be pushed at all — the worse outcome.
 ---
---- Stated honestly: this is the ONE path on which a rotation can still lose an
---- edit, and therefore the one path that can still produce the false
---- `inter_session_external_change` flag described above. It is reachable only by
---- 8 MiB of recorded events containing no 2-second pause anywhere. Skipping
---- chain recovery on the rotation path (`skip_chain_recovery`) shrinks the
---- teardown window to a flush plus a seal, so the residual exposure is small —
---- but it is not zero, and nothing here pretends otherwise.
+--- Stated honestly: this is the only path on which a rotation can lose a
+--- KEYSTROKE, and it is reachable only by 8 MiB of recorded events containing no
+--- 2-second pause anywhere. The quiet gate makes the keyboard safe and nothing
+--- else: it cannot make an external writer safe, because a formatter daemon, a
+--- build tool, or a partner's `git pull` is not synchronised to the student's
+--- pause. An `fs.external_change` landing inside any teardown window is dropped
+--- and produces the false `inter_session_external_change` described above — at
+--- HIGH severity, since an external write rewrites a whole file. The gate even
+--- concentrates rotations into the moments the student is idle, which is when
+--- background repo activity is most likely. Skipping chain recovery on the
+--- rotation path (`skip_chain_recovery`) shrinks the teardown window to a flush
+--- plus a seal, so the residual is small — but it is not zero, and nothing here
+--- pretends otherwise.
 local ROTATE_HARD_CEILING_BYTES = 48 * 1024 * 1024
 
 --- Generate a UUID v4 (RFC 4122) from 16 random bytes, lowercase hex,
