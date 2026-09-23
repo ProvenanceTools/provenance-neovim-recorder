@@ -154,6 +154,80 @@ describe("registry.new", function()
   end)
 end)
 
+--- registry.rotate_session: the root -> session map's half of size rotation
+--- (PRD §4.6). recording_session itself decides WHEN to rotate (size
+--- rotation trigger); this is the half that stops the old session with
+--- reason "rotate" and starts the replacement, linking prev_session_id to
+--- the ended session's LOGICAL session_id.
+describe("registry.rotate_session", function()
+  --- Like make_start_recording_spy(), but each fake controller also carries
+  --- a distinct session_id, so the test can assert the replacement's
+  --- prev_session_id names the FIRST controller's own id.
+  local function make_start_recording_spy_with_ids()
+    local calls = {}
+    local counter = 0
+    local function start_recording(args)
+      counter = counter + 1
+      local fake_controller = { session_id = "session-" .. counter, stop_calls = {} }
+      function fake_controller.stop(reason)
+        table.insert(fake_controller.stop_calls, reason)
+      end
+      table.insert(calls, { args = args, controller = fake_controller })
+      return fake_controller
+    end
+    return start_recording, calls
+  end
+
+  it("stops the current session with reason 'rotate', then starts a replacement with prev_session_id set to the ended session's id", function()
+    local start_recording, calls = make_start_recording_spy_with_ids()
+    local reg = registry_mod.new({ start_recording = start_recording })
+    local manifest = { assignment_id = "hw3" }
+    reg.ensure_session("/tmp/ws-a", manifest)
+    local first_controller = calls[1].controller
+
+    reg.rotate_session("/tmp/ws-a")
+
+    assert.equals(1, #first_controller.stop_calls)
+    assert.equals("rotate", first_controller.stop_calls[1])
+
+    assert.equals(2, #calls)
+    assert.equals("/tmp/ws-a", calls[2].args.workspace)
+    assert.equals(manifest, calls[2].args.manifest)
+    assert.equals(first_controller.session_id, calls[2].args.prev_session_id)
+
+    -- The registry now tracks the REPLACEMENT, not the ended session.
+    assert.equals(calls[2].controller, reg.get("/tmp/ws-a").controller)
+    assert.is_true(reg.has_session("/tmp/ws-a"))
+  end)
+
+  it("is a no-op for a root with no live session", function()
+    local start_recording, calls = make_start_recording_spy()
+    local reg = registry_mod.new({ start_recording = start_recording })
+
+    assert.has_no.errors(function()
+      reg.rotate_session("/tmp/nonexistent")
+    end)
+    assert.equals(0, #calls)
+    assert.is_false(reg.has_session("/tmp/nonexistent"))
+  end)
+
+  it("ensure_session wires on_rotate_needed by default, and it drives rotate_session for that root", function()
+    local start_recording, calls = make_start_recording_spy_with_ids()
+    local reg = registry_mod.new({ start_recording = start_recording })
+    reg.ensure_session("/tmp/ws-a", { assignment_id = "hw3" })
+
+    -- Production never calls this directly (recording_session calls it via
+    -- vim.schedule when the .slog crosses the rotation threshold) -- invoke
+    -- it here exactly the way that callback would.
+    calls[1].args.on_rotate_needed()
+
+    assert.equals(2, #calls)
+    assert.equals(1, #calls[1].controller.stop_calls)
+    assert.equals("rotate", calls[1].controller.stop_calls[1])
+    assert.equals(calls[1].controller.session_id, calls[2].args.prev_session_id)
+  end)
+end)
+
 --- `identity_outcomes()` is the single chokepoint both `status.lua` and
 --- `enroll_nudge_ui.lua` read (see `enroll_nudge_spec.lua` for the pure
 --- decision logic those two consume it with). It ANNOTATES every outcome with

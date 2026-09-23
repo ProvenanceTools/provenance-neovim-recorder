@@ -430,4 +430,108 @@ describe("recording_session lifecycle integration (Plan 8 gate)", function()
       assert.is_not_nil(st, ".slog is created empty at session start")
       assert.equals(0, st.size, "nothing has been flushed yet")
   end)
+
+  it("scenario 6: size rotation fires on_rotate_needed exactly once, only on the checkpoint-cadence branch, naming the ended session's own id", function()
+    local rotate_calls = {}
+    -- rotate_bytes = 1: any real entry (session.start alone is already far
+    -- more than one byte) crosses the threshold immediately. This isolates
+    -- exactly the property under test: the check is gated by cadence
+    -- (checkpoint_interval = 3), not run per entry -- if it ran per entry,
+    -- rotate_calls would be non-empty before start_activated_session even
+    -- returns.
+    local _, _, buf = start_activated_session(fx, scratch, {
+      checkpoint_interval = 3,
+      rotate_bytes = 1,
+      on_rotate_needed = function(ended_id)
+        table.insert(rotate_calls, ended_id)
+      end,
+    })
+
+    -- session.start + the catch-up/open pass for `buf` are on the log by
+    -- now, but that is fewer than 3 total on_entry calls, so the cadence
+    -- branch has not run once yet -- no rotation check has happened despite
+    -- bytes_appended() already exceeding rotate_bytes.
+    assert.equals(0, #rotate_calls)
+
+    -- The next appended entry is the 3rd on_entry call overall: cadence
+    -- fires, and the (already-crossed) byte check runs for the first time.
+    make_entry(buf)
+    local fired = vim.wait(500, function() return #rotate_calls > 0 end, 10)
+    assert.is_true(fired, "on_rotate_needed should have fired on the 3rd entry")
+    assert.equals(1, #rotate_calls)
+    assert.equals(scratch.session.session_id, rotate_calls[1])
+
+    -- `rotation_requested` latches: further entries (including further
+    -- cadence hits) must not fire it again.
+    for _ = 1, 6 do
+      make_entry(buf)
+    end
+    vim.wait(100)
+    assert.equals(1, #rotate_calls)
+  end)
+
+  it("scenario 7: end-to-end rotation -- the old session ends with reason 'rotate', the replacement links prev_session_id to its LOGICAL id, and both chains validate", function()
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    local manifest = activated_manifest(fx, workspace)
+
+    local path = workspace .. "/foo.txt"
+    scratch.write_file(path, "line0\n")
+
+    scratch.session = recording_session.start({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = manifest,
+      clock = core_clock.fixed(0, 0),
+    })
+    local buf = scratch.edit(path)
+    make_entry(buf)
+
+    local ended_id = scratch.session.session_id
+    local first_slog_path = scratch.session.slog_path
+
+    -- Stop-then-start (never the reverse): the replacement is only started
+    -- below, after the first session's autocmds have fully detached.
+    scratch.session.stop("rotate")
+
+    local first_parsed = core_ndjson.parse_entries(read_all(first_slog_path))
+    assert.is_true(first_parsed.ok)
+    assert.is_true(core_chain_validator.validate_chain(first_parsed.value).ok)
+    local last_entry = first_parsed.value[#first_parsed.value]
+    assert.equals("session.end", last_entry.kind)
+    assert.equals("rotate", last_entry.data.reason)
+
+    -- The replacement, in the SAME provenance_dir, with prev_session_id set
+    -- to the ended session's LOGICAL session_id (two-uuid rule) -- never the
+    -- `.slog` filename uuid.
+    scratch.session = recording_session.start({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = manifest,
+      clock = core_clock.fixed(0, 0),
+      prev_session_id = ended_id,
+    })
+    -- Force the buffered session.start (+ catch-up doc.open) onto disk
+    -- before reading it back; stop() is idempotent and teardown() will
+    -- no-op on it.
+    scratch.session.stop()
+
+    local second_parsed = core_ndjson.parse_entries(read_all(scratch.session.slog_path))
+    assert.is_true(second_parsed.ok)
+    assert.is_true(core_chain_validator.validate_chain(second_parsed.value).ok)
+    assert.equals("session.start", second_parsed.value[1].kind)
+    assert.equals(ended_id, second_parsed.value[1].data.prev_session_id)
+
+    -- The replacement's own catch-up pass re-baselines the still-open
+    -- buffer with its own doc.open (§3.3 buffer-sourced baselines) --
+    -- distinct from, and in addition to, the first session's doc.open.
+    local has_doc_open = false
+    for _, e in ipairs(second_parsed.value) do
+      if e.kind == "doc.open" then
+        has_doc_open = true
+      end
+    end
+    assert.is_true(has_doc_open, "the replacement session must emit its own doc.open for the open buffer")
+  end)
 end)

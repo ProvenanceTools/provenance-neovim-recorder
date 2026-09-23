@@ -60,6 +60,12 @@ local degraded_notifier = require("provenance.recorder.failure.degraded_notifier
 
 local M = {}
 
+--- Rotate a session once its `.slog` passes this size (PRD §4.6).
+---
+--- `submission = "git"` assignments commit `.provenance/` to a GitHub repo, and
+--- GitHub warns at 50 MB and refuses a push containing a file over 100 MB.
+local ROTATE_BYTES = 40 * 1024 * 1024
+
 --- Generate a UUID v4 (RFC 4122) from 16 random bytes, lowercase hex,
 --- version nibble forced to 4, variant bits forced to 10xx. Deliberately
 --- duplicated from recorder_context's private uuid generator (not exported
@@ -130,6 +136,8 @@ end
 ---     overridden above); "previous_session_corrupt" additionally emits
 ---     recorder.recovered_from_corruption as the entry right after
 ---     session.start. clean_start/complete do neither.
+---   rotate_bytes: number|nil -- rotate once the .slog passes this size; default ROTATE_BYTES
+---   on_rotate_needed: fun(ended_session_id: string)|nil -- called once when it does
 --- }
 --- @return table session {
 ---   session_id, slog_path, meta_path, public_key_hex,
@@ -142,6 +150,9 @@ function M.start(opts)
   local manifest = opts.manifest
   local clock = opts.clock
   local checkpoint_interval = opts.checkpoint_interval or 100
+  local rotate_bytes = opts.rotate_bytes or ROTATE_BYTES
+  local on_rotate_needed = opts.on_rotate_needed
+  local rotation_requested = false
 
   -- Plan 9 CAPSTONE seam: when false/absent (the default), recording_session
   -- behaves EXACTLY as it did pre-Plan-9 (the lean core used by focused specs
@@ -568,6 +579,21 @@ function M.start(opts)
         writer.append(entry)
         if cadence.on_entry_appended() then
           scheduler.schedule(entry.seq, entry.hash)
+
+          -- Size rotation (PRD §4.6). Inside the cadence branch, so this costs one
+          -- comparison per 100 entries rather than one per keystroke — on_bytes is
+          -- the edit firehose. The degraded branch above returns first, so a
+          -- degraded session never rotates, which is required. The callback is
+          -- deferred: rotation does teardown I/O and must not run inside on_bytes.
+          if not rotation_requested and writer.bytes_appended() >= rotate_bytes then
+            rotation_requested = true
+            local ended_id = context.session_id
+            if on_rotate_needed then
+              vim.schedule(function()
+                on_rotate_needed(ended_id)
+              end)
+            end
+          end
         end
       end
     end,

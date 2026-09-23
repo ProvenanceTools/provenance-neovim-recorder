@@ -30,6 +30,11 @@ function M.new(opts)
   -- root -> { manifest, controller, provenance_dir }
   local sessions = {}
 
+  -- root -> true while reg.rotate_session(root) is in flight, guarding
+  -- against a re-entrant rotation for the same root (e.g. a second
+  -- on_rotate_needed firing before the first replacement session exists).
+  local rotating = {}
+
   -- Verified-root cache: root -> { digest, pubkey_override, result }.
   --
   -- Keyed on the root directory PLUS the manifest's content digest PLUS the
@@ -183,6 +188,9 @@ function M.new(opts)
       workspace = root,
       provenance_dir = provenance_dir,
       manifest = manifest,
+      on_rotate_needed = function()
+        reg.rotate_session(root)
+      end,
     }, extra_opts or {})
 
     local ok, controller = pcall(start_recording, start_opts)
@@ -192,6 +200,36 @@ function M.new(opts)
 
     sessions[root] = { manifest = manifest, controller = controller, provenance_dir = provenance_dir }
     return controller, true
+  end
+
+  --- Rotate the session at `root`: stop it with reason "rotate" (which emits
+  --- `session.end` and takes the final rolling seal), then start a replacement
+  --- whose `prev_session_id` names the session that just ended.
+  ---
+  --- Stop-then-start, not the reverse: `doc_wiring.attach` is per-session and the
+  --- old session's autocmds are only detached during its stop, so starting first
+  --- would record one keystroke into two logs. The replacement's own catch-up pass
+  --- re-emits `doc.open` for every loaded buffer, so it gets its own baseline.
+  --- @param root string
+  function reg.rotate_session(root)
+    if rotating[root] then
+      return
+    end
+    rotating[root] = true
+    local ok, err = pcall(function()
+      local entry = sessions[root]
+      if entry == nil then
+        return
+      end
+      local ended_id = entry.controller.session_id
+      pcall(entry.controller.stop, "rotate")
+      sessions[root] = nil
+      reg.ensure_session(root, entry.manifest, { prev_session_id = ended_id })
+    end)
+    rotating[root] = nil
+    if not ok then
+      vim.notify("[provenance] session rotation failed: " .. tostring(err), vim.log.levels.WARN)
+    end
   end
 
   --- Stop every registered session (pcall-guarded per entry, so one
