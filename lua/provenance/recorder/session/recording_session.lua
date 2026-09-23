@@ -680,8 +680,39 @@ function M.start(opts)
     end
   end
 
+  --- THE point of commit for a rotation. Every trigger goes through here, which
+  --- is why the degraded check lives here rather than at either call site.
+  ---
+  --- "A degraded session never rotates" used to be argued structurally, from the
+  --- fact that `on_entry`'s degraded branch returns before the cadence branch.
+  --- That argument only ever covered the ENTRY path. The idle poll timer is a
+  --- SECOND, INDEPENDENT trigger and it bypassed the argument entirely:
+  --- `arm_rotation` runs on the entry path (so, not degraded), the disk then
+  --- fills and the session degrades — a ONE-WAY state, see disk_full_handler —
+  --- the student pauses to read the error notification, and that pause is
+  --- exactly the quiet window the gate is waiting for. The byte counter is
+  --- frozen at or above the threshold, so the tick would fire.
+  ---
+  --- What that costs is not untidiness. Rotating stops the predecessor, whose
+  --- teardown rolls a seal claiming `final = true` — a WHOLE-FILE commitment —
+  --- while the `session.end` it claims to cover was never written: in degraded
+  --- mode entries are diverted to the in-memory critical ring, so `session.end`
+  --- is RETAINED but never reaches the `.slog`. A bundle sealed final over a log
+  --- missing its own terminal entry is an evidence-integrity problem. And the
+  --- successor would start recording onto a disk that is still full.
+  ---
+  --- Abandoned, not deferred: degraded is one-way within a session, so there is
+  --- no later moment at which this rotation becomes legitimate. The poll timer is
+  --- stopped and `rotation_armed` is left set, so nothing re-arms either. The log
+  --- may then exceed ROTATE_BYTES, which is the correct trade — a degraded
+  --- session has already stopped recording most events, so it is barely growing,
+  --- and an oversized log is recoverable where a falsely-final seal is not.
   local function fire_rotation()
     if rotation_fired then
+      return
+    end
+    if is_degraded() then
+      stop_rotation_poll()
       return
     end
     rotation_fired = true

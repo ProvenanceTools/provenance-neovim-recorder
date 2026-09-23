@@ -675,6 +675,56 @@ describe("recording_session lifecycle integration (Plan 8 gate)", function()
     assert.equals(scratch.session.session_id, rotate_calls[1])
   end)
 
+  it("scenario 6f: a session that degrades AFTER arming never rotates -- the idle poll is a second trigger and must be gated too", function()
+    local rotate_calls = {}
+    local fake_clock = core_clock.fixed(0, 0)
+    local _, _, buf = start_activated_session(fx, scratch, {
+      clock = fake_clock,
+      checkpoint_interval = 3,
+      rotate_bytes = 1,
+      rotate_hard_ceiling_bytes = math.huge,
+      rotate_idle_quiet_ms = 2000,
+      rotate_idle_poll_ms = 600000,
+      -- Silence the degraded notification; scenario 4 already pins it.
+      notify = function() end,
+      on_rotate_needed = function(ended_id)
+        table.insert(rotate_calls, ended_id)
+      end,
+    })
+
+    -- Arm on the cadence branch, while the session is still healthy. "A degraded
+    -- session never rotates" was argued from on_entry's degraded branch
+    -- returning before the cadence branch -- but that only ever covered the
+    -- ENTRY path, and the poll timer is a SECOND, INDEPENDENT trigger.
+    make_entry(buf)
+    assert.is_true(scratch.session._rotation_armed())
+    assert.is_false(scratch.session.is_degraded())
+
+    -- The disk fills. Degraded is a ONE-WAY state.
+    scratch.session._simulate_write_error("ENOSPC")
+    assert.is_true(scratch.session.is_degraded())
+
+    -- The student pauses to read the error notification -- which is exactly the
+    -- quiet window the gate is waiting for, with the byte counter frozen at or
+    -- above the threshold. Before the guard, the tick fired here: the
+    -- predecessor would be stopped and its rolling seal would claim final = true
+    -- over a `.slog` whose own session.end was never written (degraded diverts
+    -- entries to the in-memory critical ring), and the successor would start
+    -- recording onto a disk that is still full.
+    fake_clock.advance(5000)
+    scratch.session._rotation_idle_tick()
+    -- Pumped before asserting the negative: fire_rotation hands off via
+    -- vim.schedule, so an unpumped assertion passes vacuously (see 6e).
+    vim.wait(100)
+    assert.equals(0, #rotate_calls, "a degraded session must not rotate, via the poll path either")
+
+    -- Still true however long it stays quiet: abandoned, not merely deferred.
+    fake_clock.advance(60000)
+    scratch.session._rotation_idle_tick()
+    vim.wait(100)
+    assert.equals(0, #rotate_calls)
+  end)
+
   it("scenario 7: end-to-end rotation -- the old session ends with reason 'rotate', the replacement links prev_session_id to its LOGICAL id, and both chains validate", function()
     local workspace = scratch.workspace()
     local provenance_dir = workspace .. "/.provenance"
