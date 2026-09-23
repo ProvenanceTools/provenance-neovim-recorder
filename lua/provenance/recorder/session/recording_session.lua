@@ -66,23 +66,50 @@ local M = {}
 --- GitHub warns at 50 MB and refuses a push containing a file over 100 MB.
 local ROTATE_BYTES = 40 * 1024 * 1024
 
---- Quiet interval a session must go without recording a `doc.change` before an
---- ARMED rotation actually fires (design §3.3 mechanism 1).
+--- Quiet interval a session must go without recording any CONTENT-MUTATING
+--- event before an ARMED rotation actually fires (design §3.3 mechanism 1).
 ---
---- WHY THIS EXISTS AT ALL. Rotation is stop-then-start, so any edit landing
---- inside the predecessor's teardown window is DROPPED — and a dropped edit is
---- NOT invisible to the analyzer. `inter_session_external_change` compares the
---- predecessor's side as a RECONSTRUCTION FROM ITS EVENT STREAM against the
---- successor's first `doc.open.content`, which is a LIVE BUFFER READ, by exact
---- string equality. A character typed during teardown is present in the
---- successor's baseline and absent from the predecessor's reconstruction, the
---- two differ, and the heuristic reports at confidence 0.85 that the student
+--- WHY THIS EXISTS AT ALL. Rotation is stop-then-start, so any content change
+--- landing inside the predecessor's teardown window is DROPPED — and a dropped
+--- change is NOT invisible to the analyzer. `inter_session_external_change`
+--- compares the predecessor's side as a RECONSTRUCTION FROM ITS EVENT STREAM
+--- against the successor's first `doc.open.content`, which is a LIVE BUFFER
+--- READ, by exact string equality. A character typed during teardown is present
+--- in the successor's baseline and absent from the predecessor's reconstruction,
+--- the two differ, and the heuristic reports at confidence 0.85 that the student
 --- edited that file OUTSIDE the recorder. This system produces evidence for
 --- academic-integrity cases, so that false accusation is the most expensive
---- defect available here. Waiting for a quiet window makes "nobody typed during
---- teardown" a property of WHEN we rotate rather than a hope about how fast
---- teardown is. Students pause constantly, so in practice it costs nothing.
+--- defect available here. Waiting for a quiet window makes "nothing changed
+--- during teardown" a property of WHEN we rotate rather than a hope about how
+--- fast teardown is. Students pause constantly, so in practice it costs nothing.
 local ROTATE_IDLE_QUIET_MS = 2000
+
+--- The event kinds whose arrival resets that quiet window.
+---
+--- WHY THESE THREE AND NOT OTHERS. They are exactly the kinds that change FILE
+--- CONTENT, and file content is all the seam comparison is about: the heuristic
+--- compares the predecessor's reconstruction against the successor's baseline
+--- and does not care which event moved the bytes. So a `paste`, or an
+--- `fs.external_change` from a formatter-on-save, a `git checkout` or a
+--- partner's write, dropped inside the teardown window diverges the seam exactly
+--- as a keystroke does. It is in fact WORSE: an external write is typically a
+--- whole-file rewrite, so the delta clears `highSeverityCharsChanged` and the
+--- false flag is reported at HIGH severity rather than medium. Quieting only the
+--- keyboard would leave unguarded precisely the event class the flag is named
+--- after. External writes are rare, so resetting on them costs nothing.
+---
+--- Everything else is deliberately absent. `session.heartbeat`, `focus.change`,
+--- `selection.change`, `ext.*`, `git.*`, `term.*`, `clock.skew` and
+--- `paste.anomaly` mutate no file, so losing one across the seam cannot make the
+--- two sides differ — and letting a 30-second heartbeat reset the window would
+--- mean an idle session never rotates at all, which is the exact opposite of the
+--- intent. `doc.open` is absent for the same reason: it REPORTS content, it does
+--- not change it.
+local ROTATE_QUIET_RESET_KINDS = {
+  ["doc.change"] = true,
+  ["paste"] = true,
+  ["fs.external_change"] = true,
+}
 
 --- How often the armed-rotation poller re-checks the quiet window. Deliberately
 --- coarse and on a background timer: nothing about rotation is latency
@@ -719,11 +746,14 @@ function M.start(opts)
 
         -- Idle tracking for an ARMED rotation (design §3.3). Gated on
         -- `rotation_armed` FIRST so the firehose pays one boolean test per entry
-        -- for the whole session and the kind comparison plus clock read only
-        -- inside the brief window between crossing 40 MiB and rotating. The
+        -- for the whole session and the kind lookup plus clock read only inside
+        -- the brief window between crossing 40 MiB and rotating. The
         -- quiet-window COMPARISON itself never runs here — it runs on the poll
         -- timer (rotation_idle_tick).
-        if rotation_armed and not rotation_fired and entry.kind == "doc.change" then
+        --
+        -- Every CONTENT-MUTATING kind resets the window, not just `doc.change`:
+        -- see ROTATE_QUIET_RESET_KINDS for why the set is exactly those three.
+        if rotation_armed and not rotation_fired and ROTATE_QUIET_RESET_KINDS[entry.kind] then
           last_change_ms = clock.now()
         end
 

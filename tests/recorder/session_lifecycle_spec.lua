@@ -599,6 +599,82 @@ describe("recording_session lifecycle integration (Plan 8 gate)", function()
     assert.equals(1, recovery_calls)
   end)
 
+  it("scenario 6e: EVERY content-mutating event defers an armed rotation -- fs.external_change and paste, not just doc.change -- while a non-content event does not", function()
+    local rotate_calls = {}
+    local fake_clock = core_clock.fixed(0, 0)
+    local _, _, buf = start_activated_session(fx, scratch, {
+      clock = fake_clock,
+      checkpoint_interval = 3,
+      rotate_bytes = 1,
+      rotate_hard_ceiling_bytes = math.huge,
+      rotate_idle_quiet_ms = 2000,
+      -- As in scenario 6: the real poller is pushed past this test's lifetime so
+      -- the quiet-window check happens only when the test drives it.
+      rotate_idle_poll_ms = 600000,
+      on_rotate_needed = function(ended_id)
+        table.insert(rotate_calls, ended_id)
+      end,
+    })
+
+    -- Arm on the 3rd on_entry call, exactly as scenario 6 does.
+    make_entry(buf)
+    assert.is_true(scratch.session._rotation_armed())
+
+    fake_clock.advance(1999)
+    scratch.session._rotation_idle_tick()
+    -- fire_rotation hands off via vim.schedule, so the loop MUST be pumped
+    -- before concluding that nothing fired -- otherwise the assertion passes
+    -- vacuously and the test pins nothing.
+    vim.wait(50)
+    assert.equals(0, #rotate_calls)
+
+    -- THE CASE THIS SCENARIO EXISTS FOR. An external write -- formatter-on-save,
+    -- `git checkout`, a partner's write -- landing inside the teardown window is
+    -- dropped exactly as a keystroke would be, and diverges the seam the same
+    -- way. Worse, in fact: a whole-file rewrite clears
+    -- highSeverityCharsChanged, so the false inter_session_external_change is
+    -- reported at HIGH severity. Emitted through the session's own host, the
+    -- same chokepoint the external-change coordinator uses in production.
+    scratch.session._host.emit("fs.external_change", {
+      path = "foo.txt",
+      direction = "disk_ahead",
+      expected_sha256 = string.rep("a", 64),
+      actual_sha256 = string.rep("b", 64),
+    })
+    fake_clock.advance(1999)
+    scratch.session._rotation_idle_tick()
+    vim.wait(50)
+    assert.equals(
+      0,
+      #rotate_calls,
+      "fs.external_change must reset the quiet window (3998ms have now elapsed since arming, well past 2000)"
+    )
+
+    -- A paste does too.
+    scratch.session._host.emit("paste", { path = "foo.txt", chars = 120 })
+    fake_clock.advance(1999)
+    scratch.session._rotation_idle_tick()
+    vim.wait(50)
+    assert.equals(0, #rotate_calls, "paste must reset the quiet window")
+
+    -- A heartbeat does NOT: it mutates no file, so losing one across the seam
+    -- cannot make the two sides differ -- and if it reset the window, a
+    -- genuinely idle session could never rotate at all.
+    scratch.session._host.emit("session.heartbeat", {
+      focused = true,
+      active_file = core_json.NULL,
+      idle_since_ms = 0,
+    })
+    fake_clock.advance(1)
+    scratch.session._rotation_idle_tick()
+    local fired = vim.wait(500, function()
+      return #rotate_calls > 0
+    end, 10)
+    assert.is_true(fired, "a non-content event must not defer the rotation")
+    assert.equals(1, #rotate_calls)
+    assert.equals(scratch.session.session_id, rotate_calls[1])
+  end)
+
   it("scenario 7: end-to-end rotation -- the old session ends with reason 'rotate', the replacement links prev_session_id to its LOGICAL id, and both chains validate", function()
     local workspace = scratch.workspace()
     local provenance_dir = workspace .. "/.provenance"
