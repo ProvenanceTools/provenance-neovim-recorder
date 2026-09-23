@@ -218,13 +218,126 @@ describe("registry.rotate_session", function()
 
     -- Production never calls this directly (recording_session calls it via
     -- vim.schedule when the .slog crosses the rotation threshold) -- invoke
-    -- it here exactly the way that callback would.
-    calls[1].args.on_rotate_needed()
+    -- it here exactly the way that callback would, INCLUDING the ended
+    -- session's own id, which recording_session always passes.
+    calls[1].args.on_rotate_needed(calls[1].controller.session_id)
 
     assert.equals(2, #calls)
     assert.equals(1, #calls[1].controller.stop_calls)
     assert.equals("rotate", calls[1].controller.stop_calls[1])
     assert.equals(calls[1].controller.session_id, calls[2].args.prev_session_id)
+  end)
+
+  --- Design §3.3 mechanism 2: the successor is told its predecessor's id, so it
+  --- must NOT re-derive one by reading and chain-validating the (up to 40 MiB)
+  --- predecessor log -- which in this port happens synchronously on the main
+  --- loop, freezing the editor exactly while no wiring is attached.
+  it("tells the replacement to skip chain recovery", function()
+    local start_recording, calls = make_start_recording_spy_with_ids()
+    local reg = registry_mod.new({ start_recording = start_recording })
+    reg.ensure_session("/tmp/ws-a", { assignment_id = "hw3" })
+
+    reg.rotate_session("/tmp/ws-a", calls[1].controller.session_id)
+
+    assert.is_true(calls[2].args.skip_chain_recovery)
+    -- The FIRST (non-rotation) start must not carry it: an ordinary activation
+    -- has a real predecessor to discover.
+    assert.is_nil(calls[1].args.skip_chain_recovery)
+  end)
+
+  --- STALENESS GUARD (review finding F4). on_rotate_needed is vim.schedule'd, so
+  --- a stop_all() + restart can land between the request and its delivery. The
+  --- rotation must be abandoned rather than applied to the innocent new session:
+  --- a gratuitous seam is a gratuitous chance to drop an edit, and a dropped edit
+  --- across a seam makes the analyzer report the student edited outside the
+  --- recorder (design §3.3).
+  it("abandons the rotation when the live session for that root is no longer the one that asked", function()
+    local start_recording, calls = make_start_recording_spy_with_ids()
+    local reg = registry_mod.new({ start_recording = start_recording })
+    reg.ensure_session("/tmp/ws-a", { assignment_id = "hw3" })
+    local requester = calls[1].controller
+
+    -- The requester's scheduled callback is still pending here.
+    reg.stop_all("deactivate")
+    reg.ensure_session("/tmp/ws-a", { assignment_id = "hw3" })
+    local innocent = calls[2].controller
+    assert.equals(2, #calls)
+
+    -- ...and now it lands, naming a session that is no longer live.
+    calls[1].args.on_rotate_needed(requester.session_id)
+
+    -- The brand-new session was neither stopped nor replaced.
+    assert.equals(2, #calls)
+    assert.same({}, innocent.stop_calls)
+    assert.equals(innocent, reg.get("/tmp/ws-a").controller)
+  end)
+
+  it("rotates when the live session IS the requester (the guard's positive case)", function()
+    local start_recording, calls = make_start_recording_spy_with_ids()
+    local reg = registry_mod.new({ start_recording = start_recording })
+    reg.ensure_session("/tmp/ws-a", { assignment_id = "hw3" })
+
+    calls[1].args.on_rotate_needed(calls[1].controller.session_id)
+
+    assert.equals(2, #calls)
+    assert.equals("rotate", calls[1].controller.stop_calls[1])
+  end)
+
+  --- FAILED ROTATION MUST NOT BE SILENT (review finding F3). ensure_session
+  --- reports a failed start by RETURNING nil, false, err -- it never raises -- so
+  --- a pcall around it stays `ok`. Before this, a failed restart left the root
+  --- with no session, no notification and no degraded mark: the student kept
+  --- typing, unrecorded, with the statusline indicator simply gone.
+  it("surfaces a failed restart to the student instead of silently leaving the root unrecorded", function()
+    local calls = {}
+    local counter = 0
+    local function start_recording(args)
+      counter = counter + 1
+      if counter == 2 then
+        error("ENOSPC: no space left on device")
+      end
+      local fake_controller = { session_id = "session-" .. counter, stop_calls = {} }
+      function fake_controller.stop(reason)
+        table.insert(fake_controller.stop_calls, reason)
+      end
+      table.insert(calls, { args = args, controller = fake_controller })
+      return fake_controller
+    end
+
+    local notified = {}
+    local reg = registry_mod.new({
+      start_recording = start_recording,
+      notify = function(message)
+        table.insert(notified, message)
+      end,
+    })
+    reg.ensure_session("/tmp/ws-a", { assignment_id = "hw3" })
+
+    reg.rotate_session("/tmp/ws-a", calls[1].controller.session_id)
+
+    assert.equals(1, #notified, "a failed rotation must notify exactly once")
+    assert.is_truthy(notified[1]:match("ENOSPC"))
+    -- The predecessor was still stopped cleanly (it is sealed on disk), and the
+    -- root now has no session -- which the statusline reads as "not recording".
+    assert.equals("rotate", calls[1].controller.stop_calls[1])
+    assert.is_false(reg.has_session("/tmp/ws-a"))
+    assert.is_false(reg.is_active())
+  end)
+
+  it("does not notify on a successful rotation", function()
+    local start_recording, calls = make_start_recording_spy_with_ids()
+    local notified = {}
+    local reg = registry_mod.new({
+      start_recording = start_recording,
+      notify = function(message)
+        table.insert(notified, message)
+      end,
+    })
+    reg.ensure_session("/tmp/ws-a", { assignment_id = "hw3" })
+
+    reg.rotate_session("/tmp/ws-a", calls[1].controller.session_id)
+
+    assert.same({}, notified)
   end)
 end)
 

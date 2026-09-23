@@ -431,17 +431,27 @@ describe("recording_session lifecycle integration (Plan 8 gate)", function()
       assert.equals(0, st.size, "nothing has been flushed yet")
   end)
 
-  it("scenario 6: size rotation fires on_rotate_needed exactly once, only on the checkpoint-cadence branch, naming the ended session's own id", function()
+  it("scenario 6: crossing the size threshold ARMS the rotation on the checkpoint-cadence branch but does not rotate, and it fires only after a quiet window, exactly once, naming the ended session's own id", function()
     local rotate_calls = {}
+    local fake_clock = core_clock.fixed(0, 0)
     -- rotate_bytes = 1: any real entry (session.start alone is already far
     -- more than one byte) crosses the threshold immediately. This isolates
     -- exactly the property under test: the check is gated by cadence
     -- (checkpoint_interval = 3), not run per entry -- if it ran per entry,
-    -- rotate_calls would be non-empty before start_activated_session even
-    -- returns.
+    -- the rotation would be armed before start_activated_session even returns.
+    -- The hard ceiling is pushed out of reach so this scenario exercises ONLY
+    -- the idle gate (scenario 6b covers the ceiling).
     local _, _, buf = start_activated_session(fx, scratch, {
+      clock = fake_clock,
       checkpoint_interval = 3,
       rotate_bytes = 1,
+      rotate_hard_ceiling_bytes = math.huge,
+      rotate_idle_quiet_ms = 2000,
+      -- The real poll timer is pushed far out of the test's lifetime so the
+      -- quiet-window check happens ONLY when this test drives it via
+      -- _rotation_idle_tick against the injected clock. Determinism, not a
+      -- behavioural claim: production polls every ROTATE_IDLE_POLL_MS.
+      rotate_idle_poll_ms = 600000,
       on_rotate_needed = function(ended_id)
         table.insert(rotate_calls, ended_id)
       end,
@@ -451,23 +461,142 @@ describe("recording_session lifecycle integration (Plan 8 gate)", function()
     -- now, but that is fewer than 3 total on_entry calls, so the cadence
     -- branch has not run once yet -- no rotation check has happened despite
     -- bytes_appended() already exceeding rotate_bytes.
+    assert.is_false(scratch.session._rotation_armed())
     assert.equals(0, #rotate_calls)
 
-    -- The next appended entry is the 3rd on_entry call overall: cadence
-    -- fires, and the (already-crossed) byte check runs for the first time.
+    -- The next appended entry is the 3rd on_entry call overall: cadence fires,
+    -- the (already-crossed) byte check runs for the first time -- and ARMS.
+    -- Nothing rotates: a rotation mid-burst drops whatever is typed during the
+    -- predecessor's teardown, and a dropped edit across the seam makes
+    -- inter_session_external_change accuse the student (design §3.3).
     make_entry(buf)
-    local fired = vim.wait(500, function() return #rotate_calls > 0 end, 10)
-    assert.is_true(fired, "on_rotate_needed should have fired on the 3rd entry")
+    assert.is_true(scratch.session._rotation_armed())
+    vim.wait(50)
+    assert.equals(0, #rotate_calls, "arming must not rotate")
+
+    -- Still inside the quiet window -> still no rotation.
+    fake_clock.advance(1999)
+    scratch.session._rotation_idle_tick()
+    vim.wait(50)
+    assert.equals(0, #rotate_calls)
+
+    -- STILL TYPING: a doc.change pushes the quiet window out again, so even a
+    -- clock well past the interval does not rotate. This is the "never
+    -- mid-burst" property.
+    fake_clock.advance(5000)
+    make_entry(buf)
+    scratch.session._rotation_idle_tick()
+    vim.wait(50)
+    assert.equals(0, #rotate_calls, "a doc.change must reset the quiet window")
+
+    -- Quiet at last.
+    fake_clock.advance(2000)
+    scratch.session._rotation_idle_tick()
+    local fired = vim.wait(500, function()
+      return #rotate_calls > 0
+    end, 10)
+    assert.is_true(fired, "the rotation should fire after the quiet window elapses")
     assert.equals(1, #rotate_calls)
     assert.equals(scratch.session.session_id, rotate_calls[1])
 
-    -- `rotation_requested` latches: further entries (including further
-    -- cadence hits) must not fire it again.
+    -- `rotation_fired` latches: further entries, further cadence hits and
+    -- further ticks must not fire it again.
     for _ = 1, 6 do
       make_entry(buf)
     end
+    fake_clock.advance(10000)
+    scratch.session._rotation_idle_tick()
     vim.wait(100)
     assert.equals(1, #rotate_calls)
+  end)
+
+  it("scenario 6b: past the hard ceiling the rotation fires without ever seeing a quiet window", function()
+    local rotate_calls = {}
+    local fake_clock = core_clock.fixed(0, 0)
+    -- Both thresholds at 1 byte: the first cadence hit is already past the HARD
+    -- CEILING, so the idle gate is bypassed entirely. The clock is never
+    -- advanced and _rotation_idle_tick is never called, so if the rotation
+    -- fires it can only be the ceiling path. A session that types continuously
+    -- must not grow unbounded -- an unpushable repo is the worse outcome -- and
+    -- this is the one path on which an edit can still be lost.
+    local _, _, buf = start_activated_session(fx, scratch, {
+      clock = fake_clock,
+      checkpoint_interval = 3,
+      rotate_bytes = 1,
+      rotate_hard_ceiling_bytes = 1,
+      rotate_idle_quiet_ms = 2000,
+      on_rotate_needed = function(ended_id)
+        table.insert(rotate_calls, ended_id)
+      end,
+    })
+
+    assert.equals(0, #rotate_calls)
+    make_entry(buf)
+    local fired = vim.wait(500, function()
+      return #rotate_calls > 0
+    end, 10)
+    assert.is_true(fired, "the hard ceiling must rotate regardless of the quiet window")
+    assert.equals(1, #rotate_calls)
+    assert.equals(scratch.session.session_id, rotate_calls[1])
+    -- The ceiling fires directly; it never bothers arming the idle poller.
+    assert.is_false(scratch.session._rotation_armed())
+  end)
+
+  it("scenario 6c: skip_chain_recovery means the successor never touches the predecessor's log", function()
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    local manifest = activated_manifest(fx, workspace)
+
+    -- Proof BY CONSTRUCTION (design §5 item 6): a recovery seam that fails the
+    -- test if it is invoked at all. In this port recovery reads, parses and
+    -- chain-validates the whole predecessor log SYNCHRONOUSLY ON THE MAIN LOOP,
+    -- which at 40 MiB of pure-Lua JCS + SHA-256 freezes the editor -- precisely
+    -- while no wiring is attached and every keystroke is being dropped.
+    local recovery_calls = 0
+    scratch.session = recording_session.start({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = manifest,
+      clock = core_clock.fixed(0, 0),
+      prev_session_id = "predecessor-session-id",
+      skip_chain_recovery = true,
+      recover = function()
+        recovery_calls = recovery_calls + 1
+        error("chain recovery must not run on the rotation path")
+      end,
+    })
+    scratch.session.stop()
+
+    assert.equals(0, recovery_calls, "the rotation path must not run chain recovery")
+
+    -- The link is still recorded -- the successor was TOLD its predecessor's id,
+    -- which is exactly why recovery is pointless here.
+    local parsed = core_ndjson.parse_entries(read_all(scratch.session.slog_path))
+    assert.is_true(parsed.ok)
+    assert.equals("predecessor-session-id", parsed.value[1].data.prev_session_id)
+  end)
+
+  it("scenario 6d: without skip_chain_recovery an ordinary activation DOES run recovery (negative control for 6c)", function()
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    local manifest = activated_manifest(fx, workspace)
+
+    local recovery_calls = 0
+    scratch.session = recording_session.start({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = manifest,
+      clock = core_clock.fixed(0, 0),
+      recover = function()
+        recovery_calls = recovery_calls + 1
+        return { kind = "clean_start" }
+      end,
+    })
+    scratch.session.stop()
+
+    assert.equals(1, recovery_calls)
   end)
 
   it("scenario 7: end-to-end rotation -- the old session ends with reason 'rotate', the replacement links prev_session_id to its LOGICAL id, and both chains validate", function()
