@@ -168,6 +168,28 @@ describe("session_writer", function()
     assert.is_truthy(text:match("flushed%-on%-dispose"))
   end)
 
+  it("reports cumulative bytes across flushes", function()
+    local dir = new_tempdir()
+    local slog_path = dir .. "/session.slog"
+    local fake_clock = clock.fixed(0, 0)
+    local w = track(session_writer.open({ slog_path = slog_path, clock = fake_clock }))
+
+    local entry_a = make_entry(0, "one")
+    local entry_b = make_entry(1, "two")
+
+    assert.equals(0, w.bytes_appended())
+    w.append(entry_a)
+    local after_first = w.bytes_appended()
+    assert.is_true(after_first > 0)
+    w.flush()
+    -- A flush clears the buffer, never the cumulative total.
+    assert.equals(after_first, w.bytes_appended())
+    w.append(entry_b)
+    assert.is_true(w.bytes_appended() > after_first)
+    w.dispose()
+    assert.equals(vim.loop.fs_stat(slog_path).size, w.bytes_appended())
+  end)
+
   it("dispose is idempotent", function()
     local dir = new_tempdir()
     local slog_path = dir .. "/session.slog"

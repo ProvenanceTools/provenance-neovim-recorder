@@ -430,4 +430,363 @@ describe("recording_session lifecycle integration (Plan 8 gate)", function()
       assert.is_not_nil(st, ".slog is created empty at session start")
       assert.equals(0, st.size, "nothing has been flushed yet")
   end)
+
+  it("scenario 6: crossing the size threshold ARMS the rotation on the checkpoint-cadence branch but does not rotate, and it fires only after a quiet window, exactly once, naming the ended session's own id", function()
+    local rotate_calls = {}
+    local fake_clock = core_clock.fixed(0, 0)
+    -- rotate_bytes = 1: any real entry (session.start alone is already far
+    -- more than one byte) crosses the threshold immediately. This isolates
+    -- exactly the property under test: the check is gated by cadence
+    -- (checkpoint_interval = 3), not run per entry -- if it ran per entry,
+    -- the rotation would be armed before start_activated_session even returns.
+    -- The hard ceiling is pushed out of reach so this scenario exercises ONLY
+    -- the idle gate (scenario 6b covers the ceiling).
+    local _, _, buf = start_activated_session(fx, scratch, {
+      clock = fake_clock,
+      checkpoint_interval = 3,
+      rotate_bytes = 1,
+      rotate_hard_ceiling_bytes = math.huge,
+      rotate_idle_quiet_ms = 2000,
+      -- The real poll timer is pushed far out of the test's lifetime so the
+      -- quiet-window check happens ONLY when this test drives it via
+      -- _rotation_idle_tick against the injected clock. Determinism, not a
+      -- behavioural claim: production polls every ROTATE_IDLE_POLL_MS.
+      rotate_idle_poll_ms = 600000,
+      on_rotate_needed = function(ended_id)
+        table.insert(rotate_calls, ended_id)
+      end,
+    })
+
+    -- session.start + the catch-up/open pass for `buf` are on the log by
+    -- now, but that is fewer than 3 total on_entry calls, so the cadence
+    -- branch has not run once yet -- no rotation check has happened despite
+    -- bytes_appended() already exceeding rotate_bytes.
+    assert.is_false(scratch.session._rotation_armed())
+    assert.equals(0, #rotate_calls)
+
+    -- The next appended entry is the 3rd on_entry call overall: cadence fires,
+    -- the (already-crossed) byte check runs for the first time -- and ARMS.
+    -- Nothing rotates: a rotation mid-burst drops whatever is typed during the
+    -- predecessor's teardown, and a dropped edit across the seam makes
+    -- inter_session_external_change accuse the student (design §3.3).
+    make_entry(buf)
+    assert.is_true(scratch.session._rotation_armed())
+    vim.wait(50)
+    assert.equals(0, #rotate_calls, "arming must not rotate")
+
+    -- Still inside the quiet window -> still no rotation.
+    fake_clock.advance(1999)
+    scratch.session._rotation_idle_tick()
+    vim.wait(50)
+    assert.equals(0, #rotate_calls)
+
+    -- STILL TYPING: a doc.change pushes the quiet window out again, so even a
+    -- clock well past the interval does not rotate. This is the "never
+    -- mid-burst" property.
+    fake_clock.advance(5000)
+    make_entry(buf)
+    scratch.session._rotation_idle_tick()
+    vim.wait(50)
+    assert.equals(0, #rotate_calls, "a doc.change must reset the quiet window")
+
+    -- Quiet at last.
+    fake_clock.advance(2000)
+    scratch.session._rotation_idle_tick()
+    local fired = vim.wait(500, function()
+      return #rotate_calls > 0
+    end, 10)
+    assert.is_true(fired, "the rotation should fire after the quiet window elapses")
+    assert.equals(1, #rotate_calls)
+    assert.equals(scratch.session.session_id, rotate_calls[1])
+
+    -- `rotation_fired` latches: further entries, further cadence hits and
+    -- further ticks must not fire it again.
+    for _ = 1, 6 do
+      make_entry(buf)
+    end
+    fake_clock.advance(10000)
+    scratch.session._rotation_idle_tick()
+    vim.wait(100)
+    assert.equals(1, #rotate_calls)
+  end)
+
+  it("scenario 6b: past the hard ceiling the rotation fires without ever seeing a quiet window", function()
+    local rotate_calls = {}
+    local fake_clock = core_clock.fixed(0, 0)
+    -- Both thresholds at 1 byte: the first cadence hit is already past the HARD
+    -- CEILING, so the idle gate is bypassed entirely. The clock is never
+    -- advanced and _rotation_idle_tick is never called, so if the rotation
+    -- fires it can only be the ceiling path. A session that types continuously
+    -- must not grow unbounded -- an unpushable repo is the worse outcome -- and
+    -- this is the one path on which an edit can still be lost.
+    local _, _, buf = start_activated_session(fx, scratch, {
+      clock = fake_clock,
+      checkpoint_interval = 3,
+      rotate_bytes = 1,
+      rotate_hard_ceiling_bytes = 1,
+      rotate_idle_quiet_ms = 2000,
+      on_rotate_needed = function(ended_id)
+        table.insert(rotate_calls, ended_id)
+      end,
+    })
+
+    assert.equals(0, #rotate_calls)
+    make_entry(buf)
+    local fired = vim.wait(500, function()
+      return #rotate_calls > 0
+    end, 10)
+    assert.is_true(fired, "the hard ceiling must rotate regardless of the quiet window")
+    assert.equals(1, #rotate_calls)
+    assert.equals(scratch.session.session_id, rotate_calls[1])
+    -- The ceiling fires directly; it never bothers arming the idle poller.
+    assert.is_false(scratch.session._rotation_armed())
+  end)
+
+  it("scenario 6c: skip_chain_recovery means the successor never touches the predecessor's log", function()
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    local manifest = activated_manifest(fx, workspace)
+
+    -- Proof BY CONSTRUCTION (design §5 item 6): a recovery seam that fails the
+    -- test if it is invoked at all. In this port recovery reads, parses and
+    -- chain-validates the whole predecessor log SYNCHRONOUSLY ON THE MAIN LOOP,
+    -- which at 40 MiB of pure-Lua JCS + SHA-256 freezes the editor -- precisely
+    -- while no wiring is attached and every keystroke is being dropped.
+    local recovery_calls = 0
+    scratch.session = recording_session.start({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = manifest,
+      clock = core_clock.fixed(0, 0),
+      prev_session_id = "predecessor-session-id",
+      skip_chain_recovery = true,
+      recover = function()
+        recovery_calls = recovery_calls + 1
+        error("chain recovery must not run on the rotation path")
+      end,
+    })
+    scratch.session.stop()
+
+    assert.equals(0, recovery_calls, "the rotation path must not run chain recovery")
+
+    -- The link is still recorded -- the successor was TOLD its predecessor's id,
+    -- which is exactly why recovery is pointless here.
+    local parsed = core_ndjson.parse_entries(read_all(scratch.session.slog_path))
+    assert.is_true(parsed.ok)
+    assert.equals("predecessor-session-id", parsed.value[1].data.prev_session_id)
+  end)
+
+  it("scenario 6d: without skip_chain_recovery an ordinary activation DOES run recovery (negative control for 6c)", function()
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    local manifest = activated_manifest(fx, workspace)
+
+    local recovery_calls = 0
+    scratch.session = recording_session.start({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = manifest,
+      clock = core_clock.fixed(0, 0),
+      recover = function()
+        recovery_calls = recovery_calls + 1
+        return { kind = "clean_start" }
+      end,
+    })
+    scratch.session.stop()
+
+    assert.equals(1, recovery_calls)
+  end)
+
+  it("scenario 6e: EVERY content-mutating event defers an armed rotation -- fs.external_change and paste, not just doc.change -- while a non-content event does not", function()
+    local rotate_calls = {}
+    local fake_clock = core_clock.fixed(0, 0)
+    local _, _, buf = start_activated_session(fx, scratch, {
+      clock = fake_clock,
+      checkpoint_interval = 3,
+      rotate_bytes = 1,
+      rotate_hard_ceiling_bytes = math.huge,
+      rotate_idle_quiet_ms = 2000,
+      -- As in scenario 6: the real poller is pushed past this test's lifetime so
+      -- the quiet-window check happens only when the test drives it.
+      rotate_idle_poll_ms = 600000,
+      on_rotate_needed = function(ended_id)
+        table.insert(rotate_calls, ended_id)
+      end,
+    })
+
+    -- Arm on the 3rd on_entry call, exactly as scenario 6 does.
+    make_entry(buf)
+    assert.is_true(scratch.session._rotation_armed())
+
+    fake_clock.advance(1999)
+    scratch.session._rotation_idle_tick()
+    -- fire_rotation hands off via vim.schedule, so the loop MUST be pumped
+    -- before concluding that nothing fired -- otherwise the assertion passes
+    -- vacuously and the test pins nothing.
+    vim.wait(50)
+    assert.equals(0, #rotate_calls)
+
+    -- THE CASE THIS SCENARIO EXISTS FOR. An external write -- formatter-on-save,
+    -- `git checkout`, a partner's write -- landing inside the teardown window is
+    -- dropped exactly as a keystroke would be, and diverges the seam the same
+    -- way. Worse, in fact: a whole-file rewrite clears
+    -- highSeverityCharsChanged, so the false inter_session_external_change is
+    -- reported at HIGH severity. Emitted through the session's own host, the
+    -- same chokepoint the external-change coordinator uses in production.
+    scratch.session._host.emit("fs.external_change", {
+      path = "foo.txt",
+      direction = "disk_ahead",
+      expected_sha256 = string.rep("a", 64),
+      actual_sha256 = string.rep("b", 64),
+    })
+    fake_clock.advance(1999)
+    scratch.session._rotation_idle_tick()
+    vim.wait(50)
+    assert.equals(
+      0,
+      #rotate_calls,
+      "fs.external_change must reset the quiet window (3998ms have now elapsed since arming, well past 2000)"
+    )
+
+    -- A paste does too.
+    scratch.session._host.emit("paste", { path = "foo.txt", chars = 120 })
+    fake_clock.advance(1999)
+    scratch.session._rotation_idle_tick()
+    vim.wait(50)
+    assert.equals(0, #rotate_calls, "paste must reset the quiet window")
+
+    -- A heartbeat does NOT: it mutates no file, so losing one across the seam
+    -- cannot make the two sides differ -- and if it reset the window, a
+    -- genuinely idle session could never rotate at all.
+    scratch.session._host.emit("session.heartbeat", {
+      focused = true,
+      active_file = core_json.NULL,
+      idle_since_ms = 0,
+    })
+    fake_clock.advance(1)
+    scratch.session._rotation_idle_tick()
+    local fired = vim.wait(500, function()
+      return #rotate_calls > 0
+    end, 10)
+    assert.is_true(fired, "a non-content event must not defer the rotation")
+    assert.equals(1, #rotate_calls)
+    assert.equals(scratch.session.session_id, rotate_calls[1])
+  end)
+
+  it("scenario 6f: a session that degrades AFTER arming never rotates -- the idle poll is a second trigger and must be gated too", function()
+    local rotate_calls = {}
+    local fake_clock = core_clock.fixed(0, 0)
+    local _, _, buf = start_activated_session(fx, scratch, {
+      clock = fake_clock,
+      checkpoint_interval = 3,
+      rotate_bytes = 1,
+      rotate_hard_ceiling_bytes = math.huge,
+      rotate_idle_quiet_ms = 2000,
+      rotate_idle_poll_ms = 600000,
+      -- Silence the degraded notification; scenario 4 already pins it.
+      notify = function() end,
+      on_rotate_needed = function(ended_id)
+        table.insert(rotate_calls, ended_id)
+      end,
+    })
+
+    -- Arm on the cadence branch, while the session is still healthy. "A degraded
+    -- session never rotates" was argued from on_entry's degraded branch
+    -- returning before the cadence branch -- but that only ever covered the
+    -- ENTRY path, and the poll timer is a SECOND, INDEPENDENT trigger.
+    make_entry(buf)
+    assert.is_true(scratch.session._rotation_armed())
+    assert.is_false(scratch.session.is_degraded())
+
+    -- The disk fills. Degraded is a ONE-WAY state.
+    scratch.session._simulate_write_error("ENOSPC")
+    assert.is_true(scratch.session.is_degraded())
+
+    -- The student pauses to read the error notification -- which is exactly the
+    -- quiet window the gate is waiting for, with the byte counter frozen at or
+    -- above the threshold. Before the guard, the tick fired here: the
+    -- predecessor would be stopped and its rolling seal would claim final = true
+    -- over a `.slog` whose own session.end was never written (degraded diverts
+    -- entries to the in-memory critical ring), and the successor would start
+    -- recording onto a disk that is still full.
+    fake_clock.advance(5000)
+    scratch.session._rotation_idle_tick()
+    -- Pumped before asserting the negative: fire_rotation hands off via
+    -- vim.schedule, so an unpumped assertion passes vacuously (see 6e).
+    vim.wait(100)
+    assert.equals(0, #rotate_calls, "a degraded session must not rotate, via the poll path either")
+
+    -- Still true however long it stays quiet: abandoned, not merely deferred.
+    fake_clock.advance(60000)
+    scratch.session._rotation_idle_tick()
+    vim.wait(100)
+    assert.equals(0, #rotate_calls)
+  end)
+
+  it("scenario 7: end-to-end rotation -- the old session ends with reason 'rotate', the replacement links prev_session_id to its LOGICAL id, and both chains validate", function()
+    local workspace = scratch.workspace()
+    local provenance_dir = workspace .. "/.provenance"
+    vim.fn.mkdir(provenance_dir, "p")
+    local manifest = activated_manifest(fx, workspace)
+
+    local path = workspace .. "/foo.txt"
+    scratch.write_file(path, "line0\n")
+
+    scratch.session = recording_session.start({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = manifest,
+      clock = core_clock.fixed(0, 0),
+    })
+    local buf = scratch.edit(path)
+    make_entry(buf)
+
+    local ended_id = scratch.session.session_id
+    local first_slog_path = scratch.session.slog_path
+
+    -- Stop-then-start (never the reverse): the replacement is only started
+    -- below, after the first session's autocmds have fully detached.
+    scratch.session.stop("rotate")
+
+    local first_parsed = core_ndjson.parse_entries(read_all(first_slog_path))
+    assert.is_true(first_parsed.ok)
+    assert.is_true(core_chain_validator.validate_chain(first_parsed.value).ok)
+    local last_entry = first_parsed.value[#first_parsed.value]
+    assert.equals("session.end", last_entry.kind)
+    assert.equals("rotate", last_entry.data.reason)
+
+    -- The replacement, in the SAME provenance_dir, with prev_session_id set
+    -- to the ended session's LOGICAL session_id (two-uuid rule) -- never the
+    -- `.slog` filename uuid.
+    scratch.session = recording_session.start({
+      workspace = workspace,
+      provenance_dir = provenance_dir,
+      manifest = manifest,
+      clock = core_clock.fixed(0, 0),
+      prev_session_id = ended_id,
+    })
+    -- Force the buffered session.start (+ catch-up doc.open) onto disk
+    -- before reading it back; stop() is idempotent and teardown() will
+    -- no-op on it.
+    scratch.session.stop()
+
+    local second_parsed = core_ndjson.parse_entries(read_all(scratch.session.slog_path))
+    assert.is_true(second_parsed.ok)
+    assert.is_true(core_chain_validator.validate_chain(second_parsed.value).ok)
+    assert.equals("session.start", second_parsed.value[1].kind)
+    assert.equals(ended_id, second_parsed.value[1].data.prev_session_id)
+
+    -- The replacement's own catch-up pass re-baselines the still-open
+    -- buffer with its own doc.open (§3.3 buffer-sourced baselines) --
+    -- distinct from, and in addition to, the first session's doc.open.
+    local has_doc_open = false
+    for _, e in ipairs(second_parsed.value) do
+      if e.kind == "doc.open" then
+        has_doc_open = true
+      end
+    end
+    assert.is_true(has_doc_open, "the replacement session must emit its own doc.open for the open buffer")
+  end)
 end)

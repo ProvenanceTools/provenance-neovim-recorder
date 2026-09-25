@@ -60,6 +60,82 @@ local degraded_notifier = require("provenance.recorder.failure.degraded_notifier
 
 local M = {}
 
+--- Rotate a session once its `.slog` passes this size (PRD §4.6).
+---
+--- `submission = "git"` assignments commit `.provenance/` to a GitHub repo, and
+--- GitHub warns at 50 MB and refuses a push containing a file over 100 MB.
+local ROTATE_BYTES = 40 * 1024 * 1024
+
+--- Quiet interval a session must go without recording any CONTENT-MUTATING
+--- event before an ARMED rotation actually fires (design §3.3 mechanism 1).
+---
+--- WHY THIS EXISTS AT ALL. Rotation is stop-then-start, so any content change
+--- landing inside the predecessor's teardown window is DROPPED — and a dropped
+--- change is NOT invisible to the analyzer. `inter_session_external_change`
+--- compares the predecessor's side as a RECONSTRUCTION FROM ITS EVENT STREAM
+--- against the successor's first `doc.open.content`, which is a LIVE BUFFER
+--- READ, by exact string equality. A character typed during teardown is present
+--- in the successor's baseline and absent from the predecessor's reconstruction,
+--- the two differ, and the heuristic reports at confidence 0.85 that the student
+--- edited that file OUTSIDE the recorder. This system produces evidence for
+--- academic-integrity cases, so that false accusation is the most expensive
+--- defect available here. Waiting for a quiet window makes "nothing changed
+--- during teardown" a property of WHEN we rotate rather than a hope about how
+--- fast teardown is. Students pause constantly, so in practice it costs nothing.
+local ROTATE_IDLE_QUIET_MS = 2000
+
+--- The event kinds whose arrival resets that quiet window.
+---
+--- WHY THESE THREE AND NOT OTHERS. They are exactly the kinds that change FILE
+--- CONTENT, and file content is all the seam comparison is about: the heuristic
+--- compares the predecessor's reconstruction against the successor's baseline
+--- and does not care which event moved the bytes. So a `paste`, or an
+--- `fs.external_change` from a formatter-on-save, a `git checkout` or a
+--- partner's write, dropped inside the teardown window diverges the seam exactly
+--- as a keystroke does. It is in fact WORSE: an external write is typically a
+--- whole-file rewrite, so the delta clears `highSeverityCharsChanged` and the
+--- false flag is reported at HIGH severity rather than medium. Quieting only the
+--- keyboard would leave unguarded precisely the event class the flag is named
+--- after. External writes are rare, so resetting on them costs nothing.
+---
+--- Everything else is deliberately absent. `session.heartbeat`, `focus.change`,
+--- `selection.change`, `ext.*`, `git.*`, `term.*`, `clock.skew` and
+--- `paste.anomaly` mutate no file, so losing one across the seam cannot make the
+--- two sides differ — and letting a 30-second heartbeat reset the window would
+--- mean an idle session never rotates at all, which is the exact opposite of the
+--- intent. `doc.open` is absent for the same reason: it REPORTS content, it does
+--- not change it.
+local ROTATE_QUIET_RESET_KINDS = {
+  ["doc.change"] = true,
+  ["paste"] = true,
+  ["fs.external_change"] = true,
+}
+
+--- How often the armed-rotation poller re-checks the quiet window. Deliberately
+--- coarse and on a background timer: nothing about rotation is latency
+--- sensitive, and the check must stay off the edit firehose.
+local ROTATE_IDLE_POLL_MS = 250
+
+--- Rotate REGARDLESS of the quiet window once the `.slog` reaches this size
+--- (design §3.3 "Hard ceiling"). A student typing continuously may never
+--- produce a 2 s gap, and a session that grows without limit ends in a repo
+--- that cannot be pushed at all — the worse outcome.
+---
+--- Stated honestly: this is the only path on which a rotation can lose a
+--- KEYSTROKE, and it is reachable only by 8 MiB of recorded events containing no
+--- 2-second pause anywhere. The quiet gate makes the keyboard safe and nothing
+--- else: it cannot make an external writer safe, because a formatter daemon, a
+--- build tool, or a partner's `git pull` is not synchronised to the student's
+--- pause. An `fs.external_change` landing inside any teardown window is dropped
+--- and produces the false `inter_session_external_change` described above — at
+--- HIGH severity, since an external write rewrites a whole file. The gate even
+--- concentrates rotations into the moments the student is idle, which is when
+--- background repo activity is most likely. Skipping chain recovery on the
+--- rotation path (`skip_chain_recovery`) shrinks the teardown window to a flush
+--- plus a seal, so the residual is small — but it is not zero, and nothing here
+--- pretends otherwise.
+local ROTATE_HARD_CEILING_BYTES = 48 * 1024 * 1024
+
 --- Generate a UUID v4 (RFC 4122) from 16 random bytes, lowercase hex,
 --- version nibble forced to 4, variant bits forced to 10xx. Deliberately
 --- duplicated from recorder_context's private uuid generator (not exported
@@ -130,6 +206,22 @@ end
 ---     overridden above); "previous_session_corrupt" additionally emits
 ---     recorder.recovered_from_corruption as the entry right after
 ---     session.start. clean_start/complete do neither.
+---   skip_chain_recovery: boolean|nil -- do not run chain recovery at all. Set by the
+---     ROTATION path only (registry.rotate_session), which already knows its
+---     predecessor's id and passes it as prev_session_id. Recovery there would read,
+---     parse and validate_chain the whole ~40 MiB predecessor log SYNCHRONOUSLY ON THE
+---     MAIN LOOP — pure-Lua JCS canonicalization over ~150k entries — freezing the
+---     editor while no wiring is attached. It is the largest term in the teardown
+---     window by orders of magnitude and, on a rotation, pure waste (design §3.3
+---     mechanism 2). When true, `recover` is never called at all.
+---   rotate_bytes: number|nil -- ARM rotation once the .slog passes this size; default ROTATE_BYTES
+---   rotate_hard_ceiling_bytes: number|nil -- rotate even without a quiet window past
+---     this size; default ROTATE_HARD_CEILING_BYTES
+---   rotate_idle_quiet_ms: number|nil -- quiet interval an armed rotation waits for;
+---     default ROTATE_IDLE_QUIET_MS
+---   rotate_idle_poll_ms: number|nil -- armed-rotation poll interval; default ROTATE_IDLE_POLL_MS
+---   on_rotate_needed: fun(ended_session_id: string)|nil -- called at most once, when a
+---     rotation actually fires (not when it is merely armed)
 --- }
 --- @return table session {
 ---   session_id, slog_path, meta_path, public_key_hex,
@@ -142,6 +234,18 @@ function M.start(opts)
   local manifest = opts.manifest
   local clock = opts.clock
   local checkpoint_interval = opts.checkpoint_interval or 100
+  local rotate_bytes = opts.rotate_bytes or ROTATE_BYTES
+  local rotate_hard_ceiling_bytes = opts.rotate_hard_ceiling_bytes or ROTATE_HARD_CEILING_BYTES
+  local rotate_idle_quiet_ms = opts.rotate_idle_quiet_ms or ROTATE_IDLE_QUIET_MS
+  local rotate_idle_poll_ms = opts.rotate_idle_poll_ms or ROTATE_IDLE_POLL_MS
+  local on_rotate_needed = opts.on_rotate_needed
+  -- Rotation state (design §3.2/§3.3). ARMED = the size threshold has been
+  -- crossed and we are waiting for a quiet window; FIRED = on_rotate_needed has
+  -- been handed off (latched, so at most one rotation per session).
+  local rotation_armed = false
+  local rotation_fired = false
+  local last_change_ms = 0
+  local rotate_poll_timer = nil
 
   -- Plan 9 CAPSTONE seam: when false/absent (the default), recording_session
   -- behaves EXACTLY as it did pre-Plan-9 (the lean core used by focused specs
@@ -265,7 +369,18 @@ function M.start(opts)
 
   local recover = opts.recover
   local recovery
-  if recover then
+  if opts.skip_chain_recovery then
+    -- ROTATION PATH (design §3.3 mechanism 2). The caller already knows the
+    -- predecessor's id and passed it as prev_session_id, so there is nothing to
+    -- recover — and recovery here would read + parse + validate_chain the whole
+    -- ~40 MiB predecessor log on the main loop, freezing the editor for seconds
+    -- while NO wiring is attached, i.e. while every keystroke is being dropped.
+    -- Dropped keystrokes across a rotation seam make the analyzer accuse the
+    -- student of editing outside the recorder, so this is not an optimization.
+    -- Note `recover` is deliberately NOT consulted either: the tests prove the
+    -- skip by construction with a `recover` seam that fails if it is invoked.
+    recovery = { kind = "rotation_no_recovery" }
+  elseif recover then
     recovery = recover(own_student_ref)
   else
     local deps = uv_recovery_deps.new(provenance_dir, own_student_ref)
@@ -554,6 +669,105 @@ function M.start(opts)
   -- writer.append, so no new write is attempted and on_error cannot fire
   -- again. The idempotent handler plus the degraded flag routing away from
   -- the writer together rule out any recursion/infinite loop.
+  -- 6b. Size-rotation arm/fire machinery (design §3.2/§3.3). Three pieces:
+  -- `arm_rotation` (threshold crossed, start waiting for quiet),
+  -- `rotation_idle_tick` (has the quiet window elapsed?) and `fire_rotation`
+  -- (hand off to the registry, once). None of them does I/O; the actual
+  -- stop-then-start lives in registry.rotate_session, reached via the
+  -- vim.schedule'd callback so no teardown ever runs inside on_bytes.
+  local function stop_rotation_poll()
+    local timer = rotate_poll_timer
+    rotate_poll_timer = nil
+    if timer then
+      pcall(function()
+        timer:stop()
+        timer:close()
+      end)
+    end
+  end
+
+  --- THE point of commit for a rotation. Every trigger goes through here, which
+  --- is why the degraded check lives here rather than at either call site.
+  ---
+  --- "A degraded session never rotates" used to be argued structurally, from the
+  --- fact that `on_entry`'s degraded branch returns before the cadence branch.
+  --- That argument only ever covered the ENTRY path. The idle poll timer is a
+  --- SECOND, INDEPENDENT trigger and it bypassed the argument entirely:
+  --- `arm_rotation` runs on the entry path (so, not degraded), the disk then
+  --- fills and the session degrades — a ONE-WAY state, see disk_full_handler —
+  --- the student pauses to read the error notification, and that pause is
+  --- exactly the quiet window the gate is waiting for. The byte counter is
+  --- frozen at or above the threshold, so the tick would fire.
+  ---
+  --- What that costs is not untidiness. Rotating stops the predecessor, whose
+  --- teardown rolls a seal claiming `final = true` — a WHOLE-FILE commitment —
+  --- while the `session.end` it claims to cover was never written: in degraded
+  --- mode entries are diverted to the in-memory critical ring, so `session.end`
+  --- is RETAINED but never reaches the `.slog`. A bundle sealed final over a log
+  --- missing its own terminal entry is an evidence-integrity problem. And the
+  --- successor would start recording onto a disk that is still full.
+  ---
+  --- Abandoned, not deferred: degraded is one-way within a session, so there is
+  --- no later moment at which this rotation becomes legitimate. The poll timer is
+  --- stopped and `rotation_armed` is left set, so nothing re-arms either. The log
+  --- may then exceed ROTATE_BYTES, which is the correct trade — a degraded
+  --- session has already stopped recording most events, so it is barely growing,
+  --- and an oversized log is recoverable where a falsely-final seal is not.
+  local function fire_rotation()
+    if rotation_fired then
+      return
+    end
+    if is_degraded() then
+      stop_rotation_poll()
+      return
+    end
+    rotation_fired = true
+    stop_rotation_poll()
+    if on_rotate_needed then
+      -- The LOGICAL session_id (two-uuid rule), never the `.slog` filename uuid.
+      -- The registry uses it both as the successor's prev_session_id and as the
+      -- staleness check: if the live session for that root is no longer this
+      -- one, the rotation is abandoned rather than applied to a stranger.
+      local ended_id = context.session_id
+      vim.schedule(function()
+        on_rotate_needed(ended_id)
+      end)
+    end
+  end
+
+  --- Has the armed session been quiet long enough to rotate? Runs on the poll
+  --- timer (and is exposed as a test seam), never on the edit path.
+  local function rotation_idle_tick()
+    if rotation_fired or not rotation_armed then
+      return
+    end
+    if clock.now() - last_change_ms >= rotate_idle_quiet_ms then
+      fire_rotation()
+    end
+  end
+
+  local function arm_rotation()
+    if rotation_armed or rotation_fired then
+      return
+    end
+    rotation_armed = true
+    -- Pessimistic baseline: we do not know when the last doc.change was, so the
+    -- quiet window is measured from the moment of arming. Every subsequent
+    -- doc.change pushes it out again (see on_entry).
+    last_change_ms = clock.now()
+    local uv = vim.uv or vim.loop
+    rotate_poll_timer = uv.new_timer()
+    rotate_poll_timer:start(
+      rotate_idle_poll_ms,
+      rotate_idle_poll_ms,
+      vim.schedule_wrap(function()
+        pcall(rotation_idle_tick)
+      end)
+    )
+    -- A pending rotation poll must never keep Neovim from exiting.
+    rotate_poll_timer:unref()
+  end
+
   host = session_host.new({
     session_id = context.session_id,
     clock = clock,
@@ -566,8 +780,39 @@ function M.start(opts)
         disk_full.enqueue(entry)
       else
         writer.append(entry)
+
+        -- Idle tracking for an ARMED rotation (design §3.3). Gated on
+        -- `rotation_armed` FIRST so the firehose pays one boolean test per entry
+        -- for the whole session and the kind lookup plus clock read only inside
+        -- the brief window between crossing 40 MiB and rotating. The
+        -- quiet-window COMPARISON itself never runs here — it runs on the poll
+        -- timer (rotation_idle_tick).
+        --
+        -- Every CONTENT-MUTATING kind resets the window, not just `doc.change`:
+        -- see ROTATE_QUIET_RESET_KINDS for why the set is exactly those three.
+        if rotation_armed and not rotation_fired and ROTATE_QUIET_RESET_KINDS[entry.kind] then
+          last_change_ms = clock.now()
+        end
+
         if cadence.on_entry_appended() then
           scheduler.schedule(entry.seq, entry.hash)
+
+          -- Size rotation (PRD §4.6). Inside the cadence branch, so this costs one
+          -- comparison per 100 entries rather than one per keystroke — on_bytes is
+          -- the edit firehose. The degraded branch above returns first, so a
+          -- degraded session never rotates, which is required.
+          if not rotation_fired then
+            local appended = writer.bytes_appended()
+            if appended >= rotate_hard_ceiling_bytes then
+              -- Never saw a quiet window and we are out of headroom: rotate now,
+              -- accepting that an edit inside the teardown window can be lost.
+              fire_rotation()
+            elseif appended >= rotate_bytes then
+              -- ARM only. The rotation fires from the poll timer once the session
+              -- has been quiet for rotate_idle_quiet_ms — never mid-burst.
+              arm_rotation()
+            end
+          end
         end
       end
     end,
@@ -721,6 +966,13 @@ function M.start(opts)
     -- Test/inspection seam: why an identity was or was not emitted. Diagnostic
     -- only — nothing branches on it.
     _identity_outcome = identity_outcome,
+    -- Test seams for size rotation's idle gate (design §3.3): drive the
+    -- quiet-window check deterministically (with an injected clock) instead of
+    -- waiting on the real poll timer, and inspect whether a rotation is armed.
+    _rotation_idle_tick = rotation_idle_tick,
+    _rotation_armed = function()
+      return rotation_armed
+    end,
   }
 
   -- TEST SEAM (Plan 9): expose the signal sub-handles so the integration test
@@ -791,6 +1043,12 @@ function M.start(opts)
       return
     end
     stopped = true
+
+    -- The armed-rotation poller is a background libuv timer: stop it FIRST, so
+    -- a tick cannot fire a rotation for a session that is already tearing down
+    -- (a rotation must be abandoned when the scope is stopped, design §3.2.3),
+    -- and so no handle outlives the session.
+    stop_rotation_poll()
 
     -- FINAL peer-witness drain, BEFORE session.end so the observations land
     -- inside the session they belong to. Checkpoints fire every

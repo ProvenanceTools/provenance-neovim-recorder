@@ -18,17 +18,29 @@
 --- the per-editor-instance "what do we know about this root" map.
 local activation = require("provenance.recorder.activation")
 local enrollment_policy_gate = require("provenance.recorder.enrollment_policy_gate")
+local degraded_notifier = require("provenance.recorder.failure.degraded_notifier")
 
 local M = {}
 
---- @param opts table { start_recording: function(start_opts) -> controller }
+--- @param opts table {
+---   start_recording: function(start_opts) -> controller,
+---   notify: function(message)|nil  -- user-facing failure notification; defaults to
+---     degraded_notifier.notify (vim.notify at ERROR level), the same channel the
+---     disk-full/degraded path uses. A seam so tests can capture it.
+--- }
 --- @return table registry
 function M.new(opts)
   opts = opts or {}
   local start_recording = opts.start_recording
+  local notify = opts.notify or degraded_notifier.notify
 
   -- root -> { manifest, controller, provenance_dir }
   local sessions = {}
+
+  -- root -> true while reg.rotate_session(root) is in flight, guarding
+  -- against a re-entrant rotation for the same root (e.g. a second
+  -- on_rotate_needed firing before the first replacement session exists).
+  local rotating = {}
 
   -- Verified-root cache: root -> { digest, pubkey_override, result }.
   --
@@ -183,6 +195,17 @@ function M.new(opts)
       workspace = root,
       provenance_dir = provenance_dir,
       manifest = manifest,
+      -- The ended session's own LOGICAL session_id is threaded through rather
+      -- than discarded: rotate_session uses it BOTH as the successor's
+      -- prev_session_id and as a staleness check. The callback is vim.schedule'd
+      -- by recording_session, so a stop_all() + restart can land in between, and
+      -- rotating whichever session happens to be live for this root would rotate
+      -- an innocent brand-new one — a spurious extra seam, which under the
+      -- lossy-seam problem (design §3.3) is a spurious extra flag against the
+      -- student.
+      on_rotate_needed = function(ended_session_id)
+        reg.rotate_session(root, ended_session_id)
+      end,
     }, extra_opts or {})
 
     local ok, controller = pcall(start_recording, start_opts)
@@ -192,6 +215,78 @@ function M.new(opts)
 
     sessions[root] = { manifest = manifest, controller = controller, provenance_dir = provenance_dir }
     return controller, true
+  end
+
+  --- Rotate the session at `root`: stop it with reason "rotate" (which emits
+  --- `session.end` and takes the final rolling seal), then start a replacement
+  --- whose `prev_session_id` names the session that just ended.
+  ---
+  --- Stop-then-start, not the reverse: `doc_wiring.attach` is per-session and the
+  --- old session's autocmds are only detached during its stop, so starting first
+  --- would record one keystroke into two logs. The replacement's own catch-up pass
+  --- re-emits `doc.open` for every loaded buffer, so it gets its own baseline.
+  ---
+  --- STALENESS GUARD: when `expected_session_id` is given (production always
+  --- gives it), the rotation is abandoned unless the live session for `root` is
+  --- still the one that asked to rotate. The request is raised from inside
+  --- recording_session's entry path and delivered via vim.schedule, so a
+  --- `stop_all()` + restart — `:ProvenanceStop` then a BufEnter, a manifest
+  --- change, a reload — can land in between. Without the guard that sequence
+  --- rotates a brand-new session that never crossed any size threshold, costing
+  --- a gratuitous seam, and every seam is a chance to lose an edit and thereby
+  --- accuse the student (design §3.3).
+  ---
+  --- CHAIN RECOVERY IS SKIPPED for the successor: we already know the
+  --- predecessor's id, and recovery would read + chain-validate the whole ~40 MiB
+  --- predecessor log on the main loop while no wiring is attached. See
+  --- recording_session's `skip_chain_recovery` doc.
+  ---
+  --- FAILURE IS SURFACED, never silent. `ensure_session` reports a failed start
+  --- by RETURNING `nil, false, err` — it does not raise — so a pcall around it
+  --- stays `ok` and the old code notified nobody while leaving the root with no
+  --- session at all. The student would go on typing, unrecorded, with the
+  --- statusline indicator simply gone. Both return values are inspected here and
+  --- the failure goes out through the same degraded notification this port uses
+  --- for the disk-full path (PRD §4.8); `reg.is_active()` is already false for
+  --- this root, so the statusline segment clears itself.
+  --- @param root string
+  --- @param expected_session_id string|nil  the logical session_id of the session that
+  ---   requested the rotation; when non-nil and no longer live for `root`, no-op.
+  function reg.rotate_session(root, expected_session_id)
+    if rotating[root] then
+      return
+    end
+    rotating[root] = true
+    local start_err = nil
+    local ok, err = pcall(function()
+      local entry = sessions[root]
+      if entry == nil then
+        return
+      end
+      local ended_id = entry.controller.session_id
+      if expected_session_id ~= nil and ended_id ~= expected_session_id then
+        -- Not the session that asked: a stop+restart raced the scheduled
+        -- callback. The session that wanted to rotate is already gone and sealed.
+        return
+      end
+      pcall(entry.controller.stop, "rotate")
+      sessions[root] = nil
+      local _, _, e = reg.ensure_session(root, entry.manifest, {
+        prev_session_id = ended_id,
+        skip_chain_recovery = true,
+      })
+      start_err = e
+    end)
+    rotating[root] = nil
+    if not ok then
+      notify("Provenance: session rotation failed (recording has stopped for this assignment): " .. tostring(err))
+    elseif start_err ~= nil then
+      notify(
+        "Provenance: could not restart recording after rotating the log "
+          .. "(recording has stopped for this assignment): "
+          .. tostring(start_err)
+      )
+    end
   end
 
   --- Stop every registered session (pcall-guarded per entry, so one

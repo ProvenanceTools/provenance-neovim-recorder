@@ -45,6 +45,7 @@ function M.open(opts)
 
   local buf = {}
   local buffered_bytes = 0
+  local total_bytes = 0
   local last_flush_ms = clock.now()
   local disposed = false
 
@@ -113,6 +114,7 @@ function M.open(opts)
     local line = ndjson.serialize_entry(hashed)
     buf[#buf + 1] = line
     buffered_bytes = buffered_bytes + #line
+    total_bytes = total_bytes + #line
 
     if buffer_policy.should_flush({
       buffered_bytes = buffered_bytes,
@@ -123,6 +125,13 @@ function M.open(opts)
     }) then
       writer.flush()
     end
+  end
+
+  --- Total bytes appended over this writer's lifetime. Unlike `buffered_bytes`
+  --- a flush never resets it, so once flushed it equals the `.slog`'s size on
+  --- disk. Size rotation (PRD §4.6) reads it at checkpoint cadence.
+  function writer.bytes_appended()
+    return total_bytes
   end
 
   --- Create the `.slog` NOW, empty, rather than lazily on the first flush.
