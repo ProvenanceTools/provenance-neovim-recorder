@@ -50,7 +50,7 @@ recorder carries its own — **in pure Lua, with no native dependency**:
 This means the recorder runs anywhere Neovim runs — every OS, every student machine — with
 no libsodium to install, no FFI, no compiled sidecar. It is also fully auditable, which the
 recorder is required to be: the protocol is public and students are expected to read the
-source. Signing is infrequent (session start, periodic checkpoints, final seal), so the
+source. Signing is infrequent (session start, periodic checkpoints, a debounced reseal about a second after the last save, final seal), so the
 per-keystroke path only ever *hashes* — the rare, heavier signing work never touches the
 edit hot loop. Correctness is not taken on faith: the vendored crypto is proven against the
 same golden conformance vectors that pin the format.

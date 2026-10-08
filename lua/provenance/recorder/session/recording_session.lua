@@ -410,7 +410,8 @@ function M.start(opts)
   -- no seal step: the student pushes, the grader clones, nothing ever runs
   -- `:ProvenanceSeal`. So this session maintains a seal of its OWN log at
   -- `.provenance/manifest-<session_id>.json` + `.sig`, rewritten at three
-  -- points, so whatever is committed to git is always a valid seal of the state
+  -- points (session start, each checkpoint, final teardown) plus a debounced
+  -- reseal after saves (6a' below), so whatever is committed to git is always a valid seal of the state
   -- at that moment. See core/rolling_manifest.lua for the design and
   -- io/rolling_seal_writer.lua for the write side.
   --
@@ -489,6 +490,79 @@ function M.start(opts)
     end
   end
 
+  -- 6a'. RESEAL-ON-SAVE (write point 4, a trailing debounce). A student saves
+  -- and then `git add`/`git commit`s with the editor still open, so a seal that
+  -- moves only on the checkpoint cadence records each file's hash from BEFORE
+  -- their last save(s). After a `doc.save` is chained, a roll is therefore
+  -- scheduled `reseal_debounce_ms` after the LAST save of a burst: at most one
+  -- is pending, and every further save re-arms it.
+  --
+  -- The roll first drains the checkpoint scheduler and flushes the writer, so
+  -- the seal's slog prefix digest covers the doc.save that triggered it (the
+  -- seal hashes the `.slog` as it stands on disk, and a buffered entry is not
+  -- on disk yet). NOT final: the log keeps growing. Rolls run synchronously on
+  -- the main loop, so this can never overlap another roll; `stop()` cancels the
+  -- pending timer BEFORE its final roll, which stays the last write.
+  local reseal_debounce_ms = opts.reseal_debounce_ms or 1000
+  -- Injectable timer seam: set_timer(ms, cb) -> cancel(). Default is an
+  -- unref'd libuv timer (never keeps headless Neovim alive).
+  local set_timer = opts.set_timer
+    or function(ms, cb)
+      local uv = vim.uv or vim.loop
+      local timer = uv.new_timer()
+      local closed = false
+      timer:start(
+        ms,
+        0,
+        vim.schedule_wrap(function()
+          if closed then
+            return
+          end
+          closed = true
+          timer:stop()
+          timer:close()
+          cb()
+        end)
+      )
+      timer:unref()
+      return function()
+        if not closed then
+          closed = true
+          timer:stop()
+          timer:close()
+        end
+      end
+    end
+  local stopped = false -- set by stop(); declared here so the reseal timer can see it
+  local cancel_reseal = nil
+  local scheduler -- assigned in step 6b; the reseal callback runs after that
+
+  local function cancel_pending_reseal()
+    if cancel_reseal then
+      local c = cancel_reseal
+      cancel_reseal = nil
+      pcall(c)
+    end
+  end
+
+  local function schedule_reseal()
+    if not rolling_seal_enabled or stopped then
+      return
+    end
+    cancel_pending_reseal()
+    local armed
+    armed = set_timer(reseal_debounce_ms, function()
+      if cancel_reseal ~= armed or stopped then
+        return
+      end
+      cancel_reseal = nil
+      pcall(scheduler.drain)
+      pcall(writer.flush)
+      roll_rolling_seal()
+    end)
+    cancel_reseal = armed
+  end
+
   -- 6b. Checkpoint cadence + async scheduler (Plan 8). Every
   -- `checkpoint_interval`-th appended entry, a signed seq->hash checkpoint
   -- is scheduled: signing/persisting is deferred off the on_lines hot path
@@ -504,7 +578,7 @@ function M.start(opts)
   -- after the first checkpoint, `checkpoint_interval` entries away.
 
   local cadence = checkpoint_cadence.new(checkpoint_interval)
-  local scheduler = checkpoint_scheduler.new({
+  scheduler = checkpoint_scheduler.new({
     sign = function(seq, hash)
       return core_checkpoint.sign(seq, hash, keypair.private_key)
     end,
@@ -568,6 +642,9 @@ function M.start(opts)
         writer.append(entry)
         if cadence.on_entry_appended() then
           scheduler.schedule(entry.seq, entry.hash)
+        end
+        if entry.kind == "doc.save" then
+          schedule_reseal()
         end
       end
     end,
@@ -687,8 +764,6 @@ function M.start(opts)
     interval_ms = policy.heartbeat_interval_ms,
   })
 
-  local stopped = false
-
   local session = {
     session_id = context.session_id,
     slog_path = slog_path,
@@ -791,6 +866,8 @@ function M.start(opts)
       return
     end
     stopped = true
+    -- No deferred reseal may run after (or race) the final roll below.
+    cancel_pending_reseal()
 
     -- FINAL peer-witness drain, BEFORE session.end so the observations land
     -- inside the session they belong to. Checkpoints fire every

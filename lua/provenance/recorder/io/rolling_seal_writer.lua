@@ -4,7 +4,7 @@
 --- A git-submitted assignment has no seal step: the student pushes, the grader
 --- clones, nothing ever runs `:ProvenanceSeal`. So the seal has to move off the
 --- submission event and onto the recording itself. This module rewrites, on
---- every checkpoint,
+--- every checkpoint (and, debounced, about a second after the last `doc.save`),
 ---
 ---   .provenance/manifest-<session_id>.json   BundleManifest at format_version 1.2
 ---   .provenance/manifest-<session_id>.sig    ed25519 over the canonical JSON
