@@ -415,4 +415,137 @@ describe("recording_session rolling seal wiring", function()
     -- Recording itself is intact.
     assert.is_not_nil(string.find(read_all(scratch.session.slog_path), "session.end", 1, true))
   end)
+
+  -- --- write point 4: debounced reseal after a save ---------------------------
+
+  describe("reseal on save", function()
+    local rolling_seal_writer = require("provenance.recorder.io.rolling_seal_writer")
+    local orig_write, calls, timers, cancelled
+
+    -- Deterministic timer seam: nothing fires until the test says so.
+    local function fake_set_timer(ms, cb)
+      local t = { ms = ms, cb = cb, live = true }
+      timers[#timers + 1] = t
+      return function()
+        if t.live then
+          t.live = false
+          cancelled = cancelled + 1
+        end
+      end
+    end
+
+    local function fire_last()
+      local t = timers[#timers]
+      assert.is_true(t.live, "timer was cancelled")
+      t.live = false
+      t.cb()
+    end
+
+    local function live_timers()
+      local n = 0
+      for _, t in ipairs(timers) do
+        if t.live then
+          n = n + 1
+        end
+      end
+      return n
+    end
+
+    before_each(function()
+      calls, timers, cancelled = {}, {}, 0
+      orig_write = rolling_seal_writer.write_rolling_seal
+      rolling_seal_writer.write_rolling_seal = function(o)
+        calls[#calls + 1] = { final = o.final }
+        return orig_write(o)
+      end
+    end)
+
+    after_each(function()
+      rolling_seal_writer.write_rolling_seal = orig_write
+    end)
+
+    local function save(buf)
+      scratch.make_entry(buf)
+      vim.api.nvim_buf_call(buf, function()
+        vim.cmd("silent write")
+      end)
+    end
+
+    it("a save arms ONE timer; when it fires the seal covers the save", function()
+      local buf = start_session({ checkpoint_interval = 1000, set_timer = fake_set_timer })
+      local rolls_before = #calls
+      local before = read_seal().canonical_json
+
+      save(buf)
+      assert.equals(1, live_timers())
+      assert.equals(1000, timers[#timers].ms)
+      assert.equals(rolls_before, #calls, "must not roll inline on the save")
+      assert.equals(before, read_seal().canonical_json)
+
+      fire_last()
+      assert.equals(rolls_before + 1, #calls)
+      assert.is_nil(calls[#calls].final)
+      local seal = read_seal()
+      assert.are_not.equal(before, seal.canonical_json)
+      -- The digest covers a log that already contains the doc.save.
+      local slog = read_all(scratch.session.slog_path)
+      assert.is_not_nil(string.find(slog, "doc.save", 1, true))
+      assert.equals(sha256.hex(slog), seal.manifest.sessions[1].slog_sha256)
+      assert.is_true(bundle.verify_sig(seal.canonical_json, seal.signature_hex, scratch.session.public_key_hex))
+      assert.is_false(rolling.is_final(seal.manifest))
+    end)
+
+    it("a burst of saves coalesces into a single roll", function()
+      local buf = start_session({ checkpoint_interval = 1000, set_timer = fake_set_timer })
+      local rolls_before = #calls
+
+      save(buf)
+      save(buf)
+      save(buf)
+      assert.equals(1, live_timers(), "each save re-arms; at most one is pending")
+      assert.is_true(cancelled >= 2)
+
+      fire_last()
+      assert.equals(rolls_before + 1, #calls)
+      assert.equals(0, live_timers())
+    end)
+
+    it("stop() cancels the pending reseal and the final roll is the last write", function()
+      local buf = start_session({ checkpoint_interval = 1000, set_timer = fake_set_timer })
+      save(buf)
+      local pending = timers[#timers]
+      assert.is_true(pending.live)
+      local rolls_before = #calls
+
+      scratch.session.stop()
+      assert.is_false(pending.live, "stop() must cancel the pending timer")
+      assert.equals(rolls_before + 1, #calls)
+      assert.is_true(calls[#calls].final)
+
+      -- Even a stale callback that somehow still fires writes nothing.
+      local final_json = read_seal().canonical_json
+      pending.cb()
+      assert.equals(rolls_before + 1, #calls)
+      assert.equals(final_json, read_seal().canonical_json)
+      assert.is_true(rolling.is_final(read_seal().manifest))
+    end)
+
+    it("a bundle-submission course never arms a reseal timer", function()
+      local buf = start_session({ checkpoint_interval = 1000, set_timer = fake_set_timer }, { submission = "bundle" })
+      save(buf)
+      assert.equals(0, #timers)
+      local json_path = seal_paths()
+      assert.is_false(exists(json_path))
+    end)
+
+    it("the default timer really fires (unref'd libuv timer)", function()
+      local buf = start_session({ checkpoint_interval = 1000, reseal_debounce_ms = 20 })
+      local rolls_before = #calls
+      save(buf)
+      vim.wait(2000, function()
+        return #calls > rolls_before
+      end, 10)
+      assert.equals(rolls_before + 1, #calls)
+    end)
+  end)
 end)
